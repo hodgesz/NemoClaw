@@ -100,7 +100,13 @@ fi
 # --- 3b. cloudflared (for public tunnel) ---
 if ! command -v cloudflared > /dev/null 2>&1; then
   info "Installing cloudflared..."
-  curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+  CF_ARCH="$(uname -m)"
+  case "$CF_ARCH" in
+    x86_64|amd64) CF_ARCH="amd64" ;;
+    aarch64|arm64) CF_ARCH="arm64" ;;
+    *) fail "Unsupported architecture for cloudflared: $CF_ARCH" ;;
+  esac
+  curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" -o /tmp/cloudflared
   sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
   rm -f /tmp/cloudflared
   info "cloudflared $(cloudflared --version 2>&1 | head -1) installed"

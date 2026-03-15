@@ -42,7 +42,7 @@ if [ -z "${DOCKER_HOST:-}" ]; then
 fi
 
 # Check prerequisites
-command -v openshell > /dev/null || fail "openshell CLI not found. Install: pip install 'openshell @ git+https://github.com/NVIDIA/OpenShell.git'"
+command -v openshell > /dev/null || fail "openshell CLI not found. Install the binary from https://github.com/NVIDIA/OpenShell/releases"
 command -v docker > /dev/null || fail "docker not found"
 [ -n "${NVIDIA_API_KEY:-}" ] || fail "NVIDIA_API_KEY not set. Get one from build.nvidia.com"
 
@@ -56,10 +56,14 @@ GATEWAY_ARGS=(--name nemoclaw)
 command -v nvidia-smi > /dev/null 2>&1 && GATEWAY_ARGS+=(--gpu)
 openshell gateway start "${GATEWAY_ARGS[@]}" 2>&1 | grep -E "Gateway|✓|Error|error" || true
 
-# Verify gateway is actually healthy
-if ! openshell status 2>&1 | grep -q "Connected"; then
-  fail "Gateway failed to start. Check 'openshell gateway info' and Docker logs."
-fi
+# Verify gateway is actually healthy (may need a moment after start)
+for i in 1 2 3 4 5; do
+  if openshell status 2>&1 | grep -q "Connected"; then
+    break
+  fi
+  [ "$i" -eq 5 ] && fail "Gateway failed to start. Check 'openshell gateway info' and Docker logs."
+  sleep 2
+done
 info "Gateway is healthy"
 
 # 2. CoreDNS fix (Colima only)
@@ -114,8 +118,13 @@ rm -rf "$BUILD_CTX/nemoclaw/node_modules" "$BUILD_CTX/nemoclaw/src"
 openshell sandbox create --from "$BUILD_CTX/Dockerfile" --name nemoclaw \
   --provider nvidia-nim \
   -- env NVIDIA_API_KEY="$NVIDIA_API_KEY" 2>&1 | \
-  grep -E "^  (Step |Building |Built |Pushing |\[progress\]|Successfully |Created sandbox|Image )|✓" || true
+  grep -E "^  (Step |Building |Built |Pushing |\[progress\]|Successfully |Created sandbox|Image )|✓"
 rm -rf "$BUILD_CTX"
+
+# Verify sandbox was actually created
+if ! openshell sandbox list 2>&1 | grep -q "nemoclaw"; then
+  fail "Sandbox creation failed. You may need more RAM (8GB+ recommended). Check 'docker logs' for details."
+fi
 
 # 6. Done
 echo ""

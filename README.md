@@ -25,6 +25,10 @@ First run prompts for your NVIDIA API Key (get one from [build.nvidia.com](https
 
 ### Ubuntu 24.04 (fresh install)
 
+> **Minimum 8GB RAM** — the sandbox image is ~1.5 GiB and will OOM-kill on 4GB VMs.
+
+#### Prerequisites (one-time, interactive steps)
+
 ```bash
 # Node.js 22 LTS
 curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
@@ -33,27 +37,42 @@ sudo apt-get install -y nodejs
 # Docker
 sudo apt-get install -y docker.io
 sudo usermod -aG docker $USER
-newgrp docker
+# Log out and back in (or run `su - $USER`) for the docker group to take effect.
+# Do NOT use `newgrp docker` — it spawns a subshell that breaks copy-paste flows.
 
-# OpenShell CLI (binary from GitHub releases — needs gh CLI while repo is private)
+# gh CLI (needed while OpenShell repo is private)
 sudo apt-get install -y gh
-gh auth login
-ARCH=$(uname -m); [ "$ARCH" = "aarch64" ] && ARCH="aarch64" || ARCH="x86_64"
-gh release download --repo NVIDIA/OpenShell --pattern "openshell-${ARCH}-unknown-linux-musl.tar.gz"
-tar xzf openshell-${ARCH}-unknown-linux-musl.tar.gz
-sudo install -m 755 openshell /usr/local/bin/openshell
-rm -f openshell openshell-${ARCH}-unknown-linux-musl.tar.gz
+gh auth login          # interactive — follow the prompts
 
-# NVIDIA Container Toolkit (if you have a GPU)
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+# OpenShell CLI (binary from GitHub releases)
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64|amd64) ARCH="x86_64" ;;
+  aarch64|arm64) ARCH="aarch64" ;;
+esac
+gh release download --repo NVIDIA/OpenShell \
+  --pattern "openshell-${ARCH}-unknown-linux-musl.tar.gz" --dir /tmp
+tar xzf /tmp/openshell-${ARCH}-unknown-linux-musl.tar.gz -C /tmp
+sudo install -m 755 /tmp/openshell /usr/local/bin/openshell
+rm -f /tmp/openshell /tmp/openshell-${ARCH}-unknown-linux-musl.tar.gz
+```
+
+#### NVIDIA Container Toolkit (optional — only if you have a GPU)
+
+```bash
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
   | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
   | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null
 sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
 sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
+```
 
-# NemoClaw (pre-publish: install from git)
+#### NemoClaw
+
+```bash
 git clone https://github.com/NVIDIA/openshell-openclaw-plugin.git
 cd openshell-openclaw-plugin
 sudo npm install -g .
