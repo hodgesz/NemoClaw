@@ -49,7 +49,7 @@ openclaw agent --agent main --local -m "your prompt" --session-id s1
 openshell inference set --provider nvidia-nim --model nvidia/nemotron-3-super-120b-a12b
 
 # Local vLLM
-openshell inference set --provider vllm-local --model nemotron-3-super-120b-a12b
+openshell inference set --provider vllm-local --model nvidia/nemotron-3-nano-30b-a3b
 ```
 
 ### Monitor
@@ -151,7 +151,7 @@ nemoclaw-blueprint/                 Versioned blueprint artifact (separate relea
 |---------|----------|-------|----------|
 | `default` | NVIDIA cloud | nemotron-3-super-120b-a12b | Production, requires API key |
 | `nim-local` | Local NIM service | nemotron-3-super-120b-a12b | On-prem, NIM deployed as pod |
-| `vllm` | vLLM | nemotron-3-super-120b-a12b | Local inference, vLLM on localhost:8000 |
+| `vllm` | vLLM | nemotron-3-nano-30b-a3b | Local inference, vLLM on localhost:8000 |
 
 ## Design Principles
 
