@@ -15,7 +15,23 @@ warn() { printf '  WARN: %s\n' "$1" >&2; }
 fail() { printf '  ERROR: %s\n' "$1" >&2; exit 1; }
 
 run_in_sandbox() {
-  openshell sandbox connect "$sandbox_name" -- nemoclaw-shell "$@"
+  local cfg host rc remote_cmd
+  cfg="$(mktemp)"
+  openshell sandbox ssh-config "$sandbox_name" >"$cfg"
+  host="$(awk '/^Host / { print $2; exit }' "$cfg")"
+  if [ -z "$host" ]; then
+    host="openshell-${sandbox_name}"
+  fi
+  remote_cmd="nemoclaw-shell"
+  for arg in "$@"; do
+    remote_cmd+=" '$(printf "%s" "$arg" | sed "s/'/'\\\\''/g")'"
+  done
+  set +e
+  ssh -F "$cfg" "$host" "$remote_cmd"
+  rc=$?
+  set -e
+  rm -f "$cfg"
+  return "$rc"
 }
 
 run_setup() {
@@ -24,14 +40,14 @@ run_setup() {
 }
 
 run_gateway_fallback() {
-  warn "user-systemd unavailable; starting Gateway directly"
+  warn "user-systemd unavailable, likely because the sandbox was not booted with systemd; starting Gateway directly"
   run_in_sandbox sh -lc '
 mkdir -p "$HOME/.openclaw/logs"
-if ! openclaw gateway status --deep --require-rpc >/dev/null 2>&1; then
-  nohup openclaw gateway run --force >"$HOME/.openclaw/logs/gateway.log" 2>&1 < /dev/null &
+if ! openclaw gateway status --deep >/dev/null 2>&1; then
+  nohup openclaw gateway run >"$HOME/.openclaw/logs/gateway.log" 2>&1 < /dev/null &
 fi
 for i in 1 2 3 4 5 6 7 8; do
-  if openclaw gateway status --deep --require-rpc >/dev/null 2>&1; then
+  if openclaw gateway status --deep >/dev/null 2>&1; then
     exit 0
   fi
   sleep 2

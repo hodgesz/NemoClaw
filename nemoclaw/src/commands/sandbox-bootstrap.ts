@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { PluginLogger } from "../index.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 export interface EnsureSandboxOpenClawBootstrapOptions {
   sandboxName: string;
@@ -44,12 +47,32 @@ function readExecStream(value: unknown): string {
   return "";
 }
 
-function runSandboxOpenClawCommand(
+function runSandboxSshCommand(
   sandboxName: string,
-  args: string[],
+  remoteArgs: string[],
 ): SandboxOpenClawCommandResult {
+  const tmpDir = mkdtempSync(join(tmpdir(), "nemoclaw-ssh-"));
+  const configPath = join(tmpDir, "config");
+
   try {
-    const stdout = execFileSync("openshell", ["sandbox", "connect", sandboxName, "--", "openclaw", ...args], {
+    const sshConfig = execFileSync("openshell", ["sandbox", "ssh-config", sandboxName], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    writeFileSync(configPath, sshConfig, { mode: 0o600 });
+
+    const host =
+      sshConfig
+        .split("\n")
+        .map((line) => line.trim())
+        .find((line) => line.startsWith("Host "))
+        ?.split(/\s+/)[1] || `openshell-${sandboxName}`;
+
+    const remoteCommand = remoteArgs
+      .map((arg) => `'${arg.replaceAll("'", `'\\''`)}'`)
+      .join(" ");
+
+    const stdout = execFileSync("ssh", ["-F", configPath, host, remoteCommand], {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -75,7 +98,16 @@ function runSandboxOpenClawCommand(
       stderr,
       detail,
     };
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
   }
+}
+
+function runSandboxOpenClawCommand(
+  sandboxName: string,
+  args: string[],
+): SandboxOpenClawCommandResult {
+  return runSandboxSshCommand(sandboxName, ["nemoclaw-shell", "openclaw", ...args]);
 }
 
 function parseGatewayInstallJson(stdout: string): GatewayInstallJson | null {
@@ -90,38 +122,11 @@ function parseGatewayInstallJson(stdout: string): GatewayInstallJson | null {
 }
 
 function runSandboxShellCommand(sandboxName: string, script: string): SandboxOpenClawCommandResult {
-  try {
-    const stdout = execFileSync(
-      "openshell",
-      ["sandbox", "connect", sandboxName, "--", "sh", "-lc", script],
-      {
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
-    return {
-      ok: true,
-      stdout: stdout.trim(),
-      stderr: "",
-      detail: stdout.trim(),
-    };
-  } catch (err: unknown) {
-    const stderr =
-      err && typeof err === "object" && "stderr" in err
-        ? readExecStream((err as { stderr?: unknown }).stderr)
-        : "";
-    const stdout =
-      err && typeof err === "object" && "stdout" in err
-        ? readExecStream((err as { stdout?: unknown }).stdout)
-        : "";
-    const detail = stderr || stdout || String(err);
-    return {
-      ok: false,
-      stdout,
-      stderr,
-      detail,
-    };
-  }
+  return runSandboxSshCommand(sandboxName, ["nemoclaw-shell", "sh", "-lc", script]);
+}
+
+function manualSandboxCommandHint(sandboxName: string, command: string): string {
+  return `openshell sandbox ssh-config ${sandboxName} > /tmp/${sandboxName}.ssh && ssh -F /tmp/${sandboxName}.ssh openshell-${sandboxName} nemoclaw-shell ${command}`;
 }
 
 function startSandboxGatewayWithoutSystemd(
@@ -129,17 +134,17 @@ function startSandboxGatewayWithoutSystemd(
   logger: PluginLogger,
 ): SandboxOpenClawCommandResult {
   logger.warn(
-    "Sandbox user-systemd is unavailable. Falling back to a direct background Gateway process.",
+    "Sandbox user-systemd is unavailable, likely because the sandbox was not booted with systemd. Falling back to a direct background Gateway process.",
   );
   return runSandboxShellCommand(
     sandboxName,
     [
       'mkdir -p "$HOME/.openclaw/logs"',
-      'if ! openclaw gateway status --deep --require-rpc >/dev/null 2>&1; then',
-      '  nohup openclaw gateway run --force >"$HOME/.openclaw/logs/gateway.log" 2>&1 < /dev/null &',
+      'if ! openclaw gateway status --deep >/dev/null 2>&1; then',
+      '  nohup openclaw gateway run >"$HOME/.openclaw/logs/gateway.log" 2>&1 < /dev/null &',
       "fi",
       "for i in 1 2 3 4 5 6 7 8; do",
-      "  if openclaw gateway status --deep --require-rpc >/dev/null 2>&1; then",
+      "  if openclaw gateway status --deep >/dev/null 2>&1; then",
       '    echo "gateway-ready"',
       "    exit 0",
       "  fi",
@@ -159,9 +164,7 @@ export function ensureSandboxOpenClawBootstrap(
   const setup = runSandboxOpenClawCommand(sandboxName, ["setup"]);
   if (!setup.ok) {
     logger.error(`Failed to initialize OpenClaw inside the sandbox: ${setup.detail}`);
-    logger.info(
-      `After resolving the issue, run 'openshell sandbox connect ${sandboxName} -- openclaw setup'.`,
-    );
+    logger.info(`After resolving the issue, run '${manualSandboxCommandHint(sandboxName, "openclaw setup")}'.`);
     return false;
   }
 
@@ -177,7 +180,7 @@ export function ensureSandboxOpenClawBootstrap(
     if (!fallback.ok) {
       logger.error(`Failed to start the sandbox Gateway without systemd: ${fallback.detail}`);
       logger.info(
-        `After resolving the issue, run 'openshell sandbox connect ${sandboxName} -- openclaw gateway run --force'.`,
+        `After resolving the issue, run '${manualSandboxCommandHint(sandboxName, "openclaw gateway run")}'.`,
       );
       return false;
     }
@@ -191,7 +194,7 @@ export function ensureSandboxOpenClawBootstrap(
   if (installFailure) {
     logger.error(`Failed to install the sandbox Gateway service: ${installFailureDetail}`);
     logger.info(
-      `After resolving the issue, run 'openshell sandbox connect ${sandboxName} -- openclaw gateway install'.`,
+      `After resolving the issue, run '${manualSandboxCommandHint(sandboxName, "openclaw gateway install")}'.`,
     );
     return false;
   }

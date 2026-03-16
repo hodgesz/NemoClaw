@@ -22,10 +22,12 @@ First run prompts for your NVIDIA API Key (get one from [build.nvidia.com](https
 - Docker
 - [OpenShell CLI](https://github.com/NVIDIA/OpenShell/releases) (binary download)
 
-The repo-owned sandbox image installs `systemd` and `dbus-user-session` so
-OpenClaw's managed Gateway install can work when the runtime supports
-user-systemd. NemoClaw still falls back to a direct background Gateway process
-for headless/container sessions where `systemctl --user` is unavailable.
+The repo-owned sandbox image stays simple and non-root at rest.
+Headless bootstrap runs `openclaw setup`, then `nemoclaw-gateway.sh ensure`
+inside the sandbox. That helper uses `~/.openclaw/run/gateway.pid` and
+`~/.openclaw/run/gateway.lock` to keep exactly one direct
+`openclaw gateway run --force` process alive without requiring systemd or
+root-only service installation.
 
 ### Ubuntu 24.04 (fresh install)
 
@@ -184,7 +186,7 @@ Without tmux, run these in two terminals:
 openshell term
 
 # Terminal 2 — agent
-openshell sandbox connect nemoclaw
+openshell sandbox connect nemoclaw -- nemoclaw-shell
 export NVIDIA_API_KEY=nvapi-...
 nemoclaw-start
 openclaw agent --agent main --local --session-id live
@@ -227,7 +229,9 @@ nemoclaw-blueprint/                 Versioned blueprint artifact (separate relea
 |--------|---------|
 | `scripts/setup.sh` | Host-side setup — gateway, providers, inference route, sandbox |
 | `scripts/brev-setup.sh` | Brev bootstrap — installs prerequisites, then runs `setup.sh` |
-| `scripts/nemoclaw-start.sh` | Sandbox entrypoint — configures OpenClaw, installs plugin |
+| `scripts/nemoclaw-shell.sh` | Thin shell wrapper — runs commands inside the sandbox as the current user |
+| `scripts/nemoclaw-gateway.sh` | Gateway process manager — `ensure`, `status`, `stop` using PID + lock files |
+| `scripts/nemoclaw-start.sh` | Sandbox startup helper — configures OpenClaw, installs plugin |
 | `scripts/walkthrough.sh` | Split-screen walkthrough — agent + TUI approval flow |
 | `scripts/fix-coredns.sh` | CoreDNS patch for Colima environments |
 

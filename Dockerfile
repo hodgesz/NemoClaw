@@ -3,11 +3,11 @@
 FROM node:22-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV HOME=/sandbox
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv \
         curl git ca-certificates \
-        dbus dbus-user-session systemd \
         iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -36,12 +36,13 @@ RUN npm install --omit=dev
 RUN mkdir -p /sandbox/.nemoclaw/blueprints/0.1.0 \
     && cp -r /opt/nemoclaw-blueprint/* /sandbox/.nemoclaw/blueprints/0.1.0/
 
-# Copy startup script
+# Copy startup scripts and force read+execute bits for the sandbox user.
 COPY scripts/nemoclaw-start.sh /usr/local/bin/nemoclaw-start
-RUN chmod +x /usr/local/bin/nemoclaw-start
+COPY scripts/nemoclaw-shell.sh /usr/local/bin/nemoclaw-shell
+COPY scripts/nemoclaw-gateway.sh /usr/local/bin/nemoclaw-gateway.sh
+RUN chmod 755 /usr/local/bin/nemoclaw-start /usr/local/bin/nemoclaw-shell /usr/local/bin/nemoclaw-gateway.sh
 
 WORKDIR /sandbox
-USER sandbox
 
 # Pre-create OpenClaw directories
 RUN mkdir -p /sandbox/.openclaw/agents/main/agent \
@@ -61,13 +62,13 @@ config = { \
         'models': [{'id': 'nemotron-3-super-120b-a12b', 'name': 'NVIDIA Nemotron 3 Super 120B', 'reasoning': False, 'input': ['text'], 'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0}, 'contextWindow': 131072, 'maxTokens': 4096}] \
     }}} \
 }; \
-path = os.path.expanduser('~/.openclaw/openclaw.json'); \
+path = '/sandbox/.openclaw/openclaw.json'; \
 json.dump(config, open(path, 'w'), indent=2); \
 os.chmod(path, 0o600)"
+RUN chown -R sandbox:sandbox /sandbox/.openclaw /sandbox/.nemoclaw
 
 # Install NemoClaw plugin into OpenClaw
-RUN openclaw doctor --fix > /dev/null 2>&1 || true \
-    && openclaw plugins install /opt/nemoclaw > /dev/null 2>&1 || true
+RUN runuser -u sandbox -- env HOME=/sandbox openclaw doctor --fix > /dev/null 2>&1 || true \
+    && runuser -u sandbox -- env HOME=/sandbox openclaw plugins install /opt/nemoclaw > /dev/null 2>&1 || true
 
-ENTRYPOINT ["/bin/bash"]
-CMD []
+USER sandbox

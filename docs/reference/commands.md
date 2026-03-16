@@ -31,13 +31,13 @@ Both interfaces are installed when you run `npm install -g nemoclaw`.
 
 Bootstrap a fresh OpenClaw installation inside an OpenShell sandbox.
 After provisioning the sandbox, NemoClaw runs `openclaw setup` and
-`openclaw gateway install` inside it so the config, workspace, sessions,
-gateway auth token, and managed service all exist before first use.
+`nemoclaw-gateway.sh ensure` inside it so the config, workspace, sessions,
+gateway auth token, and direct Gateway process all exist before first use.
 If NemoClaw detects an existing host installation, `launch` stops and points you
 to `openclaw nemoclaw migrate` unless you pass `--force`.
-If Linux user-systemd is unavailable inside the sandbox, NemoClaw falls back
-to a direct background `openclaw gateway run --force` start so headless
-bootstrap still completes.
+The Gateway manager uses `~/.openclaw/run/gateway.pid` and
+`~/.openclaw/run/gateway.lock` so headless bootstrap stays non-interactive and
+does not depend on systemd or root-only service installation.
 
 ```console
 $ openclaw nemoclaw launch [--force] [--profile <profile>]
@@ -57,8 +57,7 @@ The command snapshots the resolved OpenClaw state, captures external agent roots
 referenced by config, preserves symlinks in tar archives, rewrites migrated
 config paths, verifies the migrated paths inside the sandbox, and then re-runs
 the same headless bootstrap so migrated installs also have a ready gateway
-token and Gateway runtime even when the sandbox cannot host a user-systemd
-service.
+token and Gateway runtime after cutover.
 
 ```console
 $ openclaw nemoclaw migrate [--dry-run] [--profile <profile>] [--skip-backup]
@@ -75,7 +74,9 @@ $ openclaw nemoclaw migrate [--dry-run] [--profile <profile>] [--skip-backup]
 
 ### `nemoclaw <name> connect`
 
-Open an interactive shell inside the OpenClaw sandbox.
+Open an interactive shell inside the OpenClaw sandbox as the `sandbox` user.
+This routes through `nemoclaw-shell`, which is a thin shell wrapper used by the
+host-side bootstrap helpers.
 
 ```console
 $ nemoclaw my-assistant connect

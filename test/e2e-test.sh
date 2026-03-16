@@ -250,7 +250,7 @@ console.log('State management: create, save, load, clear all working');
 " && pass "NemoClaw state management works" || fail "State management broken"
 
 # -------------------------------------------------------
-info "11. Verify headless sandbox bootstrap seeds config and gateway service"
+info "11. Verify headless sandbox bootstrap seeds config and gateway process"
 # -------------------------------------------------------
 rm -rf /tmp/fake-bin /tmp/fake-sandbox
 mkdir -p /tmp/fake-bin /tmp/fake-sandbox
@@ -262,7 +262,7 @@ set -euo pipefail
 root="${FAKE_SANDBOX_ROOT:?}"
 printf '%s\n' "$*" >> "${root}/invocation.txt"
 
-if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "openclaw" ] && [ "$6" = "setup" ]; then
+if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "nemoclaw-shell" ] && [ "$6" = "openclaw" ] && [ "$7" = "setup" ]; then
     sandbox_root="${root}/$3/.openclaw"
     mkdir -p "${sandbox_root}/workspace" "${sandbox_root}/sessions"
     cat > "${sandbox_root}/openclaw.json" <<'JSON'
@@ -280,9 +280,9 @@ JSON
     exit 0
 fi
 
-if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "openclaw" ] && [ "$6" = "gateway" ] && [ "$7" = "install" ] && [ "$8" = "--json" ]; then
+if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "nemoclaw-shell" ] && [ "$6" = "nemoclaw-gateway.sh" ] && [ "$7" = "ensure" ]; then
     sandbox_root="${root}/$3/.openclaw"
-    mkdir -p "${sandbox_root}/systemd"
+    mkdir -p "${sandbox_root}/run" "${sandbox_root}/logs"
     cat > "${sandbox_root}/openclaw.json" <<'JSON'
 {
   "agents": {
@@ -299,10 +299,9 @@ if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "
   }
 }
 JSON
-    touch "${sandbox_root}/systemd/openclaw-gateway.service"
-    cat <<'JSON'
-{"ok":true,"result":"installed","message":"Gateway service installed.","warnings":["No gateway token found. Auto-generated one and saving to config."]}
-JSON
+    echo "4242" > "${sandbox_root}/run/gateway.pid"
+    touch "${sandbox_root}/logs/gateway.log"
+    echo "gateway-ready:4242"
     exit 0
 fi
 
@@ -329,117 +328,58 @@ if (!ok) {
 }
 EOF
 
-grep -q '^sandbox connect openclaw -- openclaw setup$' /tmp/fake-sandbox/invocation.txt \
+grep -q '^sandbox connect openclaw -- nemoclaw-shell openclaw setup$' /tmp/fake-sandbox/invocation.txt \
     && pass "Headless bootstrap runs openclaw setup" \
     || fail "Headless bootstrap did not run openclaw setup"
-grep -q '^sandbox connect openclaw -- openclaw gateway install --json$' /tmp/fake-sandbox/invocation.txt \
-    && pass "Headless bootstrap runs gateway install --json" \
-    || fail "Headless bootstrap did not run gateway install --json"
+grep -q '^sandbox connect openclaw -- nemoclaw-shell nemoclaw-gateway.sh ensure$' /tmp/fake-sandbox/invocation.txt \
+    && pass "Headless bootstrap ensures the Gateway process" \
+    || fail "Headless bootstrap did not ensure the Gateway process"
 grep -q '"token": "sandbox-token-123"' /tmp/fake-sandbox/openclaw/.openclaw/openclaw.json \
     && pass "Headless bootstrap seeded gateway auth token" \
     || fail "Headless bootstrap did not seed gateway auth token"
-[ -f /tmp/fake-sandbox/openclaw/.openclaw/systemd/openclaw-gateway.service ] \
-    && pass "Headless bootstrap created gateway service marker" \
-    || fail "Headless bootstrap did not create gateway service marker"
+[ -f /tmp/fake-sandbox/openclaw/.openclaw/run/gateway.pid ] \
+    && pass "Headless bootstrap created gateway pid file" \
+    || fail "Headless bootstrap did not create gateway pid file"
 
 # -------------------------------------------------------
-info "12. Verify headless bootstrap falls back when user-systemd is unavailable"
+info "12. Verify the Gateway manager reuses a healthy process via PID file"
 # -------------------------------------------------------
-rm -rf /tmp/fake-bin /tmp/fake-sandbox
-mkdir -p /tmp/fake-bin /tmp/fake-sandbox
+rm -rf /tmp/fake-bin /tmp/fake-home /tmp/fake-health
+mkdir -p /tmp/fake-bin /tmp/fake-home/.openclaw/run /tmp/fake-home/.openclaw/logs
 
-cat > /tmp/fake-bin/openshell <<'EOF'
+cat > /tmp/fake-bin/openclaw <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="${FAKE_SANDBOX_ROOT:?}"
-printf '%s\n' "$*" >> "${root}/invocation.txt"
+printf '%s\n' "$*" >> /tmp/fake-openclaw.invocation.txt
 
-if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "openclaw" ] && [ "$6" = "setup" ]; then
-    sandbox_root="${root}/$3/.openclaw"
-    mkdir -p "${sandbox_root}/workspace" "${sandbox_root}/sessions"
-    cat > "${sandbox_root}/openclaw.json" <<'JSON'
-{
-  "agents": {
-    "defaults": {
-      "workspace": "/sandbox/.openclaw/workspace"
-    }
-  },
-  "gateway": {
-    "mode": "local"
-  }
-}
-JSON
-    exit 0
+if [ "$1" = "gateway" ] && [ "$2" = "status" ] && [ "$3" = "--deep" ] && [ "$4" = "--require-rpc" ]; then
+    [ -f /tmp/fake-health ] && exit 0
+    exit 1
 fi
 
-if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "openclaw" ] && [ "$6" = "gateway" ] && [ "$7" = "install" ] && [ "$8" = "--json" ]; then
-    sandbox_root="${root}/$3/.openclaw"
-    cat > "${sandbox_root}/openclaw.json" <<'JSON'
-{
-  "agents": {
-    "defaults": {
-      "workspace": "/sandbox/.openclaw/workspace"
-    }
-  },
-  "gateway": {
-    "mode": "local",
-    "auth": {
-      "mode": "token",
-      "token": "fallback-token-789"
-    }
-  }
-}
-JSON
-    cat <<'JSON'
-{"ok":false,"message":"systemctl --user unavailable: Failed to connect to bus","warnings":["No gateway token found. Auto-generated one and saving to config."]}
-JSON
-    exit 0
+if [ "$1" = "gateway" ] && [ "$2" = "run" ] && [ "$3" = "--force" ]; then
+    touch /tmp/fake-health
+    while true; do sleep 60; done
 fi
 
-if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "sh" ] && [ "$6" = "-lc" ]; then
-    sandbox_root="${root}/$3/.openclaw"
-    mkdir -p "${sandbox_root}/logs"
-    touch "${sandbox_root}/logs/gateway.log"
-    echo "gateway-ready"
-    exit 0
-fi
-
-echo "unexpected openshell invocation: $*" >&2
+echo "unexpected openclaw invocation: $*" >&2
 exit 1
 EOF
-chmod +x /tmp/fake-bin/openshell
+chmod +x /tmp/fake-bin/openclaw
 
-PATH="/tmp/fake-bin:$PATH" FAKE_SANDBOX_ROOT=/tmp/fake-sandbox node - <<'EOF'
-const { ensureSandboxOpenClawBootstrap } = require('/opt/nemoclaw/dist/commands/sandbox-bootstrap.js');
-
-const logger = {
-  info() {},
-  warn() {},
-  error(message) {
-    throw new Error(message);
-  },
-  debug() {},
-};
-
-const ok = ensureSandboxOpenClawBootstrap({ sandboxName: 'openclaw', logger });
-if (!ok) {
-  throw new Error('fallback bootstrap helper returned false');
-}
-EOF
-
-grep -q '^sandbox connect openclaw -- openclaw gateway install --json$' /tmp/fake-sandbox/invocation.txt \
-    && pass "Fallback bootstrap still attempts gateway install first" \
-    || fail "Fallback bootstrap did not attempt gateway install first"
-grep -q '^sandbox connect openclaw -- sh -lc ' /tmp/fake-sandbox/invocation.txt \
-    && pass "Fallback bootstrap starts direct gateway process" \
-    || fail "Fallback bootstrap did not start direct gateway process"
-grep -q '"token": "fallback-token-789"' /tmp/fake-sandbox/openclaw/.openclaw/openclaw.json \
-    && pass "Fallback bootstrap preserves generated gateway auth token" \
-    || fail "Fallback bootstrap did not preserve gateway auth token"
-[ -f /tmp/fake-sandbox/openclaw/.openclaw/logs/gateway.log ] \
-    && pass "Fallback bootstrap created gateway log path" \
-    || fail "Fallback bootstrap did not create gateway log path"
+HOME=/tmp/fake-home PATH="/tmp/fake-bin:$PATH" /usr/local/bin/nemoclaw-gateway.sh ensure >/tmp/gateway-ensure-1.out
+pid1="$(cat /tmp/fake-home/.openclaw/run/gateway.pid)"
+HOME=/tmp/fake-home PATH="/tmp/fake-bin:$PATH" /usr/local/bin/nemoclaw-gateway.sh ensure >/tmp/gateway-ensure-2.out
+pid2="$(cat /tmp/fake-home/.openclaw/run/gateway.pid)"
+[ "$pid1" = "$pid2" ] || fail "Gateway manager changed pid across repeated ensure calls"
+kill "$pid1" 2>/dev/null || true
+grep -c '^gateway run --force$' /tmp/fake-openclaw.invocation.txt | grep -q '^1$' \
+    && pass "Gateway manager starts only one process for repeated ensure calls" \
+    || fail "Gateway manager started duplicate processes"
+[ -f /tmp/fake-home/.openclaw/run/gateway.pid ] \
+    && pass "Gateway manager records the process pid" \
+    || fail "Gateway manager did not record the process pid"
 
 # -------------------------------------------------------
 info "13. Verify launch runs the full headless bootstrap sequence"
@@ -472,7 +412,7 @@ if [ "$1" = "inference" ] && [ "$2" = "set" ]; then
     exit 0
 fi
 
-if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "openclaw" ] && [ "$6" = "setup" ]; then
+if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "nemoclaw-shell" ] && [ "$6" = "openclaw" ] && [ "$7" = "setup" ]; then
     sandbox_root="${root}/$3/.openclaw"
     mkdir -p "${sandbox_root}/workspace" "${sandbox_root}/sessions"
     cat > "${sandbox_root}/openclaw.json" <<'JSON'
@@ -490,9 +430,9 @@ JSON
     exit 0
 fi
 
-if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "openclaw" ] && [ "$6" = "gateway" ] && [ "$7" = "install" ] && [ "$8" = "--json" ]; then
+if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "nemoclaw-shell" ] && [ "$6" = "nemoclaw-gateway.sh" ] && [ "$7" = "ensure" ]; then
     sandbox_root="${root}/$3/.openclaw"
-    mkdir -p "${sandbox_root}/systemd"
+    mkdir -p "${sandbox_root}/run" "${sandbox_root}/logs"
     cat > "${sandbox_root}/openclaw.json" <<'JSON'
 {
   "agents": {
@@ -509,10 +449,9 @@ if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "
   }
 }
 JSON
-    touch "${sandbox_root}/systemd/openclaw-gateway.service"
-    cat <<'JSON'
-{"ok":true,"result":"installed","message":"Gateway service installed."}
-JSON
+    echo "31337" > "${sandbox_root}/run/gateway.pid"
+    touch "${sandbox_root}/logs/gateway.log"
+    echo "gateway-ready:31337"
     exit 0
 fi
 
@@ -591,7 +530,7 @@ main().catch((error) => {
 });
 EOF
 
-grep -q '^sandbox connect openclaw -- openclaw setup$' /tmp/fake-sandbox/invocation.txt \
+grep -q '^sandbox connect openclaw -- nemoclaw-shell openclaw setup$' /tmp/fake-sandbox/invocation.txt \
     && pass "Launch runs openclaw setup" \
     || fail "Launch did not run openclaw setup"
 [ -f /tmp/fake-sandbox/openclaw/.openclaw/openclaw.json ] \
@@ -600,12 +539,12 @@ grep -q '^sandbox connect openclaw -- openclaw setup$' /tmp/fake-sandbox/invocat
 [ -d /tmp/fake-sandbox/openclaw/.openclaw/workspace ] \
     && pass "Launch created workspace" \
     || fail "Launch did not create workspace"
-grep -q '^sandbox connect openclaw -- openclaw gateway install --json$' /tmp/fake-sandbox/invocation.txt \
-    && pass "Launch runs gateway install --json" \
-    || fail "Launch did not run gateway install --json"
-[ -f /tmp/fake-sandbox/openclaw/.openclaw/systemd/openclaw-gateway.service ] \
-    && pass "Launch created gateway service marker" \
-    || fail "Launch did not create gateway service marker"
+grep -q '^sandbox connect openclaw -- nemoclaw-shell nemoclaw-gateway.sh ensure$' /tmp/fake-sandbox/invocation.txt \
+    && pass "Launch ensures the Gateway process" \
+    || fail "Launch did not ensure the Gateway process"
+[ -f /tmp/fake-sandbox/openclaw/.openclaw/run/gateway.pid ] \
+    && pass "Launch created gateway pid file" \
+    || fail "Launch did not create gateway pid file"
 
 # -------------------------------------------------------
 info "14. Verify migrate reruns the headless bootstrap sequence"
@@ -671,7 +610,7 @@ if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "
     exit 0
 fi
 
-if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "openclaw" ] && [ "$6" = "setup" ]; then
+if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "nemoclaw-shell" ] && [ "$6" = "openclaw" ] && [ "$7" = "setup" ]; then
     sandbox_root="${root}/$3/.openclaw"
     mkdir -p "${sandbox_root}/workspace" "${sandbox_root}/sessions"
     if [ ! -f "${sandbox_root}/openclaw.json" ]; then
@@ -691,9 +630,9 @@ JSON
     exit 0
 fi
 
-if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "openclaw" ] && [ "$6" = "gateway" ] && [ "$7" = "install" ] && [ "$8" = "--json" ]; then
+if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "nemoclaw-shell" ] && [ "$6" = "nemoclaw-gateway.sh" ] && [ "$7" = "ensure" ]; then
     sandbox_root="${root}/$3/.openclaw"
-    mkdir -p "${sandbox_root}/systemd"
+    mkdir -p "${sandbox_root}/run" "${sandbox_root}/logs"
     cat > "${sandbox_root}/openclaw.json" <<'JSON'
 {
   "agents": {
@@ -710,10 +649,9 @@ if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$4" = "--" ] && [ "$5" = "
   }
 }
 JSON
-    touch "${sandbox_root}/systemd/openclaw-gateway.service"
-    cat <<'JSON'
-{"ok":true,"result":"installed","message":"Gateway service installed."}
-JSON
+    echo "5150" > "${sandbox_root}/run/gateway.pid"
+    touch "${sandbox_root}/logs/gateway.log"
+    echo "gateway-ready:5150"
     exit 0
 fi
 
@@ -785,12 +723,12 @@ grep -Eq '^sandbox cp .+ openclaw:/sandbox/\.nemoclaw/migration/archives/state\.
 grep -q '^sandbox connect openclaw -- sh -lc ' /tmp/fake-sandbox/invocation.txt \
     && pass "Migrate extracts archives inside the sandbox" \
     || fail "Migrate did not extract archives inside the sandbox"
-grep -q '^sandbox connect openclaw -- openclaw setup$' /tmp/fake-sandbox/invocation.txt \
+grep -q '^sandbox connect openclaw -- nemoclaw-shell openclaw setup$' /tmp/fake-sandbox/invocation.txt \
     && pass "Migrate reruns openclaw setup" \
     || fail "Migrate did not rerun openclaw setup"
-grep -q '^sandbox connect openclaw -- openclaw gateway install --json$' /tmp/fake-sandbox/invocation.txt \
-    && pass "Migrate reruns gateway install --json" \
-    || fail "Migrate did not rerun gateway install --json"
+grep -q '^sandbox connect openclaw -- nemoclaw-shell nemoclaw-gateway.sh ensure$' /tmp/fake-sandbox/invocation.txt \
+    && pass "Migrate reruns Gateway ensure" \
+    || fail "Migrate did not rerun Gateway ensure"
 [ -f /tmp/fake-sandbox/openclaw/.openclaw/workspace/project.md ] \
     && pass "Migrate restores workspace files into the sandbox" \
     || fail "Migrate did not restore workspace files into the sandbox"
