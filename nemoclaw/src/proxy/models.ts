@@ -55,7 +55,7 @@ const CURATED_MODELS_LIST: CuratedModel[] = [
   },
   {
     id: "nvidia/nemotron-3-super-120b-a12b",
-    prefixedId: prefixed("nvidia/nemotron-3-super"),
+    prefixedId: prefixed("nvidia/nemotron-3-super-120b-a12b"),
     label: "Nemotron 3 Super",
     extraBody: {
       chat_template_kwargs: {
@@ -63,7 +63,7 @@ const CURATED_MODELS_LIST: CuratedModel[] = [
         force_nonempty_content: true,
       },
     },
-    aliases: ["curated-nvidia-endpoints/nvidia/nemotron-3-super"],
+    aliases: ["curated-nvidia-endpoints/nvidia/nemotron-3-super-120b-a12b"],
     contextWindow: 131072,
     maxOutput: 8192,
   },
