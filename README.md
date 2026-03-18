@@ -60,6 +60,9 @@ The script installs Node.js if it is not already present, then runs the guided o
 $ curl -fsSL https://nvidia.com/nemoclaw.sh | bash
 ```
 
+If you use nvm or fnm to manage Node.js, the installer may not update your current shell's PATH.
+If `nemoclaw` is not found after install, run `source ~/.bashrc` (or `source ~/.zshrc` for zsh) or open a new terminal.
+
 When the install completes, a summary confirms the running environment:
 
 ```

@@ -236,6 +236,7 @@ Architecture <reference/architecture>
 Commands <reference/commands>
 Inference Profiles <reference/inference-profiles>
 Network Policies <reference/network-policies>
+Troubleshooting <reference/troubleshooting>
 ```
 
 ```{toctree}
