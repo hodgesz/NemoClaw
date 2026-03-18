@@ -91,6 +91,35 @@ function parsePolicyPresetEnv(value) {
     .filter(Boolean);
 }
 
+function isSafeModelId(value) {
+  return /^[A-Za-z0-9._:/-]+$/.test(value);
+}
+
+function getNonInteractiveProvider() {
+  const providerKey = (process.env.NEMOCLAW_PROVIDER || "").trim().toLowerCase();
+  if (!providerKey) return null;
+
+  const validProviders = new Set(["cloud", "ollama", "vllm", "nim"]);
+  if (!validProviders.has(providerKey)) {
+    console.error(`  Unsupported NEMOCLAW_PROVIDER: ${providerKey}`);
+    console.error("  Valid values: cloud, ollama, vllm, nim");
+    process.exit(1);
+  }
+
+  return providerKey;
+}
+
+function getNonInteractiveModel(providerKey) {
+  const model = (process.env.NEMOCLAW_MODEL || "").trim();
+  if (!model) return null;
+  if (!isSafeModelId(model)) {
+    console.error(`  Invalid NEMOCLAW_MODEL for provider '${providerKey}': ${model}`);
+    console.error("  Model values may only contain letters, numbers, '.', '_', ':', '/', and '-'.");
+    process.exit(1);
+  }
+  return model;
+}
+
 // ── Step 1: Preflight ────────────────────────────────────────────
 
 async function preflight() {
@@ -197,6 +226,11 @@ async function createSandbox(gpu) {
   const existing = registry.getSandbox(sandboxName);
   if (existing) {
     if (isNonInteractive()) {
+      if (process.env.NEMOCLAW_RECREATE_SANDBOX !== "1") {
+        console.error(`  Sandbox '${sandboxName}' already exists.`);
+        console.error("  Set NEMOCLAW_RECREATE_SANDBOX=1 to recreate it in non-interactive mode.");
+        process.exit(1);
+      }
       console.log(`  [non-interactive] Sandbox '${sandboxName}' exists — recreating`);
     } else {
       const recreate = await prompt(`  Sandbox '${sandboxName}' already exists. Recreate? [y/N]: `);
@@ -273,6 +307,8 @@ async function setupNim(sandboxName, gpu) {
   const hasOllama = !!runCapture("command -v ollama", { ignoreError: true });
   const ollamaRunning = !!runCapture("curl -sf http://localhost:11434/api/tags 2>/dev/null", { ignoreError: true });
   const vllmRunning = !!runCapture("curl -sf http://localhost:8000/v1/models 2>/dev/null", { ignoreError: true });
+  const requestedProvider = isNonInteractive() ? getNonInteractiveProvider() : null;
+  const requestedModel = isNonInteractive() ? getNonInteractiveModel(requestedProvider || "cloud") : null;
 
   // Auto-select only with NEMOCLAW_EXPERIMENTAL=1 (prevents silent misconfiguration)
   if (EXPERIMENTAL) {
@@ -293,8 +329,8 @@ async function setupNim(sandboxName, gpu) {
   }
 
   // Non-interactive: honor NEMOCLAW_PROVIDER before building interactive options
-  if (isNonInteractive() && process.env.NEMOCLAW_PROVIDER) {
-    const providerKey = process.env.NEMOCLAW_PROVIDER;
+  if (isNonInteractive() && requestedProvider) {
+    const providerKey = requestedProvider;
     console.log(`  [non-interactive] Provider: ${providerKey}`);
     if (providerKey === "ollama") {
       if (!ollamaRunning) {
@@ -302,7 +338,7 @@ async function setupNim(sandboxName, gpu) {
         process.exit(1);
       }
       provider = "ollama-local";
-      model = process.env.NEMOCLAW_MODEL || "nemotron-3-nano";
+      model = requestedModel || "nemotron-3-nano";
       registry.updateSandbox(sandboxName, { model, provider, nimContainer });
       return { model, provider };
     } else if (providerKey === "vllm") {
@@ -311,9 +347,18 @@ async function setupNim(sandboxName, gpu) {
         process.exit(1);
       }
       provider = "vllm-local";
-      model = process.env.NEMOCLAW_MODEL || "vllm-local";
+      model = requestedModel || "vllm-local";
       registry.updateSandbox(sandboxName, { model, provider, nimContainer });
       return { model, provider };
+    } else if (providerKey === "nim") {
+      if (!EXPERIMENTAL) {
+        console.error("  NEMOCLAW_PROVIDER=nim requires NEMOCLAW_EXPERIMENTAL=1.");
+        process.exit(1);
+      }
+      if (!gpu || !gpu.nimCapable) {
+        console.error("  Local NIM requires a compatible NVIDIA GPU.");
+        process.exit(1);
+      }
     }
     // "cloud" or "nim" fall through to normal flow below
   }
@@ -340,9 +385,12 @@ async function setupNim(sandboxName, gpu) {
     let selected;
 
     if (isNonInteractive()) {
-      // In non-interactive mode, use NEMOCLAW_PROVIDER env var or default to cloud
-      const providerKey = process.env.NEMOCLAW_PROVIDER || "cloud";
-      selected = options.find((o) => o.key === providerKey) || options.find((o) => o.key === "cloud");
+      const providerKey = requestedProvider || "cloud";
+      selected = options.find((o) => o.key === providerKey);
+      if (!selected) {
+        console.error(`  Requested provider '${providerKey}' is not available in this environment.`);
+        process.exit(1);
+      }
       console.log(`  [non-interactive] Provider: ${selected.key}`);
     } else {
       console.log("");
@@ -366,8 +414,15 @@ async function setupNim(sandboxName, gpu) {
       } else {
         let sel;
         if (isNonInteractive()) {
-          const envModel = process.env.NEMOCLAW_MODEL;
-          sel = envModel ? models.find((m) => m.name === envModel) || models[0] : models[0];
+          if (requestedModel) {
+            sel = models.find((m) => m.name === requestedModel);
+            if (!sel) {
+              console.error(`  Unsupported NEMOCLAW_MODEL for NIM: ${requestedModel}`);
+              process.exit(1);
+            }
+          } else {
+            sel = models[0];
+          }
           console.log(`  [non-interactive] NIM model: ${sel.name}`);
         } else {
           console.log("");
@@ -435,7 +490,7 @@ async function setupNim(sandboxName, gpu) {
     } else {
       await ensureApiKey();
     }
-    model = model || process.env.NEMOCLAW_MODEL || "nvidia/nemotron-3-super-120b-a12b";
+    model = model || requestedModel || "nvidia/nemotron-3-super-120b-a12b";
     console.log(`  Using NVIDIA Cloud API with model: ${model}`);
   }
 
