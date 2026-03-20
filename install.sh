@@ -20,25 +20,25 @@ resolve_installer_version() {
 }
 
 NEMOCLAW_VERSION="$(resolve_installer_version)"
-
 # ---------------------------------------------------------------------------
 # Color / style — disabled when NO_COLOR is set or stdout is not a TTY.
 # Uses exact NVIDIA green #76B900 on truecolor terminals; 256-color otherwise.
 # ---------------------------------------------------------------------------
 if [[ -z "${NO_COLOR:-}" && -t 1 ]]; then
   if [[ "${COLORTERM:-}" == "truecolor" || "${COLORTERM:-}" == "24bit" ]]; then
-    C_GREEN=$'\033[38;2;118;185;0m' # #76B900 — exact NVIDIA green
+    C_GREEN=$'\033[38;2;118;185;0m'   # #76B900 — exact NVIDIA green
   else
-    C_GREEN=$'\033[38;5;148m' # closest 256-color on dark backgrounds
+    C_GREEN=$'\033[38;5;148m'          # closest 256-color on dark backgrounds
   fi
   C_BOLD=$'\033[1m'
   C_DIM=$'\033[2m'
   C_RED=$'\033[1;31m'
   C_YELLOW=$'\033[1;33m'
   C_CYAN=$'\033[1;36m'
+  C_WHITE=$'\033[1;37m'
   C_RESET=$'\033[0m'
 else
-  C_GREEN='' C_BOLD='' C_DIM='' C_RED='' C_YELLOW='' C_CYAN='' C_RESET=''
+  C_GREEN='' C_BOLD='' C_DIM='' C_RED='' C_YELLOW='' C_CYAN='' C_WHITE='' C_RESET=''
 fi
 
 # ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ print_banner() {
   printf "  ${C_GREEN}${C_BOLD} ██║ ╚████║███████╗██║ ╚═╝ ██║╚██████╔╝╚██████╗███████╗██║  ██║╚███╔███╔╝${C_RESET}\n"
   printf "  ${C_GREEN}${C_BOLD} ╚═╝  ╚═══╝╚══════╝╚═╝     ╚═╝ ╚═════╝  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝${C_RESET}\n"
   printf "\n"
-  printf "  ${C_DIM}Launch OpenClaw in an OpenShell sandbox.  v%s${C_RESET}\n" "$NEMOCLAW_VERSION"
+  printf "  ${C_DIM}Deploy more secure, always-on AI assistants with a single command.  v%s${C_RESET}\n" "$NEMOCLAW_VERSION"
   printf "\n"
 }
 
@@ -105,7 +105,7 @@ print_done() {
   printf "\n"
   printf "  ${C_GREEN}${C_BOLD}NemoClaw${C_RESET}  ${C_DIM}(%ss)${C_RESET}\n" "$elapsed"
   printf "\n"
-  printf "  ${C_GREEN}Your OpenClaw Sandbox is live.${C_RESET}\n"
+  printf "  Your secured AI agent stack is live.\n"
   printf "  ${C_DIM}Sandbox in, break things, and tell us what you find.${C_RESET}\n"
   printf "\n"
   printf "  ${C_GREEN}Next:${C_RESET}\n"
@@ -578,8 +578,8 @@ main() {
         usage
         error "Unknown option: $arg"
         ;;
-    esac
-  done
+      esac
+    done
   # Also honor env var
   NON_INTERACTIVE="${NON_INTERACTIVE:-${NEMOCLAW_NON_INTERACTIVE:-}}"
   export NEMOCLAW_NON_INTERACTIVE="${NON_INTERACTIVE}"
@@ -596,14 +596,12 @@ main() {
   install_nemoclaw
   verify_nemoclaw
   post_install_message
-
   step 3 "Onboarding"
   if command_exists nemoclaw; then
     run_onboard
   else
     warn "Skipping onboarding — nemoclaw is not on PATH. Run 'nemoclaw onboard' after updating your PATH."
   fi
-
   print_done
 }
 
