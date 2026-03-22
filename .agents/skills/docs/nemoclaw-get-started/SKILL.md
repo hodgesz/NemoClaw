@@ -1,6 +1,6 @@
 ---
 name: nemoclaw-get-started
-description: Install NemoClaw, launch a sandbox, and run your first agent prompt. Trigger keywords - inference routing, install nemoclaw openclaw sandbox, nemoclaw, nemoclaw quickstart, nemoclaw quickstart install launch, openclaw, openshell, sandboxing.
+description: Installs NemoClaw, launch a sandbox, and run your first agent prompt. Use when inference routing, install nemoclaw openclaw sandbox, nemoclaw, nemoclaw quickstart, nemoclaw quickstart install launch, openclaw, openshell, sandboxing.
 ---
 
 # Nemoclaw Get Started

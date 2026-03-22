@@ -1,6 +1,6 @@
 ---
 name: nemoclaw-deploy-remote
-description: Provision a remote GPU VM with NemoClaw using Brev deployment. Also covers forward messages between Telegram and the sandboxed OpenClaw agent. Trigger keywords - deploy nemoclaw remote gpu, deployment, gpu, nemoclaw, nemoclaw brev cloud deployment, nemoclaw telegram bridge, openclaw, openshell.
+description: Provisions a remote GPU VM with NemoClaw using Brev deployment. Also covers forwards messages between Telegram and the sandboxed OpenClaw agent. Use when deploy nemoclaw remote gpu, deployment, gpu, nemoclaw, nemoclaw brev cloud deployment, nemoclaw telegram bridge, openclaw, openshell.
 ---
 
 # Nemoclaw Deploy Remote

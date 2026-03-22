@@ -1,11 +1,11 @@
 ---
 name: nemoclaw-overview
-description: Plugin, blueprint, sandbox creation, and inference routing concepts. Also covers nemoClaw is an open source reference stack that simplifies running OpenClaw always-on assistants safely; changelog and feature history for NemoClaw releases. Trigger keywords - blueprints, how nemoclaw works, inference routing, nemoclaw, nemoclaw changelog, nemoclaw overview, nemoclaw overview does fits, nemoclaw release notes.
+description: Learns how NemoClaw combines a lightweight CLI plugin with a versioned blueprint to move OpenClaw into a controlled sandbox. Also covers nemoClaws is an open source reference stack that simplifies running OpenClaw always-on assistants safely; changelogs and feature history for NemoClaw releases. Use when blueprints, how nemoclaw works, inference routing, nemoclaw, nemoclaw changelog, nemoclaw overview, nemoclaw overview does fits, nemoclaw release notes.
 ---
 
 # Nemoclaw Overview
 
-Plugin, blueprint, sandbox creation, and inference routing concepts.
+Learn how NemoClaw combines a lightweight CLI plugin with a versioned blueprint to move OpenClaw into a controlled sandbox.
 
 ## Context
 

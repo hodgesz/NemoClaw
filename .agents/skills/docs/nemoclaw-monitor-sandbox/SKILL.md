@@ -1,6 +1,6 @@
 ---
 name: nemoclaw-monitor-sandbox
-description: Inspect sandbox health, trace agent behavior, and diagnose problems. Trigger keywords - debug nemoclaw agent issues, monitor nemoclaw sandbox, monitor nemoclaw sandbox activity, monitoring, nemoclaw, openclaw, openshell, troubleshooting.
+description: Inspects sandbox health, trace agent behavior, and diagnose problems. Use when debug nemoclaw agent issues, monitor nemoclaw sandbox, monitor nemoclaw sandbox activity, monitoring, nemoclaw, openclaw, openshell, troubleshooting.
 ---
 
 # Nemoclaw Monitor Sandbox

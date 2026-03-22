@@ -684,16 +684,18 @@ def generate_skill_name(
 def build_skill_description(name: str, pages: list[DocPage], keywords: list[str]) -> str:
     """Build the description field for the skill frontmatter.
 
-    Uses imperative voice to match skill conventions and appends a
-    "Trigger keywords -" list for discoverability.
+    Best-practices compliance:
+    - Uses third-person voice (e.g. "Installs..." not "Install...")
+    - Includes "Use when..." clause instead of flat "Trigger keywords -" list
+    - Keeps description under 1024 characters
     """
     descriptions = [p.description for p in pages if p.description]
     if descriptions:
-        combined = descriptions[0].rstrip(".")
+        combined = _to_third_person(descriptions[0]).rstrip(".")
         if len(descriptions) > 1:
             extras = []
             for d in descriptions[1:3]:
-                clean = d.rstrip(".")
+                clean = _to_third_person(d).rstrip(".")
                 if clean:
                     clean = clean[0].lower() + clean[1:]
                 extras.append(clean)
@@ -705,7 +707,7 @@ def build_skill_description(name: str, pages: list[DocPage], keywords: list[str]
 
     kw_list = keywords[:8]
     if kw_list:
-        combined += " Trigger keywords - " + ", ".join(kw_list) + "."
+        combined += " Use when " + ", ".join(kw_list) + "."
 
     if len(combined) > 1024:
         combined = combined[:1020] + "..."

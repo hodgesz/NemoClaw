@@ -1,6 +1,6 @@
 ---
 name: nemoclaw-configure-inference
-description: Change the active inference model without restarting the sandbox. Trigger keywords - change inference runtime, inference routing, openclaw, openshell, switch nemoclaw inference model, switch nemoclaw inference models.
+description: Changes the active inference model without restarting the sandbox. Use when change inference runtime, inference routing, openclaw, openshell, switch nemoclaw inference model, switch nemoclaw inference models.
 ---
 
 # Nemoclaw Configure Inference

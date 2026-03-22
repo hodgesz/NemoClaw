@@ -2,7 +2,7 @@
 title:
   page: "How NemoClaw Works — Plugin, Blueprint, and Sandbox Lifecycle"
   nav: "How It Works"
-description: "Plugin, blueprint, sandbox creation, and inference routing concepts."
+description: "Learn how NemoClaw combines a lightweight CLI plugin with a versioned blueprint to move OpenClaw into a controlled sandbox."
 keywords: ["how nemoclaw works", "nemoclaw sandbox lifecycle blueprint"]
 topics: ["generative_ai", "ai_agents"]
 tags: ["openclaw", "openshell", "sandboxing", "inference_routing", "blueprints", "network_policy"]

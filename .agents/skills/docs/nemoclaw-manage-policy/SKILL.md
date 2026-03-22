@@ -1,6 +1,6 @@
 ---
 name: nemoclaw-manage-policy
-description: Review and approve blocked agent network requests in the TUI. Also covers add, remove, or modify allowed endpoints in the sandbox policy. Trigger keywords - approve deny nemoclaw agent, customize nemoclaw network policy, customize nemoclaw sandbox network, nemoclaw, nemoclaw approve network requests, network policy, openclaw, openshell.
+description: Reviews and approve blocked agent network requests in the TUI. Also covers adds, remove, or modify allowed endpoints in the sandbox policy. Use when approve deny nemoclaw agent, customize nemoclaw network policy, customize nemoclaw sandbox network, nemoclaw, nemoclaw approve network requests, network policy, openclaw, openshell.
 ---
 
 # Nemoclaw Manage Policy
