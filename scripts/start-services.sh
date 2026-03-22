@@ -94,7 +94,7 @@ stop_service() {
 show_status() {
   mkdir -p "$PIDDIR"
   echo ""
-  for svc in telegram-bridge cloudflared; do
+  for svc in telegram-bridge discord-bridge slack-bridge cloudflared; do
     if is_running "$svc"; then
       echo -e "  ${GREEN}●${NC} $svc  (PID $(cat "$PIDDIR/$svc.pid"))"
     else
@@ -115,6 +115,8 @@ show_status() {
 do_stop() {
   mkdir -p "$PIDDIR"
   stop_service cloudflared
+  stop_service slack-bridge
+  stop_service discord-bridge
   stop_service telegram-bridge
   info "All services stopped."
 }

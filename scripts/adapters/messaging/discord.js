@@ -7,7 +7,7 @@
  * Uses discord.js for WebSocket-based gateway connection.
  */
 
-const { Client, GatewayIntentBits } = require("discord.js");
+const { Client, GatewayIntentBits, Partials } = require("discord.js");
 
 module.exports = function createAdapter(config) {
   const TOKEN = process.env[config.credentials.token_env];
@@ -27,6 +27,7 @@ module.exports = function createAdapter(config) {
             GatewayIntentBits.MessageContent,
             GatewayIntentBits.DirectMessages,
           ],
+          partials: [Partials.Channel],
         });
 
         client.on("messageCreate", async (message) => {

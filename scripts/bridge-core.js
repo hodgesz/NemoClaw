@@ -63,9 +63,13 @@ function runAgentInSandbox(message, sessionId) {
       `-m ${shellQuote(message)} --session-id ${shellQuote(safeSessionId)}`;
 
     const proc = spawn("ssh", ["-T", "-F", confPath, `openshell-${SANDBOX}`, cmd], {
-      timeout: 120000,
       stdio: ["ignore", "pipe", "pipe"],
     });
+
+    // spawn() does not support timeout — implement manually
+    const killTimer = setTimeout(() => {
+      proc.kill("SIGTERM");
+    }, 120000);
 
     let stdout = "";
     let stderr = "";
@@ -74,6 +78,7 @@ function runAgentInSandbox(message, sessionId) {
     proc.stderr.on("data", (d) => (stderr += d.toString()));
 
     proc.on("close", (code) => {
+      clearTimeout(killTimer);
       try {
         fs.unlinkSync(confPath);
         fs.rmdirSync(confDir);
@@ -106,7 +111,8 @@ function runAgentInSandbox(message, sessionId) {
     });
 
     proc.on("error", (err) => {
-      resolve(`Error: ${err.message}`);
+      clearTimeout(killTimer);
+      resolve(`Error: ${err && err.message ? err.message : String(err)}`);
     });
   });
 }

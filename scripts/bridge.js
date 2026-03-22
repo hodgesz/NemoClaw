@@ -165,7 +165,8 @@ async function runBridge(config) {
       }
     } catch (err) {
       clearInterval(typingInterval);
-      await msg.reply(`Error: ${err.message}`).catch(() => {});
+      const errorMsg = err && err.message ? err.message : String(err);
+      await msg.reply(`Error: ${errorMsg}`).catch(() => {});
     }
   }
 
