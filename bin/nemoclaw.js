@@ -93,10 +93,15 @@ function hasNamedGateway(output = "") {
 function getNamedGatewayLifecycleState() {
   const status = captureOpenshell(["status"]);
   const gatewayInfo = captureOpenshell(["gateway", "info", "-g", "nemoclaw"], { ignoreError: true });
-  const connected = /Connected/i.test(stripAnsi(status.output));
+  const cleanStatus = stripAnsi(status.output);
+  const connected = /Connected/i.test(cleanStatus);
   const named = hasNamedGateway(gatewayInfo.output);
+  const refusing = /Connection refused|client error \(Connect\)|tcp connect error/i.test(cleanStatus);
   if (connected && named) {
     return { state: "healthy_named", status: status.output, gatewayInfo: gatewayInfo.output };
+  }
+  if (named && refusing) {
+    return { state: "named_unreachable", status: status.output, gatewayInfo: gatewayInfo.output };
   }
   if (named) {
     return { state: "named_unhealthy", status: status.output, gatewayInfo: gatewayInfo.output };
@@ -147,6 +152,13 @@ function getSandboxGatewayState(sandboxName) {
 }
 
 function printGatewayLifecycleHint(output = "", sandboxName = "", writer = console.error) {
+  const cleanOutput = stripAnsi(output);
+  if (/Connection refused|client error \(Connect\)|tcp connect error/i.test(cleanOutput) && /Gateway:\s+nemoclaw/i.test(cleanOutput)) {
+    writer("  The selected NemoClaw gateway exists in metadata, but its API is refusing connections after restart.");
+    writer("  This usually means the gateway runtime did not come back cleanly after the restart.");
+    writer("  Retry `openshell gateway start --name nemoclaw`; if it stays in this state, rebuild the gateway before expecting existing sandboxes to reconnect.");
+    return;
+  }
   if (/handshake verification failed/i.test(output)) {
     writer("  This looks like gateway identity drift after restart.");
     writer("  Existing sandboxes may still be recorded locally, but the current gateway no longer trusts their prior connection state.");
@@ -190,6 +202,12 @@ function getReconciledSandboxGatewayState(sandboxName) {
       }
       return { ...retried, recoveredGateway: true, recoveryVia: recovery.via || null };
     }
+    if (recovery.after?.state === "named_unreachable" || recovery.before?.state === "named_unreachable") {
+      return {
+        state: "gateway_unreachable_after_restart",
+        output: recovery.after?.status || recovery.before?.status || lookup.output,
+      };
+    }
     return { ...lookup, gatewayRecoveryFailed: true };
   }
 
@@ -215,6 +233,15 @@ function ensureLiveSandboxOrExit(sandboxName) {
     }
     console.error("  Existing sandbox connections cannot be reattached safely after this gateway identity change.");
     console.error("  Recreate this sandbox with `nemoclaw onboard` once the gateway runtime is stable.");
+    process.exit(1);
+  }
+  if (lookup.state === "gateway_unreachable_after_restart") {
+    console.error(`  Sandbox '${sandboxName}' may still exist, but the selected NemoClaw gateway is still refusing connections after restart.`);
+    if (lookup.output) {
+      console.error(lookup.output);
+    }
+    console.error("  Retry `openshell gateway start --name nemoclaw` and verify `openshell status` is healthy before reconnecting.");
+    console.error("  If the gateway never becomes healthy, rebuild the gateway and then recreate the affected sandbox.");
     process.exit(1);
   }
   console.error(`  Unable to verify sandbox '${sandboxName}' against the live OpenShell gateway.`);
@@ -526,6 +553,14 @@ function sandboxStatus(sandboxName) {
     }
     console.log("  Existing sandbox connections cannot be reattached safely after this gateway identity change.");
     console.log("  Recreate this sandbox with `nemoclaw onboard` once the gateway runtime is stable.");
+  } else if (lookup.state === "gateway_unreachable_after_restart") {
+    console.log("");
+    console.log(`  Sandbox '${sandboxName}' may still exist, but the selected NemoClaw gateway is still refusing connections after restart.`);
+    if (lookup.output) {
+      console.log(lookup.output);
+    }
+    console.log("  Retry `openshell gateway start --name nemoclaw` and verify `openshell status` is healthy before reconnecting.");
+    console.log("  If the gateway never becomes healthy, rebuild the gateway and then recreate the affected sandbox.");
   } else {
     console.log("");
     console.log(`  Could not verify sandbox '${sandboxName}' against the live OpenShell gateway.`);

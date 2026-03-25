@@ -315,4 +315,77 @@ describe("CLI dispatch", () => {
     expect(connectResult.out.includes("gateway trust material rotated after restart")).toBeTruthy();
     expect(connectResult.out.includes("Recreate this sandbox")).toBeTruthy();
   });
+
+  it("explains when gateway metadata exists but the restarted API is still refusing connections", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-cli-gateway-unreachable-"));
+    const localBin = path.join(home, "bin");
+    const registryDir = path.join(home, ".nemoclaw");
+    fs.mkdirSync(localBin, { recursive: true });
+    fs.mkdirSync(registryDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(registryDir, "sandboxes.json"),
+      JSON.stringify({
+        sandboxes: {
+          alpha: {
+            name: "alpha",
+            model: "test-model",
+            provider: "nvidia-prod",
+            gpuEnabled: false,
+            policies: [],
+          },
+        },
+        defaultSandbox: "alpha",
+      }),
+      { mode: 0o600 }
+    );
+    fs.writeFileSync(
+      path.join(localBin, "openshell"),
+      [
+        "#!/usr/bin/env bash",
+        "if [ \"$1\" = \"sandbox\" ] && [ \"$2\" = \"get\" ] && [ \"$3\" = \"alpha\" ]; then",
+        "  echo 'Error: transport error: Connection refused' >&2",
+        "  exit 1",
+        "fi",
+        "if [ \"$1\" = \"status\" ]; then",
+        "  echo 'Server Status'",
+        "  echo",
+        "  echo '  Gateway: nemoclaw'",
+        "  echo '  Server: https://127.0.0.1:8080'",
+        "  echo 'Error: client error (Connect)' >&2",
+        "  echo 'Connection refused (os error 111)' >&2",
+        "  exit 1",
+        "fi",
+        "if [ \"$1\" = \"gateway\" ] && [ \"$2\" = \"info\" ] && [ \"$3\" = \"-g\" ] && [ \"$4\" = \"nemoclaw\" ]; then",
+        "  echo 'Gateway Info'",
+        "  echo",
+        "  echo '  Gateway: nemoclaw'",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = \"gateway\" ] && [ \"$2\" = \"select\" ] && [ \"$3\" = \"nemoclaw\" ]; then",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = \"gateway\" ] && [ \"$2\" = \"start\" ] && [ \"$3\" = \"--name\" ] && [ \"$4\" = \"nemoclaw\" ]; then",
+        "  exit 0",
+        "fi",
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o755 }
+    );
+
+    const statusResult = runWithEnv("alpha status", {
+      HOME: home,
+      PATH: `${localBin}:${process.env.PATH || ""}`,
+    });
+    expect(statusResult.code).toBe(0);
+    expect(statusResult.out.includes("gateway is still refusing connections after restart")).toBeTruthy();
+    expect(statusResult.out.includes("Retry `openshell gateway start --name nemoclaw`")).toBeTruthy();
+
+    const connectResult = runWithEnv("alpha connect", {
+      HOME: home,
+      PATH: `${localBin}:${process.env.PATH || ""}`,
+    });
+    expect(connectResult.code).toBe(1);
+    expect(connectResult.out.includes("gateway is still refusing connections after restart")).toBeTruthy();
+    expect(connectResult.out.includes("If the gateway never becomes healthy")).toBeTruthy();
+  });
 });
