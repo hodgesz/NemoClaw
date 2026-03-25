@@ -92,20 +92,26 @@ function hasNamedGateway(output = "") {
   return stripAnsi(output).includes("Gateway: nemoclaw");
 }
 
+function getActiveGatewayName(output = "") {
+  const match = stripAnsi(output).match(/^\s*Gateway:\s+(.+?)\s*$/m);
+  return match ? match[1].trim() : "";
+}
+
 function getNamedGatewayLifecycleState() {
   const status = captureOpenshell(["status"]);
   const gatewayInfo = captureOpenshell(["gateway", "info", "-g", "nemoclaw"]);
   const cleanStatus = stripAnsi(status.output);
+  const activeGateway = getActiveGatewayName(status.output);
   const connected = /Connected/i.test(cleanStatus);
   const named = hasNamedGateway(gatewayInfo.output);
   const refusing = /Connection refused|client error \(Connect\)|tcp connect error/i.test(cleanStatus);
-  if (connected && named) {
+  if (connected && activeGateway === "nemoclaw" && named) {
     return { state: "healthy_named", status: status.output, gatewayInfo: gatewayInfo.output };
   }
-  if (named && refusing) {
+  if (activeGateway === "nemoclaw" && named && refusing) {
     return { state: "named_unreachable", status: status.output, gatewayInfo: gatewayInfo.output };
   }
-  if (named) {
+  if (activeGateway === "nemoclaw" && named) {
     return { state: "named_unhealthy", status: status.output, gatewayInfo: gatewayInfo.output };
   }
   if (connected) {

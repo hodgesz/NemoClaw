@@ -163,6 +163,12 @@ describe("onboard helpers", () => {
     expect(
       isGatewayHealthy(
         "Server Status\n\n  Gateway: openshell\n  Status: Connected",
+        "Gateway Info\n\n  Gateway: nemoclaw\n  Gateway endpoint: https://127.0.0.1:8080"
+      )
+    ).toBe(false);
+    expect(
+      isGatewayHealthy(
+        "Server Status\n\n  Gateway: openshell\n  Status: Connected",
         "Error: no gateway metadata found"
       )
     ).toBe(false);

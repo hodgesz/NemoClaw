@@ -273,7 +273,10 @@ describe("CLI dispatch", () => {
         "  exit 0",
         "fi",
         "if [ \"$1\" = \"status\" ]; then",
-        "  echo 'Connected'",
+        "  echo 'Server Status'",
+        "  echo",
+        "  echo '  Gateway: nemoclaw'",
+        "  echo '  Status: Connected'",
         "  exit 0",
         "fi",
         "if [ \"$1\" = \"gateway\" ] && [ \"$2\" = \"info\" ] && [ \"$3\" = \"-g\" ] && [ \"$4\" = \"nemoclaw\" ]; then",
@@ -296,6 +299,74 @@ describe("CLI dispatch", () => {
     expect(r.out.includes("Recovered NemoClaw gateway runtime")).toBeTruthy();
     expect(r.out.includes("Sandbox: alpha")).toBeTruthy();
   });
+
+  it("does not treat a different connected gateway as a healthy nemoclaw gateway", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-cli-mixed-gateway-"));
+    const localBin = path.join(home, "bin");
+    const registryDir = path.join(home, ".nemoclaw");
+    fs.mkdirSync(localBin, { recursive: true });
+    fs.mkdirSync(registryDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(registryDir, "sandboxes.json"),
+      JSON.stringify({
+        sandboxes: {
+          alpha: {
+            name: "alpha",
+            model: "test-model",
+            provider: "nvidia-prod",
+            gpuEnabled: false,
+            policies: [],
+          },
+        },
+        defaultSandbox: "alpha",
+      }),
+      { mode: 0o600 }
+    );
+    fs.writeFileSync(
+      path.join(localBin, "openshell"),
+      [
+        "#!/usr/bin/env bash",
+        "if [ \"$1\" = \"sandbox\" ] && [ \"$2\" = \"get\" ] && [ \"$3\" = \"alpha\" ]; then",
+        "  echo 'Error: transport error: Connection refused' >&2",
+        "  exit 1",
+        "fi",
+        "if [ \"$1\" = \"status\" ]; then",
+        "  echo 'Server Status'",
+        "  echo",
+        "  echo '  Gateway: openshell'",
+        "  echo '  Status: Connected'",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = \"gateway\" ] && [ \"$2\" = \"info\" ] && [ \"$3\" = \"-g\" ] && [ \"$4\" = \"nemoclaw\" ]; then",
+        "  echo 'Gateway Info'",
+        "  echo",
+        "  echo '  Gateway: nemoclaw'",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = \"gateway\" ] && [ \"$2\" = \"select\" ] && [ \"$3\" = \"nemoclaw\" ]; then",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = \"gateway\" ] && [ \"$2\" = \"start\" ] && [ \"$3\" = \"--name\" ] && [ \"$4\" = \"nemoclaw\" ]; then",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = \"inference\" ] && [ \"$2\" = \"get\" ]; then",
+        "  exit 0",
+        "fi",
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o755 }
+    );
+
+    const r = runWithEnv("alpha status", {
+      HOME: home,
+      PATH: `${localBin}:${process.env.PATH || ""}`,
+    }, 25000);
+
+    expect(r.code).toBe(0);
+    expect(r.out.includes("Recovered NemoClaw gateway runtime")).toBeFalsy();
+    expect(r.out.includes("Could not verify sandbox 'alpha'")).toBeTruthy();
+    expect(r.out.includes("verify the active gateway")).toBeTruthy();
+  }, 25000);
 
   it("explains unrecoverable gateway trust rotation after restart", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-cli-identity-drift-"));
@@ -328,7 +399,10 @@ describe("CLI dispatch", () => {
         "  exit 1",
         "fi",
         "if [ \"$1\" = \"status\" ]; then",
-        "  echo 'Connected'",
+        "  echo 'Server Status'",
+        "  echo",
+        "  echo '  Gateway: nemoclaw'",
+        "  echo '  Status: Connected'",
         "  exit 0",
         "fi",
         "if [ \"$1\" = \"gateway\" ] && [ \"$2\" = \"info\" ] && [ \"$3\" = \"-g\" ] && [ \"$4\" = \"nemoclaw\" ]; then",

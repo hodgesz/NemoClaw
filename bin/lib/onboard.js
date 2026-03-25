@@ -185,9 +185,36 @@ function hasStaleGateway(gwInfoOutput) {
   return typeof gwInfoOutput === "string" && gwInfoOutput.length > 0 && gwInfoOutput.includes(GATEWAY_NAME);
 }
 
+function stripAnsi(value = "") {
+  let cleaned = "";
+  for (let i = 0; i < value.length; i += 1) {
+    if (value.charCodeAt(i) === 27 && value[i + 1] === "[") {
+      i += 2;
+      while (i < value.length && /[0-9;]/.test(value[i])) {
+        i += 1;
+      }
+      if (value[i] === "m") {
+        continue;
+      }
+    }
+    cleaned += value[i] || "";
+  }
+  return cleaned;
+}
+
+function getActiveGatewayName(statusOutput = "") {
+  if (typeof statusOutput !== "string" || statusOutput.length === 0) {
+    return "";
+  }
+  const match = stripAnsi(statusOutput)
+    .match(/^\s*Gateway:\s+(.+?)\s*$/m);
+  return match ? match[1].trim() : "";
+}
+
 function isGatewayHealthy(statusOutput = "", gwInfoOutput = "") {
   const connected = typeof statusOutput === "string" && statusOutput.includes("Connected");
-  return connected && hasStaleGateway(gwInfoOutput);
+  const activeGateway = getActiveGatewayName(statusOutput);
+  return connected && activeGateway === GATEWAY_NAME && hasStaleGateway(gwInfoOutput);
 }
 
 function streamSandboxCreate(command, env = process.env, options = {}) {
@@ -1351,7 +1378,8 @@ async function startGatewayWithOptions(_gpu, { exitOnFailure = true } = {}) {
   // Verify health
   for (let i = 0; i < 5; i++) {
     const status = runCaptureOpenshell(["status"], { ignoreError: true });
-    if (status.includes("Connected")) {
+    const gwInfo = runCaptureOpenshell(["gateway", "info", "-g", GATEWAY_NAME], { ignoreError: true });
+    if (isGatewayHealthy(status, gwInfo)) {
       console.log("  ✓ Gateway is healthy");
       break;
     }
