@@ -376,13 +376,13 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════
-# Phase 6: Gateway rebuild lifecycle messaging
+# Phase 6: Gateway runtime recovery
 # ══════════════════════════════════════════════════════════════════
-section "Phase 6: Gateway rebuild lifecycle messaging"
-info "Destroying the NemoClaw gateway to verify current lifecycle guidance..."
+section "Phase 6: Gateway runtime recovery"
+info "Stopping the NemoClaw gateway runtime to verify current recovery behavior..."
 
 openshell forward stop 18789 2>/dev/null || true
-openshell gateway destroy -g nemoclaw 2>/dev/null || true
+openshell gateway stop -g nemoclaw 2>/dev/null || true
 
 GATEWAY_LOG="$(mktemp)"
 nemoclaw "$SANDBOX_B" status >"$GATEWAY_LOG" 2>&1
@@ -393,13 +393,13 @@ rm -f "$GATEWAY_LOG"
 if [ "$gateway_status_exit" -eq 0 ]; then
   pass "Post-destroy status exited 0"
 else
-  fail "Post-destroy status exited $gateway_status_exit (expected 0)"
+  fail "Post-stop status exited $gateway_status_exit (expected 0)"
 fi
 
-if grep -q "gateway is no longer configured after restart/rebuild" <<<"$gateway_status_output"; then
-  pass "Gateway rebuild guidance surfaced after destroying gateway"
+if grep -q "Recovered NemoClaw gateway runtime" <<<"$gateway_status_output"; then
+  pass "Gateway runtime recovered during status after stop"
 else
-  fail "Gateway rebuild guidance missing after destroying gateway"
+  fail "Gateway runtime recovery message missing after gateway stop"
 fi
 
 # ══════════════════════════════════════════════════════════════════
