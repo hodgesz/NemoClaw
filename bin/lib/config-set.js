@@ -27,7 +27,7 @@ function loadAllowList() {
 
   const keys = new Set();
   // Match top-level entries: exactly 2-space indent, dotted path, colon
-  const entryPattern = /^  ([\w.]+):/gm;
+  const entryPattern = /^ {2}([\w.]+):/gm;
   let m;
   while ((m = entryPattern.exec(block)) !== null) {
     // Skip "default:" which is a value key, not an entry key
@@ -41,9 +41,8 @@ function loadAllowList() {
  * Run a script inside the sandbox via `sandbox connect` with stdin piping.
  * This is the same mechanism onboard uses — no `exec` command needed.
  */
-function sandboxRun(sandboxName, script) {
+function _sandboxRun(sandboxName, script) {
   const os = require("os");
-  const fs = require("fs");
   const tmpFile = path.join(os.tmpdir(), `nemoclaw-cfg-${Date.now()}.sh`);
   fs.writeFileSync(tmpFile, script + "\nexit\n", { mode: 0o600 });
   try {
@@ -75,7 +74,7 @@ function readOverrides(sandboxName) {
   } catch {
     return {};
   } finally {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) { /* cleanup best-effort */ }
   }
 }
 

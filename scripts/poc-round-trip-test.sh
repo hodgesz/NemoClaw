@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # POC round-trip test for runtime config mutability
 # Prerequisites:
 #   - Patched openshell binary in PATH
@@ -16,7 +18,10 @@ NC='\033[0m'
 
 step() { echo -e "\n${GREEN}▸ $1${NC}"; }
 info() { echo -e "  ${CYAN}$1${NC}"; }
-wait_enter() { echo -e "\n  ${YELLOW}Press Enter to continue...${NC}"; read -r; }
+wait_enter() {
+  echo -e "\n  ${YELLOW}Press Enter to continue...${NC}"
+  read -r
+}
 
 SANDBOX_NAME="poc-test"
 
