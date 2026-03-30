@@ -293,6 +293,12 @@ describe("regression guards", () => {
         expect(line.includes("NVIDIA_API_KEY")).toBe(false);
       }
     });
+
+    it("install-openshell.sh verifies OpenShell binary checksum after download", () => {
+      const src = fs.readFileSync(path.join(import.meta.dirname, "..", "scripts", "install-openshell.sh"), "utf-8");
+      expect(src).toContain("openshell-checksums-sha256.txt");
+      expect(src).toContain("shasum -a 256 -c");
+    });
   });
 
   describe("curl-pipe-to-shell guards (#574, #583)", () => {
