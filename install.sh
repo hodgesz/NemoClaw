@@ -415,9 +415,9 @@ ensure_local_bin_in_profile() {
       fi
       {
         printf '\n# NemoClaw PATH setup\n'
-        printf 'fish_add_path --path --append %s\n' "$local_bin"
+        printf 'fish_add_path --path --append "%s"\n' "$local_bin"
         if [[ -n "$node_bin" ]]; then
-          printf 'fish_add_path --path --append %s\n' "$node_bin"
+          printf 'fish_add_path --path --append "%s"\n' "$node_bin"
         fi
         printf '# end NemoClaw PATH setup\n'
       } >>"$profile"

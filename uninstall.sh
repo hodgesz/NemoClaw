@@ -317,7 +317,7 @@ remove_nemoclaw_alias_from_profile() {
     fi
     # Legacy format: marker + one alias line.
     if grep -qF '# NemoClaw CLI alias' "$p" 2>/dev/null; then
-      sed -i.bak '/^# NemoClaw CLI alias$/,+1d' "$p" && rm -f "${p}.bak"
+      sed -i.bak '/^# NemoClaw CLI alias$/{N;d;}' "$p" && rm -f "${p}.bak"
       changed=true
     fi
     if [ "$changed" = true ]; then
