@@ -63,13 +63,16 @@ describe("credential exposure in process arguments", () => {
   it("onboard.js does not embed sandbox secrets in the sandbox create command line", () => {
     const src = fs.readFileSync(ONBOARD_JS, "utf-8");
 
-    // sandboxEnv must be built with a blocklist that strips all credential env vars
-    expect(src).toMatch(/blockedSandboxEnvNames/);
-    expect(src).toMatch(/NVIDIA_API_KEY/);
-    expect(src).toMatch(/BEDROCK_API_KEY/);
-    expect(src).toMatch(/DISCORD_BOT_TOKEN/);
-    expect(src).toMatch(/SLACK_BOT_TOKEN/);
-    expect(src).toMatch(/TELEGRAM_BOT_TOKEN/);
+    // sandboxEnv must be built with a blocklist that strips all credential env vars.
+    // Extract the actual blocklist array to avoid false positives from other mentions.
+    const blocklistMatch = src.match(/const blockedSandboxEnvNames = new Set\(\[([\s\S]*?)\]\);/);
+    expect(blocklistMatch).not.toBeNull();
+    const blocklist = blocklistMatch[1];
+    expect(blocklist).toContain('"NVIDIA_API_KEY"');
+    expect(blocklist).toContain('"BEDROCK_API_KEY"');
+    expect(blocklist).toContain('"DISCORD_BOT_TOKEN"');
+    expect(blocklist).toContain('"SLACK_BOT_TOKEN"');
+    expect(blocklist).toContain('"TELEGRAM_BOT_TOKEN"');
     expect(src).toMatch(/streamSandboxCreate\(createCommand, sandboxEnv(?:, \{)?/);
     expect(src).not.toMatch(/envArgs\.push\(formatEnvAssignment\("NVIDIA_API_KEY"/);
     expect(src).not.toMatch(/envArgs\.push\(formatEnvAssignment\("DISCORD_BOT_TOKEN"/);

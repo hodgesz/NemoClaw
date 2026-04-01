@@ -934,7 +934,10 @@ function upsertProvider(name, type, credentialEnv, baseUrl, env = {}) {
  * @returns {boolean} True if the provider exists in the gateway.
  */
 function providerExistsInGateway(name) {
-  const result = runOpenshell(["provider", "get", name], { ignoreError: true });
+  const result = runOpenshell(["provider", "get", name], {
+    ignoreError: true,
+    stdio: ["ignore", "ignore", "ignore"],
+  });
   return result.status === 0;
 }
 
@@ -2336,24 +2339,44 @@ async function createSandbox(
   const sandboxName = sandboxNameOverride || (await promptValidatedSandboxName());
   const chatUiUrl = process.env.CHAT_UI_URL || `http://127.0.0.1:${CONTROL_UI_PORT}`;
 
+  // Check whether messaging providers will be needed — this must happen before
+  // the sandbox reuse decision so we can detect stale sandboxes that were created
+  // without provider attachments (security: prevents legacy raw-env-var leaks).
+  const hasMessagingTokens =
+    !!(getCredential("DISCORD_BOT_TOKEN") || process.env.DISCORD_BOT_TOKEN) ||
+    !!(getCredential("SLACK_BOT_TOKEN") || process.env.SLACK_BOT_TOKEN) ||
+    !!(hydrateCredentialEnv("TELEGRAM_BOT_TOKEN") || process.env.TELEGRAM_BOT_TOKEN);
+
   // Reconcile local registry state with the live OpenShell gateway state.
   const liveExists = pruneStaleSandboxEntry(sandboxName);
 
   if (liveExists) {
     const existingSandboxState = getSandboxReuseState(sandboxName);
     if (existingSandboxState === "ready" && process.env.NEMOCLAW_RECREATE_SANDBOX !== "1") {
-      ensureDashboardForward(sandboxName, chatUiUrl);
-      if (isNonInteractive()) {
-        note(`  [non-interactive] Sandbox '${sandboxName}' exists and is ready — reusing it`);
+      // If messaging tokens are configured, the existing sandbox may not have
+      // provider attachments (created before this change). Force recreation so
+      // credentials flow through the provider pipeline instead of raw env vars.
+      if (hasMessagingTokens) {
+        console.log(
+          `  Sandbox '${sandboxName}' exists but messaging providers may not be attached.`,
+        );
+        console.log("  Recreating to ensure credentials flow through the provider pipeline.");
       } else {
-        console.log(`  Sandbox '${sandboxName}' already exists and is ready.`);
-        console.log("  Reusing existing sandbox.");
-        console.log("  Set NEMOCLAW_RECREATE_SANDBOX=1 to recreate it instead.");
+        ensureDashboardForward(sandboxName, chatUiUrl);
+        if (isNonInteractive()) {
+          note(`  [non-interactive] Sandbox '${sandboxName}' exists and is ready — reusing it`);
+        } else {
+          console.log(`  Sandbox '${sandboxName}' already exists and is ready.`);
+          console.log("  Reusing existing sandbox.");
+          console.log("  Set NEMOCLAW_RECREATE_SANDBOX=1 to recreate it instead.");
+        }
+        return sandboxName;
       }
-      return sandboxName;
     }
 
-    if (existingSandboxState === "ready") {
+    if (existingSandboxState === "ready" && hasMessagingTokens) {
+      note(`  Sandbox '${sandboxName}' exists — recreating to attach messaging providers.`);
+    } else if (existingSandboxState === "ready") {
       note(`  Sandbox '${sandboxName}' exists and is ready — recreating by explicit request.`);
     } else {
       note(`  Sandbox '${sandboxName}' exists but is not ready — recreating it.`);
