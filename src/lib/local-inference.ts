@@ -15,7 +15,7 @@ export const DEFAULT_OLLAMA_MODEL = "nemotron-3-nano:30b";
 export const SMALL_OLLAMA_MODEL = "qwen2.5:7b";
 export const LARGE_OLLAMA_MIN_MEMORY_MB = 32768;
 
-type RunCaptureFn = (cmd: string, opts?: { ignoreError?: boolean }) => string;
+export type RunCaptureFn = (cmd: string, opts?: { ignoreError?: boolean }) => string;
 
 export interface GpuInfo {
   totalMemoryMB: number;

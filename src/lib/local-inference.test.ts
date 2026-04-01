@@ -114,7 +114,7 @@ describe("local inference helpers", () => {
     expect(validateLocalProvider("custom-provider", () => "")).toEqual({ ok: true });
   });
 
-  it("reports generic container unreachability for unknown providers", () => {
+  it("skips health check entirely for unknown providers", () => {
     let callCount = 0;
     const result = validateLocalProvider("custom-provider", () => {
       callCount += 1;
