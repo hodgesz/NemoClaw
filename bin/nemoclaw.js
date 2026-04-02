@@ -31,6 +31,7 @@ const registry = require("./lib/registry");
 const nim = require("./lib/nim");
 const policies = require("./lib/policies");
 const { parseGatewayInference } = require("./lib/inference-config");
+const services = require("./lib/services");
 
 // ── Global commands ──────────────────────────────────────────────
 
@@ -208,12 +209,11 @@ async function start() {
   await ensureApiKey();
   const { defaultSandbox } = registry.listSandboxes();
   const safeName = defaultSandbox && /^[a-zA-Z0-9._-]+$/.test(defaultSandbox) ? defaultSandbox : null;
-  const sandboxEnv = safeName ? `SANDBOX_NAME=${shellQuote(safeName)}` : "";
-  run(`${sandboxEnv} bash "${SCRIPTS}/start-services.sh"`);
+  await services.startAll({ sandboxName: safeName || undefined, repoDir: ROOT });
 }
 
 function stop() {
-  run(`bash "${SCRIPTS}/start-services.sh" --stop`);
+  services.stopAll();
 }
 
 function debug(args) {
@@ -268,7 +268,7 @@ function showStatus() {
   }
 
   // Show service status
-  run(`bash "${SCRIPTS}/start-services.sh" --status`);
+  services.showStatus();
 }
 
 function listSandboxes() {
