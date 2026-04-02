@@ -7,9 +7,9 @@ import policies from "../bin/lib/policies";
 
 describe("policies", () => {
   describe("listPresets", () => {
-    it("returns all 9 presets", () => {
+    it("returns all 10 presets", () => {
       const presets = policies.listPresets();
-      expect(presets.length).toBe(9);
+      expect(presets.length).toBe(10);
     });
 
     it("each preset has name and description", () => {
