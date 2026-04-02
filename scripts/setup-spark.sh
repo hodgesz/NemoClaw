@@ -62,11 +62,8 @@ fi
 # ── 2. Next steps ─────────────────────────────────────────────────
 
 echo ""
-info "DGX Spark Docker configuration complete."
-info ""
 if [ "${DOCKER_GROUP_ADDED:-}" = true ]; then
   warn "Docker group was just added. You must open a new terminal (or run 'newgrp docker') before continuing."
 else
   info "DGX Spark Docker configuration complete."
 fi
-
