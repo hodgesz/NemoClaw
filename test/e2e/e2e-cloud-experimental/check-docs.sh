@@ -224,6 +224,7 @@ extract_targets() {
   perl -CS -ne '
     if (/^\s*```/) { $in = !$in; next; }
     next if $in;
+    next if /^\s*<!--/ .. /-->\s*$/;
     while (/\!?\[[^\]]*\]\(([^)\s]+)(?:\s+["'"'"'][^)"'"'"']*["'"'"'])?\)/g) { print "$1\n"; }
     while (/<(https?:[^>\s]+)>/g) { print "$1\n"; }
   ' -- "$1"
