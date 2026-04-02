@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, it, expect } from "vitest";
-import { redact } from "../../dist/lib/debug.js";
+// Import from compiled dist/ so coverage is attributed correctly.
+import { redact } from "../../dist/lib/debug";
 
 describe("redact", () => {
   it("redacts NVIDIA_API_KEY=value patterns", () => {
@@ -22,8 +23,12 @@ describe("redact", () => {
     expect(redact("using key nvapi-AbCdEfGhIj1234")).toBe("using key <REDACTED>");
   });
 
-  it("redacts GitHub personal access tokens", () => {
+  it("redacts classic GitHub personal access tokens (ghp_)", () => {
     expect(redact("token: ghp_" + "a".repeat(36))).toBe("token: <REDACTED>");
+  });
+
+  it("redacts fine-grained GitHub personal access tokens (github_pat_)", () => {
+    expect(redact("token: github_pat_" + "A".repeat(40))).toBe("token: <REDACTED>");
   });
 
   it("redacts Bearer tokens", () => {
