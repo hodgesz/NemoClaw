@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+preset:
+  name: tavily
+  description: "Tavily web search and extract API access"
+
+network_policies:
+  tavily_api:
+    name: tavily_api
+    endpoints:
+      - host: api.tavily.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: POST, path: "/search" }
+          - allow: { method: POST, path: "/extract" }
+    binaries:
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/curl }

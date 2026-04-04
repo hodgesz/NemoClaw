@@ -44,6 +44,54 @@ const COOLDOWN_MS = 5000;
 const lastMessageTime = new Map();
 const busyChats = new Set();
 
+// ── Stderr / setup noise filters (shared) ────────────────────────
+// Lines matching any of these are stripped from agent output before
+// sending to Telegram. Add new patterns here instead of scattering
+// them through the filter logic.
+const NOISE_PATTERNS = [
+  "Setting up NemoClaw",
+  "[plugins]",
+  "[SECURITY]",
+  "SECURITY WARNING",
+  "Config integrity check",
+  "(node:",
+  "(Use `node",
+  "NemoClaw ready",
+  "NemoClaw registered",
+  "openclaw agent",
+  "Running as non-root",
+  "privilege separation disabled",
+  "gateway Running",
+  "CAP_SETPCAP",
+  "UNDICI-EHPA",
+  "EnvHttpProxyAgent",
+  "trace-warnings",
+];
+const NOISE_BOX_CHARS = ["┌─", "│ ", "└─"];
+
+function isNoiseLine(line) {
+  if (line.trim() === "") return true;
+  for (const p of NOISE_PATTERNS) { if (line.includes(p)) return true; }
+  for (const c of NOISE_BOX_CHARS) { if (line.includes(c)) return true; }
+  return false;
+}
+
+// ── Resolve current model from inference route ───────────────────
+
+function getCurrentModel() {
+  try {
+    const out = execFileSync(OPENSHELL, ["inference", "get"], { encoding: "utf-8", timeout: 5000 });
+    // Strip ANSI escape codes from openshell output
+    // eslint-disable-next-line no-control-regex
+    const clean = out.replace(/\x1b\[[0-9;]*m/g, "");
+    const match = clean.match(/Model:\s*(.+)/i);
+    if (match) return match[1].trim();
+    const provMatch = clean.match(/Provider:\s*(.+)/i);
+    if (provMatch) return provMatch[1].trim();
+  } catch { /* ignore — we'll return a fallback */ }
+  return "unknown";
+}
+
 // ── Telegram API helpers ──────────────────────────────────────────
 
 function tgApi(method, body) {
@@ -77,15 +125,24 @@ async function sendMessage(chatId, text, replyTo) {
     chunks.push(text.slice(i, i + 4000));
   }
   for (const chunk of chunks) {
-    await tgApi("sendMessage", {
+    const res = await tgApi("sendMessage", {
       chat_id: chatId,
       text: chunk,
       reply_to_message_id: replyTo,
       parse_mode: "Markdown",
-    }).catch(() =>
+    }).catch(async (err) => {
+      console.error(`[sendMessage] Markdown attempt failed: ${err.message}`);
       // Retry without markdown if it fails (unbalanced formatting)
-      tgApi("sendMessage", { chat_id: chatId, text: chunk, reply_to_message_id: replyTo }),
-    );
+      return tgApi("sendMessage", { chat_id: chatId, text: chunk, reply_to_message_id: replyTo });
+    });
+    if (res && !res.ok) {
+      console.error(`[sendMessage] Telegram API error: ${JSON.stringify(res)}`);
+      // If markdown failed at API level, retry without
+      if (res.error_code === 400) {
+        const retry = await tgApi("sendMessage", { chat_id: chatId, text: chunk, reply_to_message_id: replyTo });
+        if (retry && !retry.ok) console.error(`[sendMessage] Retry also failed: ${JSON.stringify(retry)}`);
+      }
+    }
   }
 }
 
@@ -108,7 +165,12 @@ function runAgentInSandbox(message, sessionId) {
     // The remote command reads them from environment/stdin rather than
     // embedding user content in a shell string.
     const safeSessionId = String(sessionId).replace(/[^a-zA-Z0-9-]/g, "");
-    const cmd = `export NVIDIA_API_KEY=${shellQuote(API_KEY)} && nemoclaw-start openclaw agent --agent main --local -m ${shellQuote(message)} --session-id ${shellQuote("tg-" + safeSessionId)}`;
+    // Pass a dummy NVIDIA_API_KEY so the agent uses inference.local routing
+    // (which the OpenShell proxy forwards to the configured provider — e.g. Bedrock/LiteLLM).
+    // Passing the real key causes the agent to call NVIDIA directly, bypassing the route.
+    // NOTE: Do NOT use --local here — it bypasses the Gateway, which means
+    // web_search and other Gateway-only tools are unavailable.
+    const cmd = `export NVIDIA_API_KEY=unused && nemoclaw-start openclaw agent --agent main -m ${shellQuote(message)} --session-id ${shellQuote("tg-" + safeSessionId)}`;
 
     const proc = spawn("ssh", ["-T", "-F", confPath, `openshell-${SANDBOX}`, cmd], {
       timeout: 120000,
@@ -124,28 +186,16 @@ function runAgentInSandbox(message, sessionId) {
     proc.on("close", (code) => {
       try { require("fs").unlinkSync(confPath); require("fs").rmdirSync(confDir); } catch { /* ignored */ }
 
-      // Extract the actual agent response — skip setup lines
-      const lines = stdout.split("\n");
-      const responseLines = lines.filter(
-        (l) =>
-          !l.startsWith("Setting up NemoClaw") &&
-          !l.startsWith("[plugins]") &&
-          !l.startsWith("(node:") &&
-          !l.includes("NemoClaw ready") &&
-          !l.includes("NemoClaw registered") &&
-          !l.includes("openclaw agent") &&
-          !l.includes("┌─") &&
-          !l.includes("│ ") &&
-          !l.includes("└─") &&
-          l.trim() !== "",
-      );
-
+      // Extract the actual agent response — skip setup lines and stderr noise
+      const allOutput = stdout + "\n" + stderr;
+      const responseLines = allOutput.split("\n").filter((l) => !isNoiseLine(l));
       const response = responseLines.join("\n").trim();
 
       if (response) {
         resolve(response);
       } else if (code !== 0) {
-        resolve(`Agent exited with code ${code}. ${stderr.trim().slice(0, 500)}`);
+        const cleanStderr = stderr.split("\n").filter((l) => !isNoiseLine(l)).join("\n").trim();
+        resolve(`Agent exited with code ${code}. ${cleanStderr.slice(0, 500)}`);
       } else {
         resolve("(no response)");
       }
@@ -183,9 +233,10 @@ async function poll() {
 
         // Handle /start
         if (msg.text === "/start") {
+          const model = getCurrentModel();
           await sendMessage(
             chatId,
-            "🦀 *NemoClaw* — powered by Nemotron 3 Super 120B\n\n" +
+            `🦀 *NemoClaw* — model: ${model}\n\n` +
               "Send me a message and I'll run it through the OpenClaw agent " +
               "inside an OpenShell sandbox.\n\n" +
               "If the agent needs external access, the TUI will prompt for approval.",
@@ -226,7 +277,15 @@ async function poll() {
         const typingInterval = setInterval(() => sendTyping(chatId), 4000);
 
         try {
-          const response = await runAgentInSandbox(msg.text, chatId);
+          let response = await runAgentInSandbox(msg.text, chatId);
+
+          // Retry once if the sandbox SSH proxy wasn't ready
+          if (response.includes("transport error") || response.includes("Connection refused")) {
+            console.log(`[${chatId}] retrying after transport error...`);
+            await new Promise((r) => setTimeout(r, 3000));
+            response = await runAgentInSandbox(msg.text, chatId);
+          }
+
           clearInterval(typingInterval);
           console.log(`[${chatId}] agent: ${response.slice(0, 100)}...`);
           await sendMessage(chatId, response, msg.message_id);
@@ -255,13 +314,15 @@ async function main() {
     process.exit(1);
   }
 
+  const model = getCurrentModel();
+
   console.log("");
   console.log("  ┌─────────────────────────────────────────────────────┐");
   console.log("  │  NemoClaw Telegram Bridge                          │");
   console.log("  │                                                     │");
   console.log(`  │  Bot:      @${(me.result.username + "                    ").slice(0, 37)}│`);
   console.log("  │  Sandbox:  " + (SANDBOX + "                              ").slice(0, 40) + "│");
-  console.log("  │  Model:    nvidia/nemotron-3-super-120b-a12b       │");
+  console.log("  │  Model:    " + (model + "                              ").slice(0, 40) + "│");
   console.log("  │                                                     │");
   console.log("  │  Messages are forwarded to the OpenClaw agent      │");
   console.log("  │  inside the sandbox. Run 'openshell term' in       │");

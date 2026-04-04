@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+preset:
+  name: whatsapp
+  description: "WhatsApp Web (Baileys) — signaling, media download, and media upload"
+
+network_policies:
+  whatsapp:
+    name: whatsapp
+    endpoints:
+      # Primary WebSocket signaling channel (wss://web.whatsapp.com/ws/chat).
+      # Long-lived WebSocket — use access: full (CONNECT tunnel) to avoid
+      # HTTP idle timeouts killing the connection. See discord preset #409.
+      - host: web.whatsapp.com
+        port: 443
+        access: full
+
+      # Media download — inbound images, video, audio, documents
+      - host: mmg.whatsapp.net
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**" }
+
+      # Media upload/download — outbound attachments and CDN content.
+      # Baileys negotiates actual hostname(s) at runtime via the signaling
+      # channel; the *.whatsapp.net wildcard covers known CDN upload hosts
+      # (media-*.cdn.whatsapp.net, etc.).
+      - host: "*.whatsapp.net"
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/mms/**" }
+    binaries:
+      - { path: /usr/local/bin/node }
