@@ -44,13 +44,21 @@ Expanding the NemoClaw setup on M4 Pro 48GB (sandbox "my-assistant", Bedrock/Son
   - Telegram bridge must use `SANDBOX_NAME=my-assistant` (defaults to "nemoclaw" otherwise)
   - Lesson: OpenClaw skills are description-matched by the model, not slash-command triggered
   - Lesson: After sandbox rebuild, must re-inject Gemini config (step 10 in recovery doc)
+  - Lesson: OpenClaw fetch-guard DNS bug requires docker exec patch for web search to work (NemoClaw #1252)
+  - Lesson: Gateway device pairing needed after onboard/restart (NemoClaw #1310)
 
-- [ ] **2B. Autonomous Morning Briefing** (~2-3 hrs)
+- [x] **2B. Autonomous Morning Briefing** (completed 2026-04-04)
   - **Depends on:** 2A (Gemini web search for news)
-  - Policy entry: `wttr.in:443` (GET), binaries: curl
-  - Security trade-off: put `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` inside sandbox
-  - Cron: `openclaw cron add --name "morning-briefing" --schedule "0 7 * * *" ...`
-  - **Test manually via Telegram first** before scheduling
+  - Policy entry: `wttr.in:443` (GET) added to sandbox network policy
+  - Skill installed at `/sandbox/.openclaw-data/skills/morning-briefing/SKILL.md`
+  - Uses web_search (Gemini) for news/markets and wttr.in for weather
+  - Telegram channel config injected into `openclaw.json` via docker exec
+  - Scheduled via macOS launchd (not openclaw cron — gateway pairing issues, NemoClaw #1310)
+    - Plist: `~/Library/LaunchAgents/com.nemoclaw.morning-briefing.plist`
+    - Script: `scripts/morning-briefing.sh` (host-side, SSHes into sandbox, sends to Telegram)
+    - Runs daily at 7:00 AM local time
+  - Lesson: OpenClaw gateway channels require `openclaw.json` modification (same #773 workaround)
+  - Lesson: openclaw cron needs a stable gateway connection; host-side launchd is more reliable
 
 **Commit after Phase 2** (policy presets, any script changes)
 
@@ -95,8 +103,14 @@ Commit after Phase 4
 
 ## Cross-Cutting: Policy Persistence Script
 
-- [ ] Create `scripts/apply-custom-policies.sh` — merges custom policy entries after `nemoclaw onboard`
-- [ ] Hook into `scripts/recover-after-reboot.sh` step 5
+- [x] **Create `scripts/apply-custom-policies.sh`** (completed 2026-04-04)
+  - Handles: Gemini config injection, config hash, fetch-guard DNS patch, gateway restart, device pairing, skill reinstall
+  - Skills stored in `skills/` directory (morning-briefing, adhd-planner, personal-crm)
+  - Idempotent — safe to run multiple times
+  - Flags: `--sandbox`, `--skip-skills`, `--dry-run`
+- [x] **Hook into `scripts/recover-after-reboot.sh`** (completed 2026-04-04)
+  - Called automatically as step 5b after network policy
+  - Also documented in `docs/recovery-after-reboot.md` rebuild procedure (step 11)
 
 ---
 

@@ -391,9 +391,99 @@ rm /tmp/oc-cfg.json
 ```
 
 > **Note:** This produces a "Config integrity check failed" warning on agent startup.
-> In non-root mode it proceeds anyway — cosmetic only, not a security concern.
+> To suppress it, update the config hash (see step 6.4).
 
-### 6.4 Test web search
+### 6.4 Update config hash and patch fetch-guard DNS
+
+After modifying `openclaw.json`, update the stored hash so `nemoclaw-start` doesn't
+refuse to start with "integrity check FAILED":
+
+```bash
+docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
+  --exec-id fix-hash --user 0 "$CONTAINER_ID" \
+  sh -c 'sha256sum /sandbox/.openclaw/openclaw.json > /sandbox/.openclaw/.config-hash && chmod 444 /sandbox/.openclaw/.config-hash'
+```
+
+Then patch OpenClaw's fetch-guard to fix web search DNS resolution. OpenClaw's SSRF guard
+does a local DNS lookup before checking if it should use the environment proxy — this fails
+in the sandbox because k3s CoreDNS can't resolve external hostnames. The fix reorders the
+code so `TRUSTED_ENV_PROXY` mode skips DNS pinning entirely.
+
+See [NemoClaw #1252](https://github.com/NVIDIA/NemoClaw/issues/1252) and
+[upstream OpenClaw #59005](https://github.com/openclaw/openclaw/issues/59005).
+
+```bash
+# Patch all fetch-guard files in the sandbox container
+for FILE in $(docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
+  --exec-id find-guards --user 0 "$CONTAINER_ID" \
+  sh -c 'grep -rl "resolvePinnedHostname" /usr/local/lib/node_modules/openclaw/dist/' 2>/dev/null); do
+  docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
+    --exec-id "read-fg-$RANDOM" --user 0 "$CONTAINER_ID" cat "$FILE" > /tmp/fg-patch.js 2>&1
+  python3 -c "
+content = open('/tmp/fg-patch.js').read()
+old = '''let dispatcher = null;
+\t\ttry {
+\t\t\tconst pinned = await resolvePinnedHostnameWithPolicy(parsedUrl.hostname, {
+\t\t\t\tlookupFn: params.lookupFn,
+\t\t\t\tpolicy: params.policy
+\t\t\t});
+\t\t\tif (mode === GUARDED_FETCH_MODE.TRUSTED_ENV_PROXY && hasProxyEnvConfigured()) dispatcher = new EnvHttpProxyAgent();
+\t\t\telse if (params.pinDns !== false) dispatcher = createPinnedDispatcher(pinned);'''
+new = '''let dispatcher = null;
+\t\ttry {
+\t\t\tconst useTrustedEnvProxy = mode === GUARDED_FETCH_MODE.TRUSTED_ENV_PROXY && hasProxyEnvConfigured();
+\t\t\tif (useTrustedEnvProxy) {
+\t\t\t\tdispatcher = new EnvHttpProxyAgent();
+\t\t\t} else {
+\t\t\t\tconst pinned = await resolvePinnedHostnameWithPolicy(parsedUrl.hostname, {
+\t\t\t\t\tlookupFn: params.lookupFn,
+\t\t\t\t\tpolicy: params.policy
+\t\t\t\t});
+\t\t\t\tif (params.pinDns !== false) dispatcher = createPinnedDispatcher(pinned);
+\t\t\t}'''
+if old in content:
+    open('/tmp/fg-patch.js', 'w').write(content.replace(old, new))
+"
+  docker exec -i openshell-cluster-nemoclaw ctr -n k8s.io task exec \
+    --exec-id "write-fg-$RANDOM" --user 0 "$CONTAINER_ID" \
+    sh -c "cat > $FILE" < /tmp/fg-patch.js 2>&1
+done
+rm /tmp/fg-patch.js 2>/dev/null
+```
+
+After patching, restart the gateway process inside the container so it loads the patched
+files. The container's init system respawns it automatically:
+
+```bash
+# Kill the gateway (it respawns with patched code)
+docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
+  --exec-id find-gw --user 0 "$CONTAINER_ID" \
+  sh -c 'ls /proc/*/cmdline 2>/dev/null | while read f; do
+    pid=$(echo "$f" | cut -d/ -f3)
+    tr "\0" " " < "$f" 2>/dev/null | grep -q "openclaw-gateway" && echo "$pid"
+  done' | head -1 | xargs -I{} docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
+  --exec-id kill-gw --user 0 "$CONTAINER_ID" kill {}
+sleep 5  # wait for respawn
+```
+
+> **Important:** This patch must be re-applied after every sandbox rebuild. The files
+> live under `/usr` in the container image and are overwritten on rebuild. Add this step
+> to your rebuild checklist alongside the Gemini config injection.
+
+### 6.5 Approve device pairing
+
+After onboard (or gateway restart), the CLI agent needs device approval to connect to
+the gateway. Without this, the agent falls back to embedded mode. See
+[NemoClaw #1310](https://github.com/NVIDIA/NemoClaw/issues/1310).
+
+```bash
+# List pending devices and approve
+ssh openshell-my-assistant 'openclaw devices list'
+# Copy the Request UUID from the Pending table, then:
+ssh openshell-my-assistant 'openclaw devices approve <request-uuid>'
+```
+
+### 6.6 Test web search
 
 Via the dashboard chat or Telegram: ask "What's the weather in Denver today?"
 The agent should use the built-in `web_search` tool and return live results.
@@ -713,6 +803,9 @@ Safe combinations:
 - [ ] Network policy blocks unauthorized requests
 - [ ] Filesystem isolation: can't write to /usr, can write to /sandbox
 - [ ] No API keys visible inside sandbox
+- [ ] Fetch-guard DNS patch applied (all `fetch-guard-*.js` files patched)
+- [ ] Config hash updated (no "integrity check FAILED" on agent start)
+- [ ] Gateway device pairing approved (`openclaw devices list` shows Paired)
 - [ ] Gemini web search works ("what's the weather in Denver?")
 - [ ] Telegram bridge running with correct sandbox name
 - [ ] Telegram bot responds to messages
@@ -736,6 +829,8 @@ Safe combinations:
 | Telegram bridge defaults to "nemoclaw" sandbox | Always set `SANDBOX_NAME=my-assistant` | Bridge code line 32 |
 | Markdown tables don't render in Telegram | Telegram only supports basic Markdown — tables appear as pipe-delimited text | Telegram API limitation |
 | `nemoclaw status` before Docker ready destroys gateway | Always wait for Docker first | Recovery script handles this |
+| Web search DNS fails in sandbox (`EAI_AGAIN`) | Patch fetch-guard files via `docker exec` to skip DNS pinning in proxy mode | [NemoClaw #1252](https://github.com/NVIDIA/NemoClaw/issues/1252), [OpenClaw #59005](https://github.com/openclaw/openclaw/issues/59005) |
+| Gateway "pairing required" after onboard | Run `openclaw devices list` + `approve` inside sandbox | [NemoClaw #1310](https://github.com/NVIDIA/NemoClaw/issues/1310) |
 
 ---
 
@@ -756,3 +851,7 @@ Safe combinations:
 7. **Gemini web search config must be re-injected** after every sandbox rebuild (step 10 in recovery doc's rebuild procedure).
 
 8. **Never blindly append `openshell sandbox ssh-config >> ~/.ssh/config`.** It can corrupt other Host blocks (like `github.com`) by bleeding ProxyCommand settings into them. Always check the file first.
+
+9. **The fetch-guard DNS patch must be re-applied after every sandbox rebuild.** The patched files live under `/usr` in the container image and are overwritten. Same for the config hash and device pairing approval.
+
+10. **After killing the gateway process, it respawns but needs re-pairing.** Device approval (`openclaw devices approve`) is required each time the gateway restarts.

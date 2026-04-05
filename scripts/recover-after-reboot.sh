@@ -325,6 +325,19 @@ PEOF
   fi
 fi
 
+# ── Step 5b: Apply custom sandbox configurations ────────────────
+step "Step 5b/6: Custom sandbox configurations (Gemini, fetch-guard, skills)"
+
+if dry "would run apply-custom-policies.sh"; then
+  :
+else
+  if [ -x "$SCRIPT_DIR/apply-custom-policies.sh" ]; then
+    "$SCRIPT_DIR/apply-custom-policies.sh" --sandbox "$SANDBOX_NAME"
+  else
+    warn "apply-custom-policies.sh not found or not executable. Skipping."
+  fi
+fi
+
 # ── Step 6: Port forward + services ─────────────────────────────
 step "Step 6/6: Port forward and services"
 

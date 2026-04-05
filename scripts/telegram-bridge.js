@@ -66,6 +66,17 @@ const NOISE_PATTERNS = [
   "UNDICI-EHPA",
   "EnvHttpProxyAgent",
   "trace-warnings",
+  "gateway connect failed",
+  "GatewayClientRequestError",
+  "Gateway agent failed",
+  "Gateway target:",
+  "Source: local loopback",
+  "Config: /sandbox/.openclaw",
+  "Bind: loopback",
+  "pairing required",
+  "tools websearch failed",
+  "tools cron failed",
+  "getaddrinfo",
 ];
 const NOISE_BOX_CHARS = ["┌─", "│ ", "└─"];
 

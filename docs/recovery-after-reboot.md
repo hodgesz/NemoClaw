@@ -55,6 +55,8 @@ When the user says "recover after reboot", Claude should follow these steps exac
 | Telegram bridge / services | No | Host processes; re-created with `--services` |
 | SSH tunnel (gateway <-> sandbox) | Sometimes | Can break after reboot; if broken, requires full sandbox rebuild (see below) |
 | Gemini web search config in openclaw.json | Yes (if sandbox survived) | Lost on sandbox rebuild — must re-inject via docker exec (step 10 in rebuild procedure) |
+| OpenClaw fetch-guard DNS patch | No (lost on rebuild) | Must re-apply via docker exec after every rebuild (step 11) — see [NemoClaw #1252](https://github.com/NVIDIA/NemoClaw/issues/1252) |
+| Gateway device pairing | No (lost on rebuild) | Must re-approve device after rebuild or gateway restart (step 12) — see [NemoClaw #1310](https://github.com/NVIDIA/NemoClaw/issues/1310) |
 
 ## What can go wrong
 
@@ -160,6 +162,82 @@ docker exec -i openshell-cluster-nemoclaw ctr -n k8s.io task exec \
   --exec-id gemini-write --user 0 "$CONTAINER_ID" \
   sh -c 'cat > /sandbox/.openclaw/openclaw.json' < /tmp/oc-cfg.json
 rm /tmp/oc-cfg.json
+
+# 11. Apply all custom sandbox configurations (automated)
+# This single script handles steps 10-12 plus skill reinstalls.
+# Run it instead of the manual steps below.
+./scripts/apply-custom-policies.sh --sandbox my-assistant
+
+# --- Manual steps (for reference, handled by apply-custom-policies.sh) ---
+
+# 11-manual. Patch OpenClaw fetch-guard for web search DNS (NemoClaw #1252 / OpenClaw #59005)
+# OpenClaw's fetch-guard does local DNS resolution before using the proxy, which fails
+# in the sandbox (k3s CoreDNS can't resolve external hostnames). This patch reorders
+# the code so TRUSTED_ENV_PROXY mode uses EnvHttpProxyAgent without DNS pinning.
+# Must re-apply after every sandbox rebuild.
+CONTAINER_ID=$(docker exec openshell-cluster-nemoclaw ctr -n k8s.io containers list 2>/dev/null \
+  | grep 'sandbox-from' | awk '{print $1}' | head -1)
+for FILE in $(docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
+  --exec-id find-guards --user 0 "$CONTAINER_ID" \
+  sh -c 'grep -rl "resolvePinnedHostname" /usr/local/lib/node_modules/openclaw/dist/' 2>/dev/null); do
+  docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
+    --exec-id "read-fg-$RANDOM" --user 0 "$CONTAINER_ID" cat "$FILE" > /tmp/fg-patch.js 2>&1
+  python3 -c "
+content = open('/tmp/fg-patch.js').read()
+old = '''let dispatcher = null;
+\t\ttry {
+\t\t\tconst pinned = await resolvePinnedHostnameWithPolicy(parsedUrl.hostname, {
+\t\t\t\tlookupFn: params.lookupFn,
+\t\t\t\tpolicy: params.policy
+\t\t\t});
+\t\t\tif (mode === GUARDED_FETCH_MODE.TRUSTED_ENV_PROXY && hasProxyEnvConfigured()) dispatcher = new EnvHttpProxyAgent();
+\t\t\telse if (params.pinDns !== false) dispatcher = createPinnedDispatcher(pinned);'''
+new = '''let dispatcher = null;
+\t\ttry {
+\t\t\tconst useTrustedEnvProxy = mode === GUARDED_FETCH_MODE.TRUSTED_ENV_PROXY && hasProxyEnvConfigured();
+\t\t\tif (useTrustedEnvProxy) {
+\t\t\t\tdispatcher = new EnvHttpProxyAgent();
+\t\t\t} else {
+\t\t\t\tconst pinned = await resolvePinnedHostnameWithPolicy(parsedUrl.hostname, {
+\t\t\t\t\tlookupFn: params.lookupFn,
+\t\t\t\t\tpolicy: params.policy
+\t\t\t\t});
+\t\t\t\tif (params.pinDns !== false) dispatcher = createPinnedDispatcher(pinned);
+\t\t\t}'''
+if old in content:
+    open('/tmp/fg-patch.js', 'w').write(content.replace(old, new))
+    print(f'PATCHED: {\"$FILE\"!r}')
+else:
+    print(f'SKIPPED: {\"$FILE\"!r}')
+"
+  docker exec -i openshell-cluster-nemoclaw ctr -n k8s.io task exec \
+    --exec-id "write-fg-$RANDOM" --user 0 "$CONTAINER_ID" \
+    sh -c "cat > $FILE" < /tmp/fg-patch.js 2>&1
+done
+rm /tmp/fg-patch.js 2>/dev/null
+
+# 11b. Update config hash (prevents "integrity check FAILED" from nemoclaw-start)
+docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
+  --exec-id fix-hash --user 0 "$CONTAINER_ID" \
+  sh -c 'sha256sum /sandbox/.openclaw/openclaw.json > /sandbox/.openclaw/.config-hash && chmod 444 /sandbox/.openclaw/.config-hash'
+
+# 11c. Restart the gateway process so it loads the patched fetch-guard files.
+# The container's init system respawns it automatically after kill.
+docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
+  --exec-id find-gw-pid --user 0 "$CONTAINER_ID" \
+  sh -c 'ls /proc/*/cmdline 2>/dev/null | while read f; do
+    pid=$(echo "$f" | cut -d/ -f3)
+    tr "\0" " " < "$f" 2>/dev/null | grep -q "openclaw-gateway" && echo "$pid"
+  done' | head -1 | xargs -I{} docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
+  --exec-id kill-gw --user 0 "$CONTAINER_ID" kill {}
+sleep 5  # wait for gateway respawn
+
+# 12. Approve device pairing (NemoClaw #1310)
+# After onboard or gateway restart, the CLI agent needs device approval to connect
+# to the gateway. Without this, the agent falls back to embedded mode (which works
+# but loses access to some gateway-only features).
+ssh openshell-my-assistant 'openclaw devices list 2>&1' | grep -oP '[0-9a-f-]{36}' | head -1 | \
+  xargs -I{} ssh openshell-my-assistant "openclaw devices approve {} 2>&1"
 ```
 
 **Prevention:** The recovery script (`recover-after-reboot.sh`) now checks SSH health after gateway restart (step 3). If SSH is broken, it warns early instead of continuing with a broken tunnel. Always back up workspace regularly — a broken SSH tunnel means you can't make a fresh backup.
@@ -349,6 +427,8 @@ openshell inference set --provider compatible-endpoint \
 | Providers | No (gateway-level) | But may need re-pointing (step 4) |
 | Network policy | Yes (reset to presets) | Re-add custom endpoints (step 5) |
 | Port forward | Yes (recreated) | Onboard restarts it |
+| Fetch-guard DNS patch | Yes (lost) | Re-apply via docker exec (step 11) |
+| Gateway device pairing | Yes (lost) | Re-approve device (step 12) |
 
 ### Files containing model identity (audit)
 
