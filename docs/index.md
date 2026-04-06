@@ -346,6 +346,7 @@ Sandbox Hardening <deployment/sandbox-hardening>
 :hidden:
 
 Monitor Sandbox Activity <monitoring/monitor-sandbox-activity>
+Automated Health Checks <monitoring/automated-health-checks>
 ```
 
 ```{toctree}
