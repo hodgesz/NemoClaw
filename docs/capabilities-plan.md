@@ -64,6 +64,26 @@ Expanding the NemoClaw setup on M4 Pro 48GB (sandbox "my-assistant", Bedrock/Son
 
 ---
 
+## Phase 2C: Browser/Web Automation via CDP (completed 2026-04-05)
+
+> Host-side Chrome + two-script tunnel. No sandbox rebuild needed.
+
+- [x] **Architecture**: Host-side headless Chrome (port 9222) → CDP proxy (port 9223, rewrites Host header) → in-sandbox CONNECT tunnel (localhost:9222)
+- [x] **`scripts/chrome-cdp-proxy.js`** — Runs on host, rewrites `Host: host.openshell.internal` to `Host: localhost` for Chrome's security check. Handles HTTP discovery and WebSocket upgrade.
+- [x] **`scripts/cdp-tunnel.js`** — Runs inside sandbox, listens on `localhost:9222` and creates HTTP CONNECT tunnels through the egress proxy (`10.200.0.1:3128`) to the host-side proxy. Needed because Node.js `ws` library doesn't use `HTTP_PROXY` env vars.
+- [x] **Network policy**: `browser_cdp` entry with `access: full` for `host.openshell.internal:9223`
+- [x] **openclaw.json**: `browser.profiles.remote.cdpUrl = "http://127.0.0.1:9222"`
+- **Known limitation**: DNS pre-check in OpenClaw's browser tool fails because UDP 53 is blocked in sandbox (OpenShell #387). Browser open with IP addresses works; domain names require upstream DNS fix.
+- **Known limitation**: Screenshots require media directory symlink (`/sandbox/.openclaw/media → /sandbox/.openclaw-data/media`)
+- Lesson: OpenShell egress proxy strips WebSocket upgrade headers for HTTP traffic; must use CONNECT tunnel
+- Lesson: `tls: skip` in policy gives TCP passthrough but doesn't help when Node.js bypasses the proxy
+- Lesson: Same CONNECT-tunnel pattern as Discord's proxy workaround (NemoClaw #409)
+- Lesson: OpenShell v0.0.21+ fixed WebSocket relay in proxy (PR #718), but only helps traffic that goes through the proxy
+
+**Commit after Phase 2C** (scripts, policy changes)
+
+---
+
 ## Phase 3: MCP Server Integration
 
 > mcporter setup inside sandbox + per-server policy entries. No rebuild.

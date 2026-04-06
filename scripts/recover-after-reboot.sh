@@ -261,67 +261,19 @@ fi
 # ── Step 5: Re-apply network policy for local endpoints ──────────
 step "Step 5/6: Checking network policy for local endpoints"
 
-if dry "would check/update network policy"; then
+if dry "would apply full network policy"; then
   :
 else
-  policy="$(openshell policy get --full "$SANDBOX_NAME" 2>&1 || true)"
-  needs_update=0
-
-  if ! echo "$policy" | grep -q "ollama_local"; then
-    needs_update=1
-    info "ollama_local endpoint missing from policy."
-  fi
-  if ! echo "$policy" | grep -q "litellm"; then
-    needs_update=1
-    info "litellm endpoint missing from policy."
-  fi
-
-  if [ "$needs_update" -eq 1 ]; then
-    # Extract the YAML portion (everything after the --- line)
-    policy_yaml="$(echo "$policy" | sed -n '/^---$/,$ p' | tail -n +2)"
-
-    if [ -z "$policy_yaml" ]; then
-      warn "Could not parse current policy. Skipping policy update."
-      warn "You may need to manually add ollama_local and litellm endpoints."
-    else
-      # Append the local endpoint blocks
-      cat >/tmp/nemoclaw-recovery-policy.yaml <<PEOF
-${policy_yaml}
-  ollama_local:
-    name: ollama_local
-    endpoints:
-    - host: host.openshell.internal
-      port: 11434
-      protocol: rest
-      enforcement: enforce
-      rules:
-      - allow:
-          method: '*'
-          path: /**
-    binaries:
-    - path: /usr/local/bin/claude
-    - path: /usr/local/bin/openclaw
-  litellm:
-    name: litellm
-    endpoints:
-    - host: host.openshell.internal
-      port: 4000
-      protocol: rest
-      enforcement: enforce
-      rules:
-      - allow:
-          method: '*'
-          path: /**
-    binaries:
-    - path: /usr/local/bin/claude
-    - path: /usr/local/bin/openclaw
-PEOF
-      openshell policy set --policy /tmp/nemoclaw-recovery-policy.yaml --wait "$SANDBOX_NAME" 2>&1
-      info "Network policy updated with local endpoints."
-      rm -f /tmp/nemoclaw-recovery-policy.yaml
-    fi
+  POLICY_FILE="$REPO_DIR/nemoclaw-blueprint/policies/my-assistant-policy.yaml"
+  if [ -f "$POLICY_FILE" ]; then
+    openshell policy set --policy "$POLICY_FILE" --wait "$SANDBOX_NAME" 2>&1
+    info "Full network policy applied from $POLICY_FILE."
+    # Approve any pending rules (CONNECT binary identity, OpenShell #1471)
+    openshell rule approve-all "$SANDBOX_NAME" 2>&1 || true
+    info "Pending rules approved."
   else
-    info "Network policy already includes local endpoints."
+    warn "Policy file not found: $POLICY_FILE"
+    warn "Network policy not updated. Apply manually with openshell policy set."
   fi
 fi
 
