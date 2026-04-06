@@ -20,11 +20,15 @@ status: published
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Automated Health Checks
+# Automated Health Checks for NemoClaw Services
 
-The `scripts/health-check.sh` script probes all critical NemoClaw services and reports their status. It can run interactively, on a timer, or in CI, and optionally sends alerts when failures are detected.
+The `scripts/health-check.sh` script probes all critical NemoClaw services and reports their status.
+It can run interactively, on a timer, or in CI.
+It optionally sends alerts when failures are detected.
 
 ## What It Checks
+
+The following table lists each check, what it probes, and how the probe works.
 
 | Check | What it probes | How |
 |-------|---------------|-----|
@@ -151,7 +155,8 @@ $ crontab -e
 
 ### Linux (systemd timer)
 
-Create a service and timer unit for more robust scheduling. See the systemd documentation for details.
+Create a service and timer unit for scheduled execution.
+See the systemd documentation for details.
 
 ## HTML Status Page
 
@@ -175,6 +180,8 @@ If you are running the Telegram bridge (`scripts/telegram-bridge.js`), send `/st
 
 ## Configuration
 
+Use these flags to customize which services are checked and how results are reported.
+
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--sandbox <name>` | Sandbox to check | `$NEMOCLAW_SANDBOX_NAME` or `my-assistant` |
@@ -187,13 +194,15 @@ If you are running the Telegram bridge (`scripts/telegram-bridge.js`), send `/st
 
 ## Exit Codes
 
+The script uses the following exit codes for scripting and CI integration.
+
 | Code | Meaning |
 |------|---------|
 | `0` | All checks passed |
 | `1` | One or more checks failed |
 | `2` | Script error (bad arguments, missing dependencies) |
 
-## Related Topics
+## Next Steps
 
 - [Monitor Sandbox Activity](monitor-sandbox-activity.md) for manual inspection and debugging.
 - [Recovery After Reboot](../recovery-after-reboot.md) to restore services after a host restart.

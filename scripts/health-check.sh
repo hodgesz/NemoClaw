@@ -31,6 +31,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC2034
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Defaults ────────────────────────────────────────────────────
@@ -89,7 +90,11 @@ while [ $# -gt 0 ]; do
       sed -n '2,/^$/s/^# *//p' "$0"
       exit 0
       ;;
-    *) shift ;;
+    *)
+      echo "Error: Unknown option '$1'" >&2
+      echo "Run with --help for usage." >&2
+      exit 2
+      ;;
   esac
 done
 
@@ -101,6 +106,17 @@ RESULTS=()
 
 should_skip() {
   echo ",$SKIP_CHECKS," | grep -qi ",$1,"
+}
+
+# Escape special characters for JSON string values.
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  echo "$s"
 }
 
 record() {
@@ -140,9 +156,11 @@ check_gateway() {
   fi
   local status_out
   status_out="$(openshell status 2>&1 || true)"
-  if echo "$status_out" | grep -qi "healthy"; then
+  # Use word-boundary matching to avoid "unhealthy" matching "healthy"
+  # and "disconnected" matching "connected".
+  if echo "$status_out" | grep -qiw "healthy"; then
     record "gateway" "pass" "Gateway '$GATEWAY_NAME' healthy"
-  elif echo "$status_out" | grep -qi "connected"; then
+  elif echo "$status_out" | grep -qiw "connected"; then
     record "gateway" "pass" "Gateway '$GATEWAY_NAME' connected"
   else
     record "gateway" "fail" "Gateway not healthy"
@@ -157,12 +175,15 @@ check_sandbox() {
   fi
   local sandbox_out
   sandbox_out="$(openshell sandbox get "$SANDBOX_NAME" 2>&1 || true)"
-  if echo "$sandbox_out" | grep -qi "ready"; then
-    record "sandbox" "pass" "Sandbox '$SANDBOX_NAME' ready"
-  elif echo "$sandbox_out" | grep -qi "not found\|does not exist"; then
+  # Check failure cases first — "not ready" contains "ready" so order matters.
+  if echo "$sandbox_out" | grep -qi "not found\|does not exist"; then
     record "sandbox" "fail" "Sandbox '$SANDBOX_NAME' not found"
-  else
+  elif echo "$sandbox_out" | grep -qi "not ready"; then
     record "sandbox" "fail" "Sandbox '$SANDBOX_NAME' not ready"
+  elif echo "$sandbox_out" | grep -qiw "ready"; then
+    record "sandbox" "pass" "Sandbox '$SANDBOX_NAME' ready"
+  else
+    record "sandbox" "fail" "Sandbox '$SANDBOX_NAME' state unknown"
   fi
 }
 
@@ -241,11 +262,12 @@ check_bridge() {
   if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
     record "bridge" "pass" "Telegram bridge running (PID $(cat "$pidfile"))"
   else
-    # Not necessarily a failure — bridge is optional
-    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-      record "bridge" "fail" "Telegram bridge not running (token is set)"
+    # Bridge requires both TELEGRAM_BOT_TOKEN and NVIDIA_API_KEY (same as start-services.sh).
+    # Only report failure if both are set but the bridge is not running.
+    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${NVIDIA_API_KEY:-}" ]; then
+      record "bridge" "fail" "Telegram bridge not running (tokens are set)"
     else
-      record "bridge" "skip" "No TELEGRAM_BOT_TOKEN"
+      record "bridge" "skip" "Bridge prerequisites not set"
     fi
   fi
 }
@@ -254,7 +276,7 @@ check_agent() {
   if should_skip "agent"; then record "agent" "skip" ""; return; fi
   # Run openclaw doctor inside the sandbox via SSH.
   # The command outputs a banner, warnings, and diagnostic lines.
-  # We only look for explicit error/failure indicators.
+  # We check the exit code first, then look for explicit error indicators.
   local doctor_out doctor_exit
   doctor_out=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
@@ -262,13 +284,15 @@ check_agent() {
   doctor_exit=$(echo "$doctor_out" | grep -o 'EXIT:[0-9]*' | tail -1 | cut -d: -f2)
   if [ "${doctor_exit:-1}" = "0" ]; then
     record "agent" "pass" "openclaw doctor: passed (exit 0)"
-  elif echo "$doctor_out" | grep -qi "error\|fail\|unhealthy"; then
-    # Extract the first meaningful error line
-    local err_line
-    err_line=$(echo "$doctor_out" | grep -i "error\|fail\|unhealthy" | head -1)
-    record "agent" "fail" "openclaw doctor: ${err_line:0:80}"
   else
-    record "agent" "pass" "openclaw doctor: responded"
+    # Non-zero exit or missing exit code — treat as failure
+    local err_line
+    err_line=$(echo "$doctor_out" | grep -i "error\|fail\|unhealthy" | head -1 || true)
+    if [ -n "$err_line" ]; then
+      record "agent" "fail" "openclaw doctor: ${err_line:0:80}"
+    else
+      record "agent" "fail" "openclaw doctor: exited with code ${doctor_exit:-unknown}"
+    fi
   fi
 }
 
@@ -301,18 +325,20 @@ if [ "$OUTPUT_MODE" = "pretty" ]; then
 fi
 
 if [ "$OUTPUT_MODE" = "json" ]; then
-  # Build JSON output
+  safe_sandbox=$(json_escape "$SANDBOX_NAME")
+  safe_gateway=$(json_escape "$GATEWAY_NAME")
   echo "{"
   echo "  \"timestamp\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\","
-  echo "  \"sandbox\": \"$SANDBOX_NAME\","
-  echo "  \"gateway\": \"$GATEWAY_NAME\","
+  echo "  \"sandbox\": \"$safe_sandbox\","
+  echo "  \"gateway\": \"$safe_gateway\","
   echo "  \"summary\": { \"passed\": $CHECKS_PASSED, \"failed\": $CHECKS_FAILED, \"skipped\": $CHECKS_SKIPPED },"
   echo "  \"checks\": ["
   first=1
   for result in "${RESULTS[@]}"; do
     IFS='|' read -r name status detail <<< "$result"
+    safe_detail=$(json_escape "$detail")
     [ "$first" -eq 1 ] && first=0 || echo ","
-    printf '    { "name": "%s", "status": "%s", "detail": "%s" }' "$name" "$status" "$detail"
+    printf '    { "name": "%s", "status": "%s", "detail": "%s" }' "$name" "$status" "$safe_detail"
   done
   echo ""
   echo "  ]"

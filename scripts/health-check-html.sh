@@ -62,6 +62,17 @@ PASSED=$(echo "$JSON" | grep '"passed"' | head -1 | sed 's/.*"passed": *\([0-9]*
 FAILED=$(echo "$JSON" | grep '"failed"' | head -1 | sed 's/.*"failed": *\([0-9]*\).*/\1/')
 SKIPPED=$(echo "$JSON" | grep '"skipped"' | head -1 | sed 's/.*"skipped": *\([0-9]*\).*/\1/')
 
+# Escape HTML special characters to prevent injection via check output.
+html_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"
+  s="${s//</&lt;}"
+  s="${s//>/&gt;}"
+  s="${s//\"/&quot;}"
+  s="${s//\'/&#39;}"
+  echo "$s"
+}
+
 if [ "$FAILED" -eq 0 ]; then
   OVERALL_STATUS="Healthy"
   OVERALL_COLOR="#22c55e"
@@ -78,6 +89,10 @@ while IFS= read -r line; do
   name=$(echo "$line" | sed 's/.*"name": *"\([^"]*\)".*/\1/')
   check_status=$(echo "$line" | sed 's/.*"status": *"\([^"]*\)".*/\1/')
   detail=$(echo "$line" | sed 's/.*"detail": *"\([^"]*\)".*/\1/')
+
+  # Sanitize values before embedding in HTML
+  name=$(html_escape "$name")
+  detail=$(html_escape "$detail")
 
   case "$check_status" in
     pass)
@@ -142,7 +157,7 @@ cat > "$OUTPUT_FILE" << HTMLEOF
       <span class="badge" style="background:${OVERALL_BG};color:${OVERALL_COLOR}">${OVERALL_STATUS}</span>
     </div>
     <div class="meta">
-      Sandbox: <strong>${SANDBOX}</strong> &middot; Last checked: ${TIMESTAMP} &middot; Auto-refreshes every 60s
+      Sandbox: <strong>$(html_escape "$SANDBOX")</strong> &middot; Last checked: ${TIMESTAMP} &middot; Auto-refreshes every 60s
     </div>
     <div class="card">
       <table>${ROWS}
