@@ -116,7 +116,7 @@ json_escape() {
   s="${s//$'\n'/\\n}"
   s="${s//$'\r'/\\r}"
   s="${s//$'\t'/\\t}"
-  echo "$s"
+  printf '%s' "$s"
 }
 
 record() {
