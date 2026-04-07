@@ -1020,6 +1020,392 @@ async function sandboxConnect(sandboxName) {
   exitWithSpawnResult(result);
 }
 
+/**
+ * Resolve Claude Code authentication environment variables.
+ * Supports AWS Bedrock, GCP Vertex AI, and direct Anthropic API key.
+ * Returns an array of [key, value] pairs to inject, or null if no auth found.
+ */
+function resolveClaudeAuthEnv() {
+  const pairs = [];
+
+  // Bedrock — check env first, then credentials store
+  if (process.env.CLAUDE_CODE_USE_BEDROCK === "1") {
+    pairs.push(["CLAUDE_CODE_USE_BEDROCK", "1"]);
+
+    // Forward AWS env vars. When a bearer token is present it provides
+    // self-contained auth, so skip AWS_PROFILE which would cause Claude
+    // Code to look for ~/.aws/config (absent inside the sandbox).
+    const hasBearerToken = Boolean(process.env.AWS_BEARER_TOKEN_BEDROCK);
+    const awsVars = [
+      "AWS_REGION", "AWS_DEFAULT_REGION",
+      "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+      "AWS_BEARER_TOKEN_BEDROCK",
+    ];
+    if (!hasBearerToken) {
+      awsVars.push("AWS_PROFILE");
+    }
+    for (const v of awsVars) {
+      if (process.env[v]) pairs.push([v, process.env[v]]);
+    }
+    return pairs.length > 1 ? pairs : null;
+  }
+
+  // Vertex AI
+  if (process.env.CLAUDE_CODE_USE_VERTEX === "1") {
+    pairs.push(["CLAUDE_CODE_USE_VERTEX", "1"]);
+    const vertexVars = [
+      "GOOGLE_APPLICATION_CREDENTIALS", "CLOUD_ML_REGION",
+      "ANTHROPIC_VERTEX_PROJECT_ID", "GOOGLE_CLOUD_PROJECT",
+    ];
+    for (const v of vertexVars) {
+      if (process.env[v]) pairs.push([v, process.env[v]]);
+    }
+    return pairs.length > 1 ? pairs : null;
+  }
+
+  // Direct Anthropic API key — from env or credentials store
+  const apiKey = getCredential("ANTHROPIC_API_KEY");
+  if (apiKey) {
+    return [["ANTHROPIC_API_KEY", apiKey]];
+  }
+
+  return null;
+}
+
+async function sandboxClaude(sandboxName, actionArgs) {
+  await ensureLiveSandboxOrExit(sandboxName);
+  checkAndRecoverSandboxProcesses(sandboxName);
+
+  // Resolve Claude Code auth — supports Bedrock, Vertex, or direct Anthropic API key.
+  const claudeAuthEnv = resolveClaudeAuthEnv();
+  if (!claudeAuthEnv) {
+    console.error("");
+    console.error(`  ${_RD}No Claude Code credentials found.${R}`);
+    console.error("");
+    console.error("  Claude Code requires one of:");
+    console.error("    • AWS Bedrock:  export CLAUDE_CODE_USE_BEDROCK=1  (+ AWS_PROFILE or AWS creds)");
+    console.error("    • GCP Vertex:   export CLAUDE_CODE_USE_VERTEX=1   (+ GOOGLE_APPLICATION_CREDENTIALS)");
+    console.error("    • Anthropic:    export ANTHROPIC_API_KEY=sk-ant-...");
+    console.error("");
+    process.exit(1);
+  }
+
+  // Parse flags
+  const printIdx = actionArgs.indexOf("--print");
+  const modelIdx = actionArgs.indexOf("--model");
+  const cwdIdx = actionArgs.indexOf("--cwd");
+  const resumeIdx = actionArgs.indexOf("--resume");
+  const schemaIdx = actionArgs.indexOf("--json-schema");
+  const outputFmtIdx = actionArgs.indexOf("--output-format");
+  const printPrompt = printIdx !== -1 ? actionArgs[printIdx + 1] : null;
+  const model = modelIdx !== -1 ? actionArgs[modelIdx + 1] : null;
+  const cwd = cwdIdx !== -1 ? actionArgs[cwdIdx + 1] : "/sandbox";
+  const resumeId = resumeIdx !== -1 ? actionArgs[resumeIdx + 1] : null;
+  const jsonSchema = schemaIdx !== -1 ? actionArgs[schemaIdx + 1] : null;
+  const outputFmt = outputFmtIdx !== -1 ? actionArgs[outputFmtIdx + 1] : null;
+  const continueFlag = actionArgs.includes("--continue");
+
+  // Build the claude command to run inside the sandbox
+  const claudeArgs = [];
+  if (printPrompt) {
+    claudeArgs.push("--print", shellQuote(printPrompt));
+  }
+  if (model) {
+    claudeArgs.push("--model", shellQuote(model));
+  }
+  if (resumeId) {
+    claudeArgs.push("--resume", shellQuote(resumeId));
+  }
+  if (continueFlag) {
+    claudeArgs.push("--continue");
+  }
+  if (jsonSchema) {
+    // Load schema from file if it's a path, otherwise pass inline
+    let schemaStr = jsonSchema;
+    try {
+      schemaStr = fs.readFileSync(path.resolve(jsonSchema), "utf-8").replace(/\n/g, "");
+    } catch {
+      /* treat as inline JSON */
+    }
+    claudeArgs.push("--json-schema", shellQuote(schemaStr));
+  }
+  if (outputFmt) {
+    claudeArgs.push("--output-format", shellQuote(outputFmt));
+  }
+
+  // Get SSH config for the sandbox
+  const sshConfigResult = captureOpenshell(["sandbox", "ssh-config", sandboxName], {
+    ignoreError: true,
+  });
+  if (sshConfigResult.status !== 0) {
+    console.error("  Failed to retrieve SSH config for sandbox.");
+    process.exit(1);
+  }
+
+  const tmpFile = path.join(os.tmpdir(), `nemoclaw-ssh-${process.pid}-${Date.now()}.conf`);
+  fs.writeFileSync(tmpFile, sshConfigResult.output, { mode: 0o600 });
+
+  try {
+    const sshArgs = [
+      "-F", tmpFile,
+      "-o", "StrictHostKeyChecking=no",
+      "-o", "UserKnownHostsFile=/dev/null",
+      "-o", "LogLevel=ERROR",
+      "-t",  // force TTY allocation for interactive sessions
+    ];
+
+    // Inject auth env vars and launch claude inside the sandbox.
+    // Use export+semicolons to avoid quoting issues with SSH remote commands.
+    // Claude Code may be installed globally or under /sandbox/.local via npm prefix.
+    const claudeBin = "$(command -v claude || echo /sandbox/.local/node_modules/.bin/claude)";
+    const envExports = claudeAuthEnv.map(([k, v]) => `export ${k}=${shellQuote(v)}`).join("; ");
+    const remoteCmd = `${envExports}; cd ${shellQuote(cwd)} && ${claudeBin} ${claudeArgs.join(" ")}`;
+    sshArgs.push(`openshell-${sandboxName}`, remoteCmd);
+
+    if (printPrompt) {
+      // Headless mode — capture output
+      console.log("");
+      console.log(`  ${G}Claude Code${R} ${D}(headless)${R} → sandbox ${B}${sandboxName}${R}`);
+      if (model) console.log(`  ${D}Model: ${model}${R}`);
+      console.log(`  ${D}Working directory: ${cwd}${R}`);
+      if (resumeId) console.log(`  ${D}Resuming session: ${resumeId}${R}`);
+      if (continueFlag) console.log(`  ${D}Continuing most recent session${R}`);
+      if (jsonSchema) console.log(`  ${D}JSON schema: ${jsonSchema}${R}`);
+      if (outputFmt) console.log(`  ${D}Output format: ${outputFmt}${R}`);
+      console.log("");
+
+      const result = spawnSync("ssh", sshArgs, {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 300000,  // 5 min timeout for headless
+      });
+
+      if (result.stdout) process.stdout.write(result.stdout);
+      if (result.status !== 0 && result.stderr) {
+        process.stderr.write(result.stderr);
+      }
+      process.exit(result.status ?? 1);
+    } else {
+      // Interactive mode — pass through TTY
+      console.log("");
+      console.log(`  ${G}Claude Code${R} → sandbox ${B}${sandboxName}${R}`);
+      if (model) console.log(`  ${D}Model: ${model}${R}`);
+      console.log(`  ${D}Working directory: ${cwd}${R}`);
+      console.log(`  ${D}Exit with /exit or Ctrl+C${R}`);
+      console.log("");
+
+      const result = spawnSync("ssh", sshArgs, {
+        stdio: "inherit",
+        env: process.env,
+      });
+      exitWithSpawnResult(result);
+    }
+  } finally {
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+async function sandboxClaudeSdk(sandboxName, actionArgs) {
+  await ensureLiveSandboxOrExit(sandboxName);
+  checkAndRecoverSandboxProcesses(sandboxName);
+
+  // Handle --sessions subcommand (no auth needed)
+  if (actionArgs[0] === "--sessions") {
+    try {
+      const { listSandboxSessions } = require("./lib/claude-sdk");
+      const limit = actionArgs[1] ? parseInt(actionArgs[1], 10) : 10;
+      const sessions = await listSandboxSessions(sandboxName, limit);
+      if (sessions.length === 0) {
+        console.log("");
+        console.log("  No Claude Code sessions found for this sandbox.");
+        console.log("");
+      } else {
+        console.log("");
+        console.log(`  ${G}Claude Code Sessions${R} — sandbox ${B}${sandboxName}${R}`);
+        console.log("");
+        for (const s of sessions) {
+          const date = new Date(s.timestamp).toLocaleString();
+          const model_ = s.model || "unknown";
+          console.log(`  ${B}${s.sessionId}${R}`);
+          console.log(`    ${D}${date} · ${model_} · ${s.numMessages || "?"} messages${R}`);
+        }
+        console.log("");
+        console.log(`  ${D}Resume with: nemoclaw ${sandboxName} claude-sdk --resume <session-id> --prompt "..."${R}`);
+        console.log("");
+      }
+    } catch (err) {
+      console.error(`  ${_RD}Error listing sessions:${R} ${err.message || err}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  const claudeAuthEnv = resolveClaudeAuthEnv();
+  if (!claudeAuthEnv) {
+    console.error("");
+    console.error(`  ${_RD}No Claude Code credentials found.${R}`);
+    console.error("");
+    console.error("  Claude Code requires one of:");
+    console.error("    • AWS Bedrock:  export CLAUDE_CODE_USE_BEDROCK=1  (+ AWS_PROFILE or AWS creds)");
+    console.error("    • GCP Vertex:   export CLAUDE_CODE_USE_VERTEX=1   (+ GOOGLE_APPLICATION_CREDENTIALS)");
+    console.error("    • Anthropic:    export ANTHROPIC_API_KEY=sk-ant-...");
+    console.error("");
+    process.exit(1);
+  }
+
+  // Parse flags
+  const promptIdx = actionArgs.indexOf("--prompt");
+  const modelIdx = actionArgs.indexOf("--model");
+  const cwdIdx = actionArgs.indexOf("--cwd");
+  const maxTurnsIdx = actionArgs.indexOf("--max-turns");
+  const toolsIdx = actionArgs.indexOf("--tools");
+  const resumeIdx = actionArgs.indexOf("--resume");
+  const outputIdx = actionArgs.indexOf("--output-schema");
+  const verboseFlag = actionArgs.includes("--verbose");
+  const continueFlag = actionArgs.includes("--continue");
+  const jsonFlag = actionArgs.includes("--json");
+
+  const promptText = promptIdx !== -1 ? actionArgs[promptIdx + 1] : null;
+  const model = modelIdx !== -1 ? actionArgs[modelIdx + 1] : null;
+  const cwd = cwdIdx !== -1 ? actionArgs[cwdIdx + 1] : "/sandbox";
+  const maxTurns = maxTurnsIdx !== -1 ? parseInt(actionArgs[maxTurnsIdx + 1], 10) : undefined;
+  const resumeSessionId = resumeIdx !== -1 ? actionArgs[resumeIdx + 1] : null;
+  const outputSchemaPath = outputIdx !== -1 ? actionArgs[outputIdx + 1] : null;
+  const tools =
+    toolsIdx !== -1
+      ? actionArgs[toolsIdx + 1].split(",").map((t) => t.trim())
+      : ["Read", "Edit", "Write", "Bash", "Glob", "Grep"];
+
+  if (!promptText) {
+    console.error("");
+    console.error("  Usage: nemoclaw <name> claude-sdk --prompt \"your prompt here\"");
+    console.error("");
+    console.error("  Options:");
+    console.error("    --prompt <text>       Prompt to send (required)");
+    console.error("    --model <name>        Model to use (e.g., claude-sonnet-4-6)");
+    console.error("    --cwd <path>          Working directory inside sandbox (default: /sandbox)");
+    console.error("    --max-turns <n>       Max agentic turns");
+    console.error("    --tools <list>        Comma-separated tool list (default: Read,Edit,Write,Bash,Glob,Grep)");
+    console.error("    --verbose             Show all SDK messages (not just result)");
+    console.error("");
+    console.error("  Session management:");
+    console.error("    --resume <id>         Resume a previous session by ID");
+    console.error("    --continue            Continue the most recent session");
+    console.error("    --sessions [limit]    List recent sessions (no prompt needed)");
+    console.error("");
+    console.error("  Output control:");
+    console.error("    --output-schema <file> Return structured JSON matching the given JSON Schema file");
+    console.error("    --json                Output raw JSON result (no formatting)");
+    console.error("");
+    process.exit(1);
+  }
+
+  // Load output schema if specified
+  let outputFormat = undefined;
+  if (outputSchemaPath) {
+    try {
+      const schemaContent = fs.readFileSync(path.resolve(outputSchemaPath), "utf-8");
+      outputFormat = { type: "json_schema", schema: JSON.parse(schemaContent) };
+    } catch (err) {
+      console.error(`  ${_RD}Failed to load output schema:${R} ${err.message}`);
+      process.exit(1);
+    }
+  }
+
+  // Get SSH config
+  const sshConfigResult = captureOpenshell(["sandbox", "ssh-config", sandboxName], {
+    ignoreError: true,
+  });
+  if (sshConfigResult.status !== 0) {
+    console.error("  Failed to retrieve SSH config for sandbox.");
+    process.exit(1);
+  }
+
+  if (!jsonFlag) {
+    console.log("");
+    console.log(`  ${G}Claude Code SDK${R} → sandbox ${B}${sandboxName}${R}`);
+    if (model) console.log(`  ${D}Model: ${model}${R}`);
+    console.log(`  ${D}Working directory: ${cwd}${R}`);
+    console.log(`  ${D}Tools: ${tools.join(", ")}${R}`);
+    if (maxTurns) console.log(`  ${D}Max turns: ${maxTurns}${R}`);
+    if (resumeSessionId) console.log(`  ${D}Resuming session: ${resumeSessionId}${R}`);
+    if (continueFlag) console.log(`  ${D}Continuing most recent session${R}`);
+    if (outputFormat) console.log(`  ${D}Output schema: ${outputSchemaPath}${R}`);
+    console.log("");
+  }
+
+  try {
+    const { querySandbox } = require("./lib/claude-sdk");
+
+    const stream = querySandbox({
+      sandboxName,
+      sshConfigContent: sshConfigResult.output,
+      authEnv: claudeAuthEnv,
+      prompt: promptText,
+      sdkOptions: {
+        model,
+        cwd,
+        maxTurns,
+        allowedTools: tools,
+        permissionMode: "bypassPermissions",
+        resume: resumeSessionId || undefined,
+        continue: continueFlag || undefined,
+        outputFormat,
+      },
+    });
+
+    for await (const message of stream) {
+      if (message.type === "assistant" && verboseFlag && !jsonFlag) {
+        for (const block of message.message?.content || []) {
+          if ("text" in block && block.text) {
+            process.stdout.write(`  ${D}[assistant]${R} ${block.text}\n`);
+          }
+          if ("name" in block) {
+            process.stdout.write(`  ${D}[tool: ${block.name}]${R}\n`);
+          }
+        }
+      } else if (message.type === "result") {
+        if (jsonFlag) {
+          // Raw JSON output for piping/scripting
+          const output = {
+            success: message.subtype === "success",
+            result: message.result || null,
+            sessionId: message.session_id || null,
+            cost: message.total_cost_usd || null,
+          };
+          process.stdout.write(JSON.stringify(output, null, 2) + "\n");
+        } else if (message.subtype === "success") {
+          console.log(`  ${G}Result:${R}`);
+          console.log("");
+          if (message.result) console.log(message.result);
+          console.log("");
+          if (message.session_id) console.log(`  ${D}Session: ${message.session_id}${R}`);
+          if (message.total_cost_usd) {
+            console.log(`  ${D}Cost: $${message.total_cost_usd.toFixed(4)}${R}`);
+          }
+          console.log(`  ${D}Resume: nemoclaw ${sandboxName} claude-sdk --resume ${message.session_id} --prompt "..."${R}`);
+        } else {
+          console.error(`  ${_RD}Error: ${message.subtype}${R}`);
+          if (message.result) console.error(`  ${message.result}`);
+        }
+      }
+    }
+  } catch (err) {
+    if (err.code === "MODULE_NOT_FOUND" || err.message?.includes("Cannot find module")) {
+      console.error(`  ${_RD}Claude Agent SDK not installed.${R}`);
+      console.error("");
+      console.error("  Install it with: npm install @anthropic-ai/claude-agent-sdk");
+      process.exit(1);
+    }
+    console.error(`  ${_RD}SDK error:${R} ${err.message || err}`);
+    process.exit(1);
+  }
+}
+
 // eslint-disable-next-line complexity
 async function sandboxStatus(sandboxName) {
   const sb = registry.getSandbox(sandboxName);
@@ -1271,6 +1657,37 @@ function help() {
     nemoclaw <name> logs ${D}[--follow]${R}  Stream sandbox logs
     nemoclaw <name> destroy          Stop NIM + delete sandbox ${D}(--yes to skip prompt)${R}
 
+  ${G}Claude Code:${R}
+    nemoclaw <name> claude           Launch interactive Claude Code in sandbox
+    nemoclaw <name> claude ${D}--print "prompt"${R}
+                                     Run a headless one-shot prompt
+    nemoclaw <name> claude ${D}--model claude-sonnet-4-6${R}
+                                     Use a specific model
+    nemoclaw <name> claude ${D}--cwd /path${R}
+                                     Set working directory ${D}(default: /sandbox)${R}
+    nemoclaw <name> claude ${D}--resume <session-id>${R}
+                                     Resume a previous session
+    nemoclaw <name> claude ${D}--continue${R}
+                                     Continue most recent session
+    nemoclaw <name> claude ${D}--json-schema <file-or-json>${R}
+                                     Structured JSON output via schema
+    nemoclaw <name> claude ${D}--output-format json${R}
+                                     Machine-readable JSON output
+
+  ${G}Claude Code SDK ${D}(programmatic):${R}
+    nemoclaw <name> claude-sdk ${D}--prompt "prompt"${R}
+                                     Run a prompt via the Claude Agent SDK
+    ${D}--model <name>                   Model override${R}
+    ${D}--tools Read,Edit,Bash           Comma-separated tool allowlist${R}
+    ${D}--max-turns <n>                  Limit agentic turns${R}
+    ${D}--cwd /path                      Working directory (default: /sandbox)${R}
+    ${D}--verbose                        Show all SDK messages${R}
+    ${D}--resume <session-id>            Resume a previous session${R}
+    ${D}--continue                       Continue most recent session${R}
+    ${D}--sessions [n]                   List recent sessions${R}
+    ${D}--output-schema <file.json>      Structured JSON output via schema${R}
+    ${D}--json                           Raw JSON result for scripting${R}
+
   ${G}Policy Presets:${R}
     nemoclaw <name> policy-add       Add a network or filesystem policy preset
     nemoclaw <name> policy-list      List presets ${D}(● = applied)${R}
@@ -1383,22 +1800,36 @@ const [cmd, ...args] = process.argv.slice(2);
       case "policy-list":
         sandboxPolicyList(cmd);
         break;
+      case "claude":
+        await sandboxClaude(cmd, actionArgs);
+        break;
+      case "claude-sdk":
+        await sandboxClaudeSdk(cmd, actionArgs);
+        break;
       case "destroy":
         await sandboxDestroy(cmd, actionArgs);
         break;
       default:
         console.error(`  Unknown action: ${action}`);
-        console.error(`  Valid actions: connect, status, logs, policy-add, policy-list, destroy`);
+        console.error(`  Valid actions: connect, status, logs, claude, claude-sdk, policy-add, policy-list, destroy`);
         process.exit(1);
     }
     return;
   }
 
-  if (args[0] === "connect") {
+  if (args[0] === "connect" || args[0] === "claude" || args[0] === "claude-sdk") {
     validateName(cmd, "sandbox name");
     await recoverRegistryEntries({ requestedSandboxName: cmd });
     if (registry.getSandbox(cmd)) {
-      await sandboxConnect(cmd);
+      const recoveredAction = args[0];
+      const recoveredArgs = args.slice(1);
+      if (recoveredAction === "claude") {
+        await sandboxClaude(cmd, recoveredArgs);
+      } else if (recoveredAction === "claude-sdk") {
+        await sandboxClaudeSdk(cmd, recoveredArgs);
+      } else {
+        await sandboxConnect(cmd);
+      }
       return;
     }
   }

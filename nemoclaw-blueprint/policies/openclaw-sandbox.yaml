@@ -47,6 +47,7 @@ network_policies:
   claude_code:
     name: claude_code
     endpoints:
+      # Direct Anthropic API
       - host: api.anthropic.com
         port: 443
         protocol: rest
@@ -55,6 +56,24 @@ network_policies:
         rules:
           - allow: { method: GET, path: "/**" }
           - allow: { method: POST, path: "/**" }
+      # AWS Bedrock — Claude Code uses these when CLAUDE_CODE_USE_BEDROCK=1
+      - host: bedrock-runtime.us-east-1.amazonaws.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: bedrock.us-east-1.amazonaws.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      # Telemetry
       - host: statsig.anthropic.com
         port: 443
         protocol: rest
@@ -73,6 +92,8 @@ network_policies:
           - allow: { method: POST, path: "/**" }
     binaries:
       - { path: /usr/local/bin/claude }
+      - { path: /sandbox/.local/node_modules/.bin/claude }
+      - { path: /usr/local/bin/node }
 
   nvidia:
     name: nvidia
