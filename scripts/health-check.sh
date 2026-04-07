@@ -260,8 +260,9 @@ check_bridge() {
   if should_skip "bridge"; then record "bridge" "skip" ""; return; fi
   local piddir="/tmp/nemoclaw-services-${SANDBOX_NAME}"
   local pidfile="$piddir/telegram-bridge.pid"
-  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-    record "bridge" "pass" "Telegram bridge running (PID $(cat "$pidfile"))"
+  local pid
+  if [ -f "$pidfile" ] && pid=$(cat "$pidfile") && kill -0 "$pid" 2>/dev/null; then
+    record "bridge" "pass" "Telegram bridge running (PID $pid)"
   else
     # Bridge requires both TELEGRAM_BOT_TOKEN and NVIDIA_API_KEY (same as start-services.sh).
     # Only report failure if both are set but the bridge is not running.
@@ -367,7 +368,7 @@ if [ "$CHECKS_FAILED" -gt 0 ] && [ -n "$ALERT_METHOD" ]; then
 ${CHECKS_FAILED}/${TOTAL} checks failed (sandbox: ${SANDBOX_NAME})
 
 $(echo -e "$FAILURE_LINES")
-Run: ./scripts/health-check.sh --sandbox $SANDBOX_NAME"
+Run: ./scripts/health-check.sh --sandbox '$SANDBOX_NAME'"
 
         RESULT=$(curl -s -X POST \
           "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
