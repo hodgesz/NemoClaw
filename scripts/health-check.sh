@@ -155,7 +155,8 @@ check_gateway() {
     return
   fi
   local status_out
-  status_out="$(openshell status 2>&1 || true)"
+  # Strip ANSI escape codes — openshell embeds colors that break word-boundary matching.
+  status_out="$(openshell status 2>&1 | sed 's/\x1b\[[0-9;]*m//g' || true)"
   # Use word-boundary matching to avoid "unhealthy" matching "healthy"
   # and "disconnected" matching "connected".
   if echo "$status_out" | grep -qiw "healthy"; then
