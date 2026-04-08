@@ -18,6 +18,7 @@
 #   ./scripts/health-check.sh --json                     # output JSON (for scripting)
 #   ./scripts/health-check.sh --quiet                    # exit code only (0=healthy)
 #   ./scripts/health-check.sh --skip docker,ssh          # skip specific checks
+#   ./scripts/health-check.sh --auto-fix                 # attempt to fix failures before alerting
 #
 # Exit codes:
 #   0  All checks passed
@@ -41,6 +42,7 @@ DASHBOARD_PORT="${DASHBOARD_PORT:-18789}"
 ALERT_METHOD=""          # empty = no alerting
 OUTPUT_MODE="pretty"     # pretty | json | quiet
 SKIP_CHECKS=""           # comma-separated list of checks to skip
+AUTO_FIX=0               # when set, attempt to fix failures before alerting
 
 # ── Colors (disabled when not a terminal or in json/quiet mode) ─
 if [ -t 1 ] && [ "$OUTPUT_MODE" = "pretty" ]; then
@@ -85,6 +87,10 @@ while [ $# -gt 0 ]; do
     --skip)
       SKIP_CHECKS="${2:?--skip requires a comma-separated list}"
       shift 2
+      ;;
+    --auto-fix)
+      AUTO_FIX=1
+      shift
       ;;
     --help | -h)
       sed -n '2,/^$/s/^# *//p' "$0"
@@ -298,6 +304,197 @@ check_agent() {
   fi
 }
 
+# ── Auto-fix functions ─────────────────────────────────────────
+# Each returns 0 if remediation was attempted (re-check warranted).
+
+fix_docker() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    open -a Docker 2>/dev/null || true
+  fi
+  # Give the daemon time to start
+  local elapsed=0
+  while [ "$elapsed" -lt 15 ]; do
+    docker info >/dev/null 2>&1 && return 0
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  return 0
+}
+
+fix_gateway() {
+  openshell gateway select "$GATEWAY_NAME" 2>/dev/null || true
+  openshell gateway start --name "$GATEWAY_NAME" 2>&1 || true
+  local elapsed=0
+  while [ "$elapsed" -lt 30 ]; do
+    local out
+    out="$(openshell status 2>&1 | sed 's/\x1b\[[0-9;]*m//g' || true)"
+    if echo "$out" | grep -qiw "healthy\|connected"; then
+      return 0
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  return 0
+}
+
+fix_inference() {
+  # Restart LiteLLM if not responding on port 4000
+  if ! curl -sf --max-time 2 http://localhost:4000/health >/dev/null 2>&1; then
+    if command -v litellm >/dev/null 2>&1; then
+      if [ -f /tmp/litellm.pid ]; then
+        kill "$(cat /tmp/litellm.pid)" 2>/dev/null || true
+      fi
+      nohup litellm --model bedrock/us.anthropic.claude-sonnet-4-6 --port 4000 \
+        >/tmp/litellm.log 2>&1 &
+      echo $! >/tmp/litellm.pid
+      sleep 5
+    fi
+  fi
+  # Re-create the compatible-endpoint provider
+  if command -v openshell >/dev/null 2>&1; then
+    openshell provider delete "compatible-endpoint" 2>/dev/null || true
+    openshell provider create --name "compatible-endpoint" --type "openai" \
+      --credential "OPENAI_API_KEY=dummy" \
+      --config "OPENAI_BASE_URL=http://host.openshell.internal:4000/v1" 2>/dev/null || true
+  fi
+  return 0
+}
+
+fix_dashboard() {
+  openshell forward stop "$DASHBOARD_PORT" 2>/dev/null || true
+  openshell forward start --background "$DASHBOARD_PORT" "$SANDBOX_NAME" 2>&1 || true
+  sleep 2
+  return 0
+}
+
+fix_bridge() {
+  "$SCRIPT_DIR/start-services.sh" --sandbox "$SANDBOX_NAME" 2>/dev/null || true
+  sleep 3
+  return 0
+}
+
+fix_agent() {
+  if [ -x "$SCRIPT_DIR/apply-custom-policies.sh" ]; then
+    "$SCRIPT_DIR/apply-custom-policies.sh" --sandbox "$SANDBOX_NAME" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Map check name → fix function (bash 3.2 compatible, no associative arrays)
+get_fix_func() {
+  case "$1" in
+    docker)    echo "fix_docker" ;;
+    gateway)   echo "fix_gateway" ;;
+    inference) echo "fix_inference" ;;
+    dashboard) echo "fix_dashboard" ;;
+    bridge)    echo "fix_bridge" ;;
+    agent)     echo "fix_agent" ;;
+    *)         echo "" ;;  # sandbox, ssh: not auto-fixable
+  esac
+}
+
+REMEDIATION_ORDER=(docker gateway sandbox ssh inference dashboard bridge agent)
+
+get_result_status() {
+  local target="$1"
+  local entry
+  for entry in "${RESULTS[@]}"; do
+    IFS='|' read -r rname rstatus rdetail <<< "$entry"
+    if [ "$rname" = "$target" ]; then
+      echo "$rstatus"
+      return
+    fi
+  done
+  echo "skip"
+}
+
+replace_result() {
+  local target="$1" new_status="$2" new_detail="$3"
+  local i
+  for i in "${!RESULTS[@]}"; do
+    IFS='|' read -r rname _ _ <<< "${RESULTS[$i]}"
+    if [ "$rname" = "$target" ]; then
+      RESULTS[$i]="${target}|${new_status}|${new_detail}"
+      return
+    fi
+  done
+}
+
+remediate_and_recheck() {
+  [ "$OUTPUT_MODE" = "pretty" ] && echo -e "\n${CYAN}Auto-fix: attempting remediation...${NC}\n"
+
+  local name
+  for name in "${REMEDIATION_ORDER[@]}"; do
+    local status
+    status="$(get_result_status "$name")"
+    [ "$status" = "fail" ] || continue
+
+    local func
+    func="$(get_fix_func "$name")"
+    if [ -n "$func" ]; then
+      [ "$OUTPUT_MODE" = "pretty" ] && echo -e "  ${YELLOW}⟳${NC} Fixing $name..."
+      $func 2>/dev/null || true
+    else
+      [ "$OUTPUT_MODE" = "pretty" ] && echo -e "  ${YELLOW}–${NC} $name: no auto-fix available (retry only)"
+    fi
+  done
+
+  [ "$OUTPUT_MODE" = "pretty" ] && echo -e "\n${CYAN}Auto-fix: re-checking...${NC}\n"
+
+  # Re-run only the checks that failed. Capture new result without polluting RESULTS.
+  for name in "${REMEDIATION_ORDER[@]}"; do
+    local status
+    status="$(get_result_status "$name")"
+    [ "$status" = "fail" ] || continue
+
+    # Save state
+    local saved_passed=$CHECKS_PASSED saved_failed=$CHECKS_FAILED saved_skipped=$CHECKS_SKIPPED
+    local saved_len=${#RESULTS[@]}
+
+    # Re-run the check (it appends to RESULTS)
+    "check_${name}"
+
+    # Extract the new entry
+    local new_entry="${RESULTS[$saved_len]}"
+    IFS='|' read -r _ new_status new_detail <<< "$new_entry"
+
+    # Restore RESULTS to saved state, then update the original entry
+    unset "RESULTS[$saved_len]"
+    RESULTS=("${RESULTS[@]}")
+    CHECKS_PASSED=$saved_passed
+    CHECKS_FAILED=$saved_failed
+    CHECKS_SKIPPED=$saved_skipped
+
+    replace_result "$name" "$new_status" "$new_detail"
+  done
+
+  # Recalculate counters
+  CHECKS_PASSED=0
+  CHECKS_FAILED=0
+  CHECKS_SKIPPED=0
+  local entry
+  for entry in "${RESULTS[@]}"; do
+    IFS='|' read -r _ rstatus _ <<< "$entry"
+    case "$rstatus" in
+      pass) CHECKS_PASSED=$((CHECKS_PASSED + 1)) ;;
+      fail) CHECKS_FAILED=$((CHECKS_FAILED + 1)) ;;
+      skip) CHECKS_SKIPPED=$((CHECKS_SKIPPED + 1)) ;;
+    esac
+  done
+
+  # Print post-remediation results in pretty mode
+  if [ "$OUTPUT_MODE" = "pretty" ]; then
+    for entry in "${RESULTS[@]}"; do
+      IFS='|' read -r rname rstatus rdetail <<< "$entry"
+      case "$rstatus" in
+        pass) echo -e "  ${GREEN}✓${NC} ${rname}: ${rdetail}" ;;
+        fail) echo -e "  ${RED}✗${NC} ${rname}: ${rdetail}" ;;
+        skip) echo -e "  ${YELLOW}–${NC} ${rname}: skipped" ;;
+      esac
+    done
+  fi
+}
+
 # ── Run all checks ─────────────────────────────────────────────
 if [ "$OUTPUT_MODE" = "pretty" ]; then
   echo -e "\n${CYAN}NemoClaw Health Check${NC}  ($(date '+%Y-%m-%d %H:%M:%S'))"
@@ -312,6 +509,11 @@ check_inference
 check_dashboard
 check_bridge
 check_agent
+
+# ── Auto-fix pass ─────────────────────────────────────────────
+if [ "$AUTO_FIX" -eq 1 ] && [ "$CHECKS_FAILED" -gt 0 ]; then
+  remediate_and_recheck
+fi
 
 # ── Output ─────────────────────────────────────────────────────
 TOTAL=$((CHECKS_PASSED + CHECKS_FAILED + CHECKS_SKIPPED))
