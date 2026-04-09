@@ -277,12 +277,9 @@ else
   warn "setup-dns-proxy.sh not found or not executable. Skipping."
 fi
 
-# ── Step 4e: Ensure dashboard port forward ────────────────────────
-# nemoclaw status triggers this internally, but we ensure it explicitly
-# in case the sandbox check ran before the gateway was fully ready.
-info "Ensuring dashboard port forward (18789)..."
-openshell forward stop 18789 2>/dev/null || true
-openshell forward start --background 18789 "$SANDBOX_NAME" 2>&1 || warn "Port forward failed."
+# ── Step 4e: Dashboard port forward ───────────────────────────────
+# Managed by the com.nemoclaw.dashboard-forward LaunchAgent (KeepAlive).
+# No action needed here — launchd supervises the foreground forward.
 
 # ── Step 5: Start auxiliary services ───────────────────────────────
 info "Starting auxiliary services..."
@@ -291,6 +288,19 @@ if command -v nemoclaw > /dev/null 2>&1; then
   nemoclaw start 2>&1 || warn "Service start returned non-zero."
 else
   node "$REPO_DIR/bin/nemoclaw.js" start 2>&1 || warn "Service start returned non-zero."
+fi
+
+# ── Step 6: Final rule approval pass ──────────────────────────────
+# Services starting up (bridge, agent, etc.) may trigger new egress
+# connections that generate proposed rules. Give them a moment, then
+# approve anything pending so web_search/web_fetch work immediately.
+sleep 10
+pending="$(openshell rule get "$SANDBOX_NAME" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -ci "proposed" || true)"
+if [ "$pending" -gt 0 ]; then
+  info "Approving $pending pending network rule(s)..."
+  openshell rule approve-all "$SANDBOX_NAME" 2>&1 || warn "Rule approval failed."
+else
+  info "No pending network rules."
 fi
 
 info "Auto-start complete."

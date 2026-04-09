@@ -304,6 +304,22 @@ check_agent() {
   fi
 }
 
+check_rules() {
+  if should_skip "rules"; then record "rules" "skip" ""; return; fi
+  if ! command -v openshell >/dev/null 2>&1; then
+    record "rules" "skip" "openshell CLI not found"
+    return
+  fi
+  local rules_out pending_count
+  rules_out="$(openshell rule get "$SANDBOX_NAME" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' || true)"
+  pending_count="$(echo "$rules_out" | grep -ci "proposed" || true)"
+  if [ "$pending_count" -eq 0 ]; then
+    record "rules" "pass" "No pending network rules"
+  else
+    record "rules" "fail" "$pending_count pending rule(s) awaiting approval"
+  fi
+}
+
 # ── Auto-fix functions ─────────────────────────────────────────
 # Each returns 0 if remediation was attempted (re-check warranted).
 
@@ -380,6 +396,11 @@ fix_agent() {
   return 0
 }
 
+fix_rules() {
+  openshell rule approve-all "$SANDBOX_NAME" 2>/dev/null || true
+  return 0
+}
+
 # Map check name → fix function (bash 3.2 compatible, no associative arrays)
 get_fix_func() {
   case "$1" in
@@ -389,11 +410,12 @@ get_fix_func() {
     dashboard) echo "fix_dashboard" ;;
     bridge)    echo "fix_bridge" ;;
     agent)     echo "fix_agent" ;;
+    rules)     echo "fix_rules" ;;
     *)         echo "" ;;  # sandbox, ssh: not auto-fixable
   esac
 }
 
-REMEDIATION_ORDER=(docker gateway sandbox ssh inference dashboard bridge agent)
+REMEDIATION_ORDER=(docker gateway sandbox ssh inference dashboard bridge agent rules)
 
 get_result_status() {
   local target="$1"
@@ -509,6 +531,7 @@ check_inference
 check_dashboard
 check_bridge
 check_agent
+check_rules
 
 # ── Auto-fix pass ─────────────────────────────────────────────
 if [ "$AUTO_FIX" -eq 1 ] && [ "$CHECKS_FAILED" -gt 0 ]; then

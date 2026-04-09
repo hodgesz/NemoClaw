@@ -174,6 +174,74 @@ network_policies:
       access: full
     binaries:
     - path: /usr/local/bin/node
+  # --- Web search / fetch (agent tools hit arbitrary domains) ---
+  # Pre-approve common search engines and news sources so web_search
+  # and web_fetch work immediately without waiting for rule approval.
+  web_search:
+    name: web_search
+    endpoints:
+    - host: www.google.com
+      port: 443
+      access: full
+    - host: google.com
+      port: 443
+      access: full
+    - host: www.bing.com
+      port: 443
+      access: full
+    - host: duckduckgo.com
+      port: 443
+      access: full
+    - host: html.duckduckgo.com
+      port: 443
+      access: full
+    - host: lite.duckduckgo.com
+      port: 443
+      access: full
+    - host: search.brave.com
+      port: 443
+      access: full
+    binaries:
+    - path: /usr/local/bin/openclaw
+    - path: /usr/local/bin/node
+    - path: /usr/bin/curl
+  web_fetch:
+    name: web_fetch
+    endpoints:
+    - host: www.reuters.com
+      port: 443
+      access: full
+    - host: apnews.com
+      port: 443
+      access: full
+    - host: www.bbc.com
+      port: 443
+      access: full
+    - host: www.espn.com
+      port: 443
+      access: full
+    - host: espn.com
+      port: 443
+      access: full
+    - host: www.cyclingnews.com
+      port: 443
+      access: full
+    - host: www.velonews.com
+      port: 443
+      access: full
+    - host: www.denverpost.com
+      port: 443
+      access: full
+    - host: kdvr.com
+      port: 443
+      access: full
+    - host: www.9news.com
+      port: 443
+      access: full
+    binaries:
+    - path: /usr/local/bin/openclaw
+    - path: /usr/local/bin/node
+    - path: /usr/bin/curl
   wttr_in:
     name: wttr_in
     endpoints:
