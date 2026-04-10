@@ -92,32 +92,53 @@ sandbox_exec() {
     --exec-id "$exec_id" --user 0 "$CONTAINER_ID" "$@"
 }
 
-# ── Step 1: Inject Gemini web search config ─────────────────────
-# NOTE: Model identity is now handled by NEMOCLAW_MODEL_OVERRIDE env var
-# at sandbox creation (upstream PR #1633). This step only injects the
-# Gemini web search API key + tool config, which is a separate concern.
-# Pass --skip-gemini to skip this entirely (e.g. from auto-start).
+# ── Step 1: Inject web search config ─────────────────────────────
+# Configures web search provider in openclaw.json. Prefers Brave Search
+# (BRAVE_SEARCH_API_KEY) over Gemini (GEMINI_API_KEY). Brave is more
+# reliable for always-on use (Gemini was 503ing intermittently).
+# Pass --skip-gemini to skip this entirely (e.g. from auto-start when
+# model config is handled by NEMOCLAW_MODEL_OVERRIDE).
 
 if [ "$SKIP_GEMINI" -eq 1 ]; then
-  step "Step 1/6: Gemini web search config (skipped via --skip-gemini)"
-  info "Model config handled by NEMOCLAW_MODEL_OVERRIDE. Skipping Gemini injection."
-elif [ -z "${GEMINI_API_KEY:-}" ]; then
-  step "Step 1/6: Gemini web search config"
-  warn "GEMINI_API_KEY not set. Skipping Gemini config injection."
-else
-  step "Step 1/6: Gemini web search config"
+  step "Step 1/6: Web search config (skipped via --skip-gemini)"
+  info "Skipping web search injection."
+elif [ -n "${BRAVE_SEARCH_API_KEY:-}" ]; then
+  step "Step 1/6: Web search config (Brave)"
+  if dry "would inject Brave web search config into openclaw.json"; then
+    :
+  else
+    sandbox_exec read-cfg cat /sandbox/.openclaw/openclaw.json > /tmp/oc-cfg.json 2>/dev/null
+
+    if grep -q '"brave"' /tmp/oc-cfg.json && grep -q "$BRAVE_SEARCH_API_KEY" /tmp/oc-cfg.json 2>/dev/null; then
+      info "Brave web search already configured."
+    else
+      python3 -c "
+import json
+cfg = json.load(open('/tmp/oc-cfg.json'))
+cfg.setdefault('tools', {})['web'] = {
+    'search': {'enabled': True, 'provider': 'brave',
+               'brave': {'apiKey': '$BRAVE_SEARCH_API_KEY'}},
+    'fetch': {'enabled': True}
+}
+json.dump(cfg, open('/tmp/oc-cfg.json', 'w'), indent=2)
+"
+      sandbox_exec write-cfg sh -c 'cat > /sandbox/.openclaw/openclaw.json' < /tmp/oc-cfg.json
+      info "Brave web search config injected."
+    fi
+    rm -f /tmp/oc-cfg.json
+  fi
+elif [ -n "${GEMINI_API_KEY:-}" ]; then
+  step "Step 1/6: Web search config (Gemini fallback)"
   if dry "would inject Gemini web search config into openclaw.json"; then
     :
   else
-    # Read current config
     sandbox_exec read-cfg cat /sandbox/.openclaw/openclaw.json > /tmp/oc-cfg.json 2>/dev/null
 
-    # Check if already configured
     if grep -q '"gemini"' /tmp/oc-cfg.json && grep -q "$GEMINI_API_KEY" /tmp/oc-cfg.json 2>/dev/null; then
       info "Gemini web search already configured."
     else
       python3 -c "
-import json, sys
+import json
 cfg = json.load(open('/tmp/oc-cfg.json'))
 cfg.setdefault('tools', {})['web'] = {
     'search': {'enabled': True, 'provider': 'gemini',
@@ -131,6 +152,9 @@ json.dump(cfg, open('/tmp/oc-cfg.json', 'w'), indent=2)
     fi
     rm -f /tmp/oc-cfg.json
   fi
+else
+  step "Step 1/6: Web search config"
+  warn "Neither BRAVE_SEARCH_API_KEY nor GEMINI_API_KEY set. Skipping."
 fi
 
 # ── Step 2: Update config hash ──────────────────────────────────

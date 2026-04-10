@@ -201,6 +201,9 @@ network_policies:
     - host: search.brave.com
       port: 443
       access: full
+    - host: api.search.brave.com
+      port: 443
+      access: full
     binaries:
     - path: /usr/local/bin/openclaw
     - path: /usr/local/bin/node
