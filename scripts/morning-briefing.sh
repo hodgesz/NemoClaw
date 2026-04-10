@@ -18,7 +18,6 @@ if [[ -f "$HOME/.zshrc" ]]; then
   eval "$(grep '^export [A-Za-z_]' "$HOME/.zshrc" 2>/dev/null)" || true
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SANDBOX_NAME="${SANDBOX_NAME:-my-assistant}"
 CHAT_ID="${1:---chat-id}"
 
