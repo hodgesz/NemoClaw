@@ -423,7 +423,6 @@ check_inference_live() {
 # ── Auto-fix functions ─────────────────────────────────────────
 # Each returns 0 if remediation was attempted (re-check warranted).
 # These are invoked indirectly via get_fix_func().
-# shellcheck disable=SC2329
 
 fix_docker() {
   if [ "$(uname -s)" = "Darwin" ]; then

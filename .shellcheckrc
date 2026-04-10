@@ -6,4 +6,8 @@
 # SC1091: Not following sourced file.
 # We dynamically source nvm.sh and runtime.sh at paths that shellcheck
 # cannot resolve statically.
-disable=SC2059,SC1091
+#
+# SC2329: This function is never invoked.
+# Auto-fix functions (fix_docker, fix_gateway, etc.) are invoked
+# indirectly via dynamic dispatch in get_fix_func().
+disable=SC2059,SC1091,SC2329
