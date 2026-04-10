@@ -117,7 +117,7 @@ import json
 cfg = json.load(open('/tmp/oc-cfg.json'))
 cfg.setdefault('tools', {})['web'] = {
     'search': {'enabled': True, 'provider': 'brave',
-               'brave': {'apiKey': '$BRAVE_SEARCH_API_KEY'}},
+               'apiKey': '$BRAVE_SEARCH_API_KEY'},
     'fetch': {'enabled': True}
 }
 json.dump(cfg, open('/tmp/oc-cfg.json', 'w'), indent=2)
