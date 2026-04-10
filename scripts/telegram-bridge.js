@@ -19,9 +19,9 @@
 const https = require("https");
 const path = require("path");
 const { execFileSync, execFile, spawn } = require("child_process");
-const { resolveOpenshell } = require("../bin/lib/resolve-openshell");
-const { shellQuote, validateName } = require("../bin/lib/runner");
-const { parseAllowedChatIds, isChatAllowed } = require("../bin/lib/chat-filter");
+const { resolveOpenshell } = require("../dist/lib/resolve-openshell");
+const { shellQuote, validateName } = require("../dist/lib/runner");
+const { parseAllowedChatIds, isChatAllowed } = require("../dist/lib/chat-filter");
 
 const OPENSHELL = resolveOpenshell();
 if (!OPENSHELL) {
@@ -219,6 +219,33 @@ function runAgentInSandbox(message, sessionId) {
   });
 }
 
+// ── Command handlers ─────────────────────────────────────────────
+
+async function handleStatus(chatId, msgId) {
+  await sendTyping(chatId);
+  const healthScript = path.join(__dirname, "health-check.sh");
+  try {
+    const result = await new Promise((resolve, reject) => {
+      execFile(healthScript, ["--sandbox", SANDBOX, "--json"], { timeout: 60000 }, (err, stdout) => {
+        // health-check.sh exits 1 on failures — that's expected, not an error
+        if (err && !stdout) return reject(err);
+        resolve(stdout);
+      });
+    });
+    const data = JSON.parse(result);
+    const lines = data.checks.map((c) => {
+      const icon = c.status === "pass" ? "\u2705" : c.status === "fail" ? "\u274c" : "\u2796";
+      return `${icon} *${c.name}*: ${c.detail || "skipped"}`;
+    });
+    const summary = data.summary.failed === 0
+      ? `\u2705 All ${data.summary.passed} checks passed`
+      : `\u26a0\ufe0f ${data.summary.failed}/${data.summary.passed + data.summary.failed} checks failed`;
+    await sendMessage(chatId, `*NemoClaw Status* (${data.sandbox})\n\n${lines.join("\n")}\n\n${summary}`, msgId);
+  } catch (err) {
+    await sendMessage(chatId, `Health check error: ${err.message}`, msgId);
+  }
+}
+
 // ── Poll loop ─────────────────────────────────────────────────────
 
 async function poll() {
@@ -266,28 +293,7 @@ async function poll() {
 
         // Handle /status — run health check and report results
         if (msg.text === "/status") {
-          await sendTyping(chatId);
-          const healthScript = path.join(__dirname, "health-check.sh");
-          try {
-            const result = await new Promise((resolve, reject) => {
-              execFile(healthScript, ["--sandbox", SANDBOX, "--json"], { timeout: 60000 }, (err, stdout) => {
-                // health-check.sh exits 1 on failures — that's expected, not an error
-                if (err && !stdout) return reject(err);
-                resolve(stdout);
-              });
-            });
-            const data = JSON.parse(result);
-            const lines = data.checks.map((c) => {
-              const icon = c.status === "pass" ? "\u2705" : c.status === "fail" ? "\u274c" : "\u2796";
-              return `${icon} *${c.name}*: ${c.detail || "skipped"}`;
-            });
-            const summary = data.summary.failed === 0
-              ? `\u2705 All ${data.summary.passed} checks passed`
-              : `\u26a0\ufe0f ${data.summary.failed}/${data.summary.passed + data.summary.failed} checks failed`;
-            await sendMessage(chatId, `*NemoClaw Status* (${data.sandbox})\n\n${lines.join("\n")}\n\n${summary}`, msg.message_id);
-          } catch (err) {
-            await sendMessage(chatId, `Health check error: ${err.message}`, msg.message_id);
-          }
+          await handleStatus(chatId, msg.message_id);
           continue;
         }
 

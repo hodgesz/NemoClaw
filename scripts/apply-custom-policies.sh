@@ -44,7 +44,10 @@ NC='\033[0m'
 
 info() { echo -e "${GREEN}[custom]${NC} $1"; }
 warn() { echo -e "${YELLOW}[custom]${NC} $1"; }
-fail() { echo -e "${RED}[custom]${NC} $1" >&2; exit 1; }
+fail() {
+  echo -e "${RED}[custom]${NC} $1" >&2
+  exit 1
+}
 step() { echo -e "\n${CYAN}── $1 ──${NC}"; }
 dry() {
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -58,12 +61,27 @@ dry() {
 # ── Parse flags ─────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
   case "$1" in
-    --sandbox)    SANDBOX_NAME="${2:?--sandbox requires a name}"; shift 2 ;;
-    --skip-skills) SKIP_SKILLS=1; shift ;;
-    --skip-gemini) SKIP_GEMINI=1; shift ;;
-    --dry-run)    DRY_RUN=1; shift ;;
-    --help|-h)    sed -n '2,/^$/s/^# *//p' "$0"; exit 0 ;;
-    *)            shift ;;
+    --sandbox)
+      SANDBOX_NAME="${2:?--sandbox requires a name}"
+      shift 2
+      ;;
+    --skip-skills)
+      SKIP_SKILLS=1
+      shift
+      ;;
+    --skip-gemini)
+      SKIP_GEMINI=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --help | -h)
+      sed -n '2,/^$/s/^# *//p' "$0"
+      exit 0
+      ;;
+    *) shift ;;
   esac
 done
 
@@ -107,7 +125,7 @@ elif [ -n "${BRAVE_SEARCH_API_KEY:-}" ]; then
   if dry "would inject Brave web search config into openclaw.json"; then
     :
   else
-    sandbox_exec read-cfg cat /sandbox/.openclaw/openclaw.json > /tmp/oc-cfg.json 2>/dev/null
+    sandbox_exec read-cfg cat /sandbox/.openclaw/openclaw.json >/tmp/oc-cfg.json 2>/dev/null
 
     if grep -q '"brave"' /tmp/oc-cfg.json && grep -q "$BRAVE_SEARCH_API_KEY" /tmp/oc-cfg.json 2>/dev/null; then
       info "Brave web search already configured."
@@ -122,7 +140,7 @@ cfg.setdefault('tools', {})['web'] = {
 }
 json.dump(cfg, open('/tmp/oc-cfg.json', 'w'), indent=2)
 "
-      sandbox_exec write-cfg sh -c 'cat > /sandbox/.openclaw/openclaw.json' < /tmp/oc-cfg.json
+      sandbox_exec write-cfg sh -c 'cat > /sandbox/.openclaw/openclaw.json' </tmp/oc-cfg.json
       info "Brave web search config injected."
     fi
     rm -f /tmp/oc-cfg.json
@@ -132,7 +150,7 @@ elif [ -n "${GEMINI_API_KEY:-}" ]; then
   if dry "would inject Gemini web search config into openclaw.json"; then
     :
   else
-    sandbox_exec read-cfg cat /sandbox/.openclaw/openclaw.json > /tmp/oc-cfg.json 2>/dev/null
+    sandbox_exec read-cfg cat /sandbox/.openclaw/openclaw.json >/tmp/oc-cfg.json 2>/dev/null
 
     if grep -q '"gemini"' /tmp/oc-cfg.json && grep -q "$GEMINI_API_KEY" /tmp/oc-cfg.json 2>/dev/null; then
       info "Gemini web search already configured."
@@ -147,7 +165,7 @@ cfg.setdefault('tools', {})['web'] = {
 }
 json.dump(cfg, open('/tmp/oc-cfg.json', 'w'), indent=2)
 "
-      sandbox_exec write-cfg sh -c 'cat > /sandbox/.openclaw/openclaw.json' < /tmp/oc-cfg.json
+      sandbox_exec write-cfg sh -c 'cat > /sandbox/.openclaw/openclaw.json' </tmp/oc-cfg.json
       info "Gemini web search config injected."
     fi
     rm -f /tmp/oc-cfg.json
@@ -191,7 +209,7 @@ else
     warn "No fetch-guard files found. OpenClaw may have been updated (patch no longer needed?)."
   else
     for FILE in $GUARD_FILES; do
-      sandbox_exec "read-fg-$$" cat "$FILE" > /tmp/fg-patch.js 2>/dev/null
+      sandbox_exec "read-fg-$$" cat "$FILE" >/tmp/fg-patch.js 2>/dev/null
       RESULT=$(python3 -c "
 content = open('/tmp/fg-patch.js').read()
 old = '''let dispatcher = null;
@@ -222,7 +240,7 @@ else:
 " 2>&1)
 
       if [ "$RESULT" = "PATCHED" ]; then
-        sandbox_exec "write-fg-$$" sh -c "cat > $FILE" < /tmp/fg-patch.js 2>/dev/null
+        sandbox_exec "write-fg-$$" sh -c "cat > $FILE" </tmp/fg-patch.js 2>/dev/null
         PATCHED=$((PATCHED + 1))
       else
         SKIPPED=$((SKIPPED + 1))
@@ -362,7 +380,7 @@ else
         "mkdir -p /sandbox/.openclaw-data/skills/$skill_name" 2>/dev/null || true
       ssh -o ConnectTimeout=10 "openshell-${SANDBOX_NAME}" \
         "cat > /sandbox/.openclaw-data/skills/$skill_name/SKILL.md" \
-        < "$skill_file" 2>/dev/null || true
+        <"$skill_file" 2>/dev/null || true
       info "Installed skill: $skill_name"
     done
   fi

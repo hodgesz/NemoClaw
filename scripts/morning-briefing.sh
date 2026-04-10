@@ -41,12 +41,12 @@ RESPONSE=$(ssh -o ConnectTimeout=10 "openshell-${SANDBOX_NAME}" \
   "export NVIDIA_API_KEY=unused && nemoclaw-start openclaw agent --agent main \
    -m 'Give me my morning briefing' --session-id ${SESSION_ID}" 2>&1 \
   | grep -v -e '\[SECURITY\]' -e 'Setting up NemoClaw' -e '\[gateway\]' -e 'UNDICI' \
-           -e '(node:' -e 'Use .node' -e 'pairing required' -e 'CAP_SET' \
-           -e 'privilege separation' -e 'Gateway target:' -e 'Source: local loopback' \
-           -e 'Config: /sandbox' -e 'Bind: loopback' -e 'getaddrinfo' \
-           -e 'tools websearch' -e 'Gateway agent failed' \
-           -e 'GatewayClientRequestError' -e 'abnormal closure' \
-           -e 'tools cron failed' || true)
+    -e '(node:' -e 'Use .node' -e 'pairing required' -e 'CAP_SET' \
+    -e 'privilege separation' -e 'Gateway target:' -e 'Source: local loopback' \
+    -e 'Config: /sandbox' -e 'Bind: loopback' -e 'getaddrinfo' \
+    -e 'tools websearch' -e 'Gateway agent failed' \
+    -e 'GatewayClientRequestError' -e 'abnormal closure' \
+    -e 'tools cron failed' || true)
 
 # ── Detect error responses ───────────────────────────────────────
 # The agent may return an error message instead of a real briefing.
@@ -69,7 +69,7 @@ fi
 STATUS_FILE="/tmp/nemoclaw-briefing-status.json"
 printf '{"timestamp":"%s","status":"%s","chat_id":"%s"}\n' \
   "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$BRIEFING_STATUS" "$CHAT_ID" \
-  > "$STATUS_FILE"
+  >"$STATUS_FILE"
 
 # Send to Telegram (try Markdown first, fall back to plain text)
 RESULT=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -91,6 +91,6 @@ else
   # Update status file with send failure too
   printf '{"timestamp":"%s","status":"error:send","chat_id":"%s"}\n' \
     "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$CHAT_ID" \
-    > "$STATUS_FILE"
+    >"$STATUS_FILE"
   exit 1
 fi

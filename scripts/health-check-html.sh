@@ -26,7 +26,7 @@ HC_ARGS=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --output|-o)
+    --output | -o)
       OUTPUT_FILE="${2:?--output requires a path}"
       shift 2
       ;;
@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
       OPEN_BROWSER=1
       shift
       ;;
-    --help|-h)
+    --help | -h)
       sed -n '2,/^$/s/^# *//p' "$0"
       exit 0
       ;;
@@ -120,7 +120,7 @@ while IFS= read -r line; do
         </tr>"
 done < <(echo "$JSON" | grep '"name"')
 
-cat > "$OUTPUT_FILE" << HTMLEOF
+cat >"$OUTPUT_FILE" <<HTMLEOF
 <!DOCTYPE html>
 <html lang="en">
 <head>

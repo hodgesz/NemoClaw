@@ -39,10 +39,10 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SANDBOX_NAME="${NEMOCLAW_SANDBOX_NAME:-my-assistant}"
 GATEWAY_NAME="${NEMOCLAW_GATEWAY_NAME:-nemoclaw}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-18789}"
-ALERT_METHOD=""          # empty = no alerting
-OUTPUT_MODE="pretty"     # pretty | json | quiet
-SKIP_CHECKS=""           # comma-separated list of checks to skip
-AUTO_FIX=0               # when set, attempt to fix failures before alerting
+ALERT_METHOD=""      # empty = no alerting
+OUTPUT_MODE="pretty" # pretty | json | quiet
+SKIP_CHECKS=""       # comma-separated list of checks to skip
+AUTO_FIX=0           # when set, attempt to fix failures before alerting
 
 # ── Colors (disabled when not a terminal or in json/quiet mode) ─
 if [ -t 1 ] && [ "$OUTPUT_MODE" = "pretty" ]; then
@@ -146,7 +146,10 @@ record() {
 # ── Individual checks ──────────────────────────────────────────
 
 check_docker() {
-  if should_skip "docker"; then record "docker" "skip" ""; return; fi
+  if should_skip "docker"; then
+    record "docker" "skip" ""
+    return
+  fi
   if docker info >/dev/null 2>&1; then
     record "docker" "pass" "Docker daemon running"
   else
@@ -155,7 +158,10 @@ check_docker() {
 }
 
 check_gateway() {
-  if should_skip "gateway"; then record "gateway" "skip" ""; return; fi
+  if should_skip "gateway"; then
+    record "gateway" "skip" ""
+    return
+  fi
   if ! command -v openshell >/dev/null 2>&1; then
     record "gateway" "fail" "openshell CLI not found"
     return
@@ -175,7 +181,10 @@ check_gateway() {
 }
 
 check_sandbox() {
-  if should_skip "sandbox"; then record "sandbox" "skip" ""; return; fi
+  if should_skip "sandbox"; then
+    record "sandbox" "skip" ""
+    return
+  fi
   if ! command -v openshell >/dev/null 2>&1; then
     record "sandbox" "fail" "openshell CLI not found"
     return
@@ -195,7 +204,10 @@ check_sandbox() {
 }
 
 check_ssh() {
-  if should_skip "ssh"; then record "ssh" "skip" ""; return; fi
+  if should_skip "ssh"; then
+    record "ssh" "skip" ""
+    return
+  fi
   local ssh_out
   ssh_out=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
@@ -208,7 +220,10 @@ check_ssh() {
 }
 
 check_inference() {
-  if should_skip "inference"; then record "inference" "skip" ""; return; fi
+  if should_skip "inference"; then
+    record "inference" "skip" ""
+    return
+  fi
   # Check common inference endpoints; at least one should respond
   local found=0 detail=""
 
@@ -246,7 +261,10 @@ check_inference() {
 }
 
 check_dashboard() {
-  if should_skip "dashboard"; then record "dashboard" "skip" ""; return; fi
+  if should_skip "dashboard"; then
+    record "dashboard" "skip" ""
+    return
+  fi
   # Use -o /dev/null -w to get HTTP status; accept any response (even errors)
   # as proof the port forward is alive. curl exit 7 = connection refused (down),
   # exit 52 = empty reply (gateway restarting). Only 7 is a hard failure.
@@ -263,7 +281,10 @@ check_dashboard() {
 }
 
 check_bridge() {
-  if should_skip "bridge"; then record "bridge" "skip" ""; return; fi
+  if should_skip "bridge"; then
+    record "bridge" "skip" ""
+    return
+  fi
   local piddir="/tmp/nemoclaw-services-${SANDBOX_NAME}"
   local pidfile="$piddir/telegram-bridge.pid"
   local pid
@@ -281,7 +302,10 @@ check_bridge() {
 }
 
 check_agent() {
-  if should_skip "agent"; then record "agent" "skip" ""; return; fi
+  if should_skip "agent"; then
+    record "agent" "skip" ""
+    return
+  fi
   # Run openclaw doctor inside the sandbox via SSH.
   # The command outputs a banner, warnings, and diagnostic lines.
   # We check the exit code first, then look for explicit error indicators.
@@ -305,7 +329,10 @@ check_agent() {
 }
 
 check_rules() {
-  if should_skip "rules"; then record "rules" "skip" ""; return; fi
+  if should_skip "rules"; then
+    record "rules" "skip" ""
+    return
+  fi
   if ! command -v openshell >/dev/null 2>&1; then
     record "rules" "skip" "openshell CLI not found"
     return
@@ -321,7 +348,10 @@ check_rules() {
 }
 
 check_briefing() {
-  if should_skip "briefing"; then record "briefing" "skip" ""; return; fi
+  if should_skip "briefing"; then
+    record "briefing" "skip" ""
+    return
+  fi
   local status_file="/tmp/nemoclaw-briefing-status.json"
   if [ ! -f "$status_file" ]; then
     record "briefing" "skip" "No briefing status file (never ran?)"
@@ -337,7 +367,7 @@ check_briefing() {
     local file_epoch now_epoch
     file_epoch="$(date -jf '%Y-%m-%dT%H:%M:%SZ' "$timestamp" '+%s' 2>/dev/null || stat -f '%m' "$status_file")"
     now_epoch="$(date '+%s')"
-    age_hours=$(( (now_epoch - file_epoch) / 3600 ))
+    age_hours=$(((now_epoch - file_epoch) / 3600))
     if [ "$age_hours" -gt 25 ]; then
       record "briefing" "fail" "Last briefing is ${age_hours}h old (stale)"
       return
@@ -359,7 +389,10 @@ check_briefing() {
 }
 
 check_inference_live() {
-  if should_skip "inference_live"; then record "inference_live" "skip" ""; return; fi
+  if should_skip "inference_live"; then
+    record "inference_live" "skip" ""
+    return
+  fi
   # End-to-end inference probe: send a minimal prompt through the sandbox agent
   # and verify we get a non-error response. Timeout after 30s to avoid blocking
   # the health check for minutes on a hung provider.
@@ -429,8 +462,8 @@ fix_inference() {
         kill "$(cat /tmp/litellm.pid)" 2>/dev/null || true
       fi
       AWS_BEARER_TOKEN_BEDROCK="${AWS_BEARER_TOKEN_BEDROCK:-}" \
-      AWS_REGION_NAME="${AWS_REGION_NAME:-us-east-1}" \
-      nohup litellm --model bedrock/us.anthropic.claude-sonnet-4-6 --port 4000 \
+        AWS_REGION_NAME="${AWS_REGION_NAME:-us-east-1}" \
+        nohup litellm --model bedrock/us.anthropic.claude-sonnet-4-6 --port 4000 \
         >/tmp/litellm.log 2>&1 &
       echo $! >/tmp/litellm.pid
       sleep 5
@@ -474,14 +507,14 @@ fix_rules() {
 # Map check name → fix function (bash 3.2 compatible, no associative arrays)
 get_fix_func() {
   case "$1" in
-    docker)    echo "fix_docker" ;;
-    gateway)   echo "fix_gateway" ;;
+    docker) echo "fix_docker" ;;
+    gateway) echo "fix_gateway" ;;
     inference) echo "fix_inference" ;;
     dashboard) echo "fix_dashboard" ;;
-    bridge)    echo "fix_bridge" ;;
-    agent)     echo "fix_agent" ;;
-    rules)     echo "fix_rules" ;;
-    *)         echo "" ;;  # sandbox, ssh: not auto-fixable
+    bridge) echo "fix_bridge" ;;
+    agent) echo "fix_agent" ;;
+    rules) echo "fix_rules" ;;
+    *) echo "" ;; # sandbox, ssh: not auto-fixable
   esac
 }
 
@@ -491,7 +524,7 @@ get_result_status() {
   local target="$1"
   local entry
   for entry in "${RESULTS[@]}"; do
-    IFS='|' read -r rname rstatus rdetail <<< "$entry"
+    IFS='|' read -r rname rstatus rdetail <<<"$entry"
     if [ "$rname" = "$target" ]; then
       echo "$rstatus"
       return
@@ -504,7 +537,7 @@ replace_result() {
   local target="$1" new_status="$2" new_detail="$3"
   local i
   for i in "${!RESULTS[@]}"; do
-    IFS='|' read -r rname _ _ <<< "${RESULTS[$i]}"
+    IFS='|' read -r rname _ _ <<<"${RESULTS[$i]}"
     if [ "$rname" = "$target" ]; then
       RESULTS[$i]="${target}|${new_status}|${new_detail}"
       return
@@ -548,7 +581,7 @@ remediate_and_recheck() {
 
     # Extract the new entry
     local new_entry="${RESULTS[$saved_len]}"
-    IFS='|' read -r _ new_status new_detail <<< "$new_entry"
+    IFS='|' read -r _ new_status new_detail <<<"$new_entry"
 
     # Restore RESULTS to saved state, then update the original entry
     unset "RESULTS[$saved_len]"
@@ -566,7 +599,7 @@ remediate_and_recheck() {
   CHECKS_SKIPPED=0
   local entry
   for entry in "${RESULTS[@]}"; do
-    IFS='|' read -r _ rstatus _ <<< "$entry"
+    IFS='|' read -r _ rstatus _ <<<"$entry"
     case "$rstatus" in
       pass) CHECKS_PASSED=$((CHECKS_PASSED + 1)) ;;
       fail) CHECKS_FAILED=$((CHECKS_FAILED + 1)) ;;
@@ -577,7 +610,7 @@ remediate_and_recheck() {
   # Print post-remediation results in pretty mode
   if [ "$OUTPUT_MODE" = "pretty" ]; then
     for entry in "${RESULTS[@]}"; do
-      IFS='|' read -r rname rstatus rdetail <<< "$entry"
+      IFS='|' read -r rname rstatus rdetail <<<"$entry"
       case "$rstatus" in
         pass) echo -e "  ${GREEN}✓${NC} ${rname}: ${rdetail}" ;;
         fail) echo -e "  ${RED}✗${NC} ${rname}: ${rdetail}" ;;
@@ -634,7 +667,7 @@ if [ "$OUTPUT_MODE" = "json" ]; then
   echo "  \"checks\": ["
   first=1
   for result in "${RESULTS[@]}"; do
-    IFS='|' read -r name status detail <<< "$result"
+    IFS='|' read -r name status detail <<<"$result"
     safe_detail=$(json_escape "$detail")
     [ "$first" -eq 1 ] && first=0 || echo ","
     printf '    { "name": "%s", "status": "%s", "detail": "%s" }' "$name" "$status" "$safe_detail"
@@ -649,7 +682,7 @@ if [ "$CHECKS_FAILED" -gt 0 ] && [ -n "$ALERT_METHOD" ]; then
   # Build failure summary
   FAILURE_LINES=""
   for result in "${RESULTS[@]}"; do
-    IFS='|' read -r name status detail <<< "$result"
+    IFS='|' read -r name status detail <<<"$result"
     if [ "$status" = "fail" ]; then
       FAILURE_LINES="${FAILURE_LINES}✗ ${name}: ${detail}\n"
     fi

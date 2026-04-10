@@ -91,7 +91,8 @@ async function* querySandbox({ sandboxName, sshConfigContent, authEnv, prompt, s
       model: sdkOptions.model || undefined,
       allowedTools: sdkOptions.allowedTools || ["Read", "Edit", "Write", "Bash", "Glob", "Grep"],
       permissionMode: sdkOptions.permissionMode || "bypassPermissions",
-      allowDangerouslySkipPermissions: sdkOptions.permissionMode === "bypassPermissions" || !sdkOptions.permissionMode,
+      allowDangerouslySkipPermissions:
+        sdkOptions.permissionMode === "bypassPermissions" || !sdkOptions.permissionMode,
       maxTurns: sdkOptions.maxTurns || undefined,
       systemPrompt: sdkOptions.systemPrompt || undefined,
       persistSession: sdkOptions.persistSession !== false,
@@ -161,9 +162,9 @@ async function listSandboxSessions(sandboxName, limit = 10) {
     const sessions = await listSessions({ dir: "/sandbox", limit });
     return sessions.map((s) => ({
       sessionId: s.sessionId,
-      timestamp: s.timestamp || Date.now(),
-      model: s.model || null,
-      numMessages: s.numMessages || null,
+      timestamp: s.lastModified || Date.now(),
+      model: null,
+      numMessages: null,
     }));
   } catch {
     // Fallback: list session files from the sandbox via SSH

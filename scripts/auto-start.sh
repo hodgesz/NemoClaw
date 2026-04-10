@@ -21,8 +21,8 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG_PREFIX="[nemoclaw-autostart]"
 
 # ── Defaults ────────────────────────────────────────────────────────
-DOCKER_TIMEOUT=180        # seconds to wait for Docker daemon
-SANDBOX_NAME=""           # auto-detect from registry if empty
+DOCKER_TIMEOUT=180 # seconds to wait for Docker daemon
+SANDBOX_NAME=""    # auto-detect from registry if empty
 
 # ── Parse flags ─────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -42,9 +42,12 @@ while [ $# -gt 0 ]; do
 done
 
 # ── Logging ─────────────────────────────────────────────────────────
-info()  { echo "$(date '+%Y-%m-%d %H:%M:%S') $LOG_PREFIX $1"; }
-warn()  { echo "$(date '+%Y-%m-%d %H:%M:%S') $LOG_PREFIX [WARN] $1"; }
-fail()  { echo "$(date '+%Y-%m-%d %H:%M:%S') $LOG_PREFIX [ERROR] $1" >&2; exit 1; }
+info() { echo "$(date '+%Y-%m-%d %H:%M:%S') $LOG_PREFIX $1"; }
+warn() { echo "$(date '+%Y-%m-%d %H:%M:%S') $LOG_PREFIX [WARN] $1"; }
+fail() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $LOG_PREFIX [ERROR] $1" >&2
+  exit 1
+}
 
 # ── Load env vars from shell profiles (tokens, API keys) ───────────
 # LaunchAgents don't run in a login shell, so TELEGRAM_BOT_TOKEN,
@@ -59,7 +62,7 @@ _load_exports_from() {
     if [[ "$line" =~ ^[[:space:]]*export[[:space:]]+([A-Z_][A-Z0-9_]*)= ]]; then
       eval "$line" 2>/dev/null || true
     fi
-  done < "$file"
+  done <"$file"
 }
 
 for rc in "$HOME/.zprofile" "$HOME/.zshrc" "$HOME/.bashrc"; do
@@ -74,7 +77,7 @@ for p in \
   /opt/homebrew/bin \
   /usr/local/bin; do
   case ":$PATH:" in
-    *":$p:"*) ;;   # already present
+    *":$p:"*) ;; # already present
     *) [ -d "$p" ] && PATH="$p:$PATH" ;;
   esac
 done
@@ -84,7 +87,7 @@ export PATH
 info "Waiting for Docker daemon (timeout: ${DOCKER_TIMEOUT}s)..."
 
 elapsed=0
-while ! docker info > /dev/null 2>&1; do
+while ! docker info >/dev/null 2>&1; do
   if [ "$elapsed" -ge "$DOCKER_TIMEOUT" ]; then
     fail "Docker daemon did not start within ${DOCKER_TIMEOUT}s. Aborting."
   fi
@@ -96,7 +99,7 @@ info "Docker is ready (waited ${elapsed}s)."
 
 # ── Step 2: Resolve sandbox name ───────────────────────────────────
 if [ -z "$SANDBOX_NAME" ]; then
-  if [ -f "$HOME/.nemoclaw/sandboxes.json" ] && command -v node > /dev/null 2>&1; then
+  if [ -f "$HOME/.nemoclaw/sandboxes.json" ] && command -v node >/dev/null 2>&1; then
     SANDBOX_NAME="$(node -e "
       const s = require('$HOME/.nemoclaw/sandboxes.json');
       console.log(s.defaultSandbox || Object.keys(s.sandboxes || {})[0] || '');
@@ -113,7 +116,7 @@ info "Target sandbox: $SANDBOX_NAME"
 # ── Step 3: Recover OpenShell gateway ──────────────────────────────
 info "Recovering OpenShell gateway..."
 
-if ! command -v openshell > /dev/null 2>&1; then
+if ! command -v openshell >/dev/null 2>&1; then
   fail "openshell not found on PATH."
 fi
 
@@ -143,25 +146,25 @@ info "Gateway state: $(openshell status 2>&1 | head -3 | tr '\n' ' ')"
 # The sandbox routes inference through a LiteLLM proxy on the host
 # (compatible-endpoint → localhost:4000). Auth uses a Bedrock bearer
 # token (AWS_BEARER_TOKEN_BEDROCK), NOT IAM/SSO credentials.
-if ! curl -sf --max-time 2 http://127.0.0.1:4000/health > /dev/null 2>&1; then
-  if command -v litellm > /dev/null 2>&1; then
+if ! curl -sf --max-time 2 http://127.0.0.1:4000/health >/dev/null 2>&1; then
+  if command -v litellm >/dev/null 2>&1; then
     if [ -z "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then
       warn "AWS_BEARER_TOKEN_BEDROCK not set. LiteLLM will fail to authenticate with Bedrock."
     fi
     info "Starting LiteLLM proxy (bedrock/claude-sonnet-4-6 on port 4000)..."
     AWS_BEARER_TOKEN_BEDROCK="${AWS_BEARER_TOKEN_BEDROCK:-}" \
-    AWS_REGION_NAME="${AWS_REGION_NAME:-us-east-1}" \
-    nohup litellm --model bedrock/us.anthropic.claude-sonnet-4-6 --port 4000 \
+      AWS_REGION_NAME="${AWS_REGION_NAME:-us-east-1}" \
+      nohup litellm --model bedrock/us.anthropic.claude-sonnet-4-6 --port 4000 \
       >/tmp/litellm.log 2>&1 &
     echo $! >/tmp/litellm.pid
     # Wait for it to be ready
     for _ in $(seq 1 10); do
-      if curl -sf --max-time 2 http://127.0.0.1:4000/health > /dev/null 2>&1; then
+      if curl -sf --max-time 2 http://127.0.0.1:4000/health >/dev/null 2>&1; then
         break
       fi
       sleep 2
     done
-    if curl -sf --max-time 2 http://127.0.0.1:4000/health > /dev/null 2>&1; then
+    if curl -sf --max-time 2 http://127.0.0.1:4000/health >/dev/null 2>&1; then
       info "LiteLLM ready (PID $(cat /tmp/litellm.pid))."
     else
       warn "LiteLLM may still be starting. Check /tmp/litellm.log if inference fails."
@@ -214,7 +217,7 @@ fi
 # ── Step 4: Recover sandbox (triggers OpenClaw process recovery) ───
 info "Checking sandbox '$SANDBOX_NAME'..."
 
-if command -v nemoclaw > /dev/null 2>&1; then
+if command -v nemoclaw >/dev/null 2>&1; then
   nemoclaw "$SANDBOX_NAME" status 2>&1 || warn "Sandbox status check returned non-zero."
 else
   # Fall back to direct node invocation
@@ -293,7 +296,7 @@ fi
 # ── Step 5: Start auxiliary services ───────────────────────────────
 info "Starting auxiliary services..."
 
-if command -v nemoclaw > /dev/null 2>&1; then
+if command -v nemoclaw >/dev/null 2>&1; then
   nemoclaw start 2>&1 || warn "Service start returned non-zero."
 else
   node "$REPO_DIR/bin/nemoclaw.js" start 2>&1 || warn "Service start returned non-zero."

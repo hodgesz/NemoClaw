@@ -22,6 +22,7 @@ Compile a brief morning briefing with these sections. Keep the total response un
 ### 1. Weather (Denver, CO)
 
 Use `web_fetch` to get weather from `https://wttr.in/Denver?format=j1` (JSON format). Extract:
+
 - Current temperature (°F) and condition
 - Today's high/low
 - Precipitation chance
@@ -31,6 +32,7 @@ If wttr.in fails, use `web_search` for "Denver weather today" as fallback.
 ### 2. Top News
 
 Use `web_search` to find 3-4 top headlines. Focus on:
+
 - Major world/US news
 - Tech/AI news
 - Pro cycling news if anything notable
@@ -41,6 +43,7 @@ One sentence per headline. Include source name.
 ### 3. Markets (if weekday)
 
 Use `web_search` for "stock market today S&P 500". Report:
+
 - S&P 500 direction and approximate level
 - Any notable moves
 
@@ -56,7 +59,7 @@ If the user has mentioned priorities, tasks, or meetings in recent conversations
 
 ## Output Format
 
-```
+```text
 ☀️ Morning Briefing — [Day, Month Date]
 
 🌤 WEATHER (Denver)

@@ -55,7 +55,7 @@ const server = http.createServer((req, res) => {
       delete headers["content-length"];
       delete headers["connection"];
       delete headers["transfer-encoding"];
-      headers["content-length"] = Buffer.byteLength(rewritten);
+      headers["content-length"] = String(Buffer.byteLength(rewritten));
       if (!res.headersSent) {
         res.writeHead(proxyRes.statusCode, headers);
         res.end(rewritten);

@@ -17,7 +17,7 @@ set -euo pipefail
 
 SANDBOX_NAME="${NEMOCLAW_SANDBOX_NAME:-my-assistant}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-18789}"
-READY_TIMEOUT=300   # seconds to wait for sandbox before giving up
+READY_TIMEOUT=300 # seconds to wait for sandbox before giving up
 
 # ── Parse flags ────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
