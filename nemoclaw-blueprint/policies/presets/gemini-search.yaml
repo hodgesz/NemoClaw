@@ -12,7 +12,8 @@ network_policies:
         enforcement: enforce
         tls: terminate
         rules:
-          - allow: { method: "*", path: "/**" }
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
     binaries:
       - { path: /usr/local/bin/openclaw }
       - { path: /usr/local/bin/node }
