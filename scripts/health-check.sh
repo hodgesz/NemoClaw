@@ -421,12 +421,15 @@ fix_gateway() {
 }
 
 fix_inference() {
-  # Restart LiteLLM if not responding on port 4000
+  # Restart LiteLLM if not responding on port 4000.
+  # Auth uses AWS_BEARER_TOKEN_BEDROCK (bearer token), not IAM/SSO.
   if ! curl -sf --max-time 2 http://localhost:4000/health >/dev/null 2>&1; then
     if command -v litellm >/dev/null 2>&1; then
       if [ -f /tmp/litellm.pid ]; then
         kill "$(cat /tmp/litellm.pid)" 2>/dev/null || true
       fi
+      AWS_BEARER_TOKEN_BEDROCK="${AWS_BEARER_TOKEN_BEDROCK:-}" \
+      AWS_REGION_NAME="${AWS_REGION_NAME:-us-east-1}" \
       nohup litellm --model bedrock/us.anthropic.claude-sonnet-4-6 --port 4000 \
         >/tmp/litellm.log 2>&1 &
       echo $! >/tmp/litellm.pid

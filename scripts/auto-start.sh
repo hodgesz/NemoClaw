@@ -141,10 +141,16 @@ info "Gateway state: $(openshell status 2>&1 | head -3 | tr '\n' ' ')"
 
 # ── Step 3b: Start LiteLLM proxy (Bedrock inference) ───────────────
 # The sandbox routes inference through a LiteLLM proxy on the host
-# (compatible-endpoint → localhost:4000). Start it if not running.
+# (compatible-endpoint → localhost:4000). Auth uses a Bedrock bearer
+# token (AWS_BEARER_TOKEN_BEDROCK), NOT IAM/SSO credentials.
 if ! curl -sf --max-time 2 http://127.0.0.1:4000/health > /dev/null 2>&1; then
   if command -v litellm > /dev/null 2>&1; then
+    if [ -z "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then
+      warn "AWS_BEARER_TOKEN_BEDROCK not set. LiteLLM will fail to authenticate with Bedrock."
+    fi
     info "Starting LiteLLM proxy (bedrock/claude-sonnet-4-6 on port 4000)..."
+    AWS_BEARER_TOKEN_BEDROCK="${AWS_BEARER_TOKEN_BEDROCK:-}" \
+    AWS_REGION_NAME="${AWS_REGION_NAME:-us-east-1}" \
     nohup litellm --model bedrock/us.anthropic.claude-sonnet-4-6 --port 4000 \
       >/tmp/litellm.log 2>&1 &
     echo $! >/tmp/litellm.pid
