@@ -32,6 +32,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SANDBOX_NAME="${NEMOCLAW_SANDBOX_NAME:-my-assistant}"
 CLUSTER_CONTAINER="openshell-cluster-nemoclaw"
 SKIP_SKILLS=0
+SKIP_GEMINI=0
 DRY_RUN=0
 
 # ── Colors ──────────────────────────────────────────────────────
@@ -59,6 +60,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --sandbox)    SANDBOX_NAME="${2:?--sandbox requires a name}"; shift 2 ;;
     --skip-skills) SKIP_SKILLS=1; shift ;;
+    --skip-gemini) SKIP_GEMINI=1; shift ;;
     --dry-run)    DRY_RUN=1; shift ;;
     --help|-h)    sed -n '2,/^$/s/^# *//p' "$0"; exit 0 ;;
     *)            shift ;;
@@ -91,11 +93,19 @@ sandbox_exec() {
 }
 
 # ── Step 1: Inject Gemini web search config ─────────────────────
-step "Step 1/6: Gemini web search config"
+# NOTE: Model identity is now handled by NEMOCLAW_MODEL_OVERRIDE env var
+# at sandbox creation (upstream PR #1633). This step only injects the
+# Gemini web search API key + tool config, which is a separate concern.
+# Pass --skip-gemini to skip this entirely (e.g. from auto-start).
 
-if [ -z "${GEMINI_API_KEY:-}" ]; then
+if [ "$SKIP_GEMINI" -eq 1 ]; then
+  step "Step 1/6: Gemini web search config (skipped via --skip-gemini)"
+  info "Model config handled by NEMOCLAW_MODEL_OVERRIDE. Skipping Gemini injection."
+elif [ -z "${GEMINI_API_KEY:-}" ]; then
+  step "Step 1/6: Gemini web search config"
   warn "GEMINI_API_KEY not set. Skipping Gemini config injection."
 else
+  step "Step 1/6: Gemini web search config"
   if dry "would inject Gemini web search config into openclaw.json"; then
     :
   else
@@ -124,14 +134,20 @@ json.dump(cfg, open('/tmp/oc-cfg.json', 'w'), indent=2)
 fi
 
 # ── Step 2: Update config hash ──────────────────────────────────
-step "Step 2/6: Config hash update"
+# Only needed when Step 1 modified openclaw.json. When --skip-gemini is
+# set, the entrypoint's NEMOCLAW_MODEL_OVERRIDE handles hash recomputation.
 
-if dry "would update config hash"; then
-  :
+if [ "$SKIP_GEMINI" -eq 1 ]; then
+  step "Step 2/6: Config hash update (skipped — entrypoint handles this)"
 else
-  sandbox_exec fix-hash sh -c \
-    'sha256sum /sandbox/.openclaw/openclaw.json > /sandbox/.openclaw/.config-hash && chmod 444 /sandbox/.openclaw/.config-hash'
-  info "Config hash updated."
+  step "Step 2/6: Config hash update"
+  if dry "would update config hash"; then
+    :
+  else
+    sandbox_exec fix-hash sh -c \
+      'sha256sum /sandbox/.openclaw/openclaw.json > /sandbox/.openclaw/.config-hash && chmod 444 /sandbox/.openclaw/.config-hash'
+    info "Config hash updated."
+  fi
 fi
 
 # ── Step 3: Fetch-guard DNS patch ───────────────────────────────

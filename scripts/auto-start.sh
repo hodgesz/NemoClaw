@@ -240,11 +240,14 @@ else
 fi
 
 # ── Step 4c: Apply custom sandbox configurations ─────────────────
-# Gemini config injection, fetch-guard DNS patch, gateway restart,
-# device pairing, and custom skill installation.
+# Model config is now handled by NEMOCLAW_MODEL_OVERRIDE env var at sandbox
+# creation (PR #1633). The custom-policies script is still needed for:
+#   - Fetch-guard DNS patch (NemoClaw #1252, still open)
+#   - Gateway restart (to reload patched code)
+#   - Device pairing, custom skill installation
 if [ -x "$SCRIPT_DIR/apply-custom-policies.sh" ]; then
-  info "Applying custom sandbox configurations (Gemini, fetch-guard, skills)..."
-  "$SCRIPT_DIR/apply-custom-policies.sh" --sandbox "$SANDBOX_NAME" 2>&1 || warn "Custom policies failed."
+  info "Applying custom sandbox configurations (fetch-guard, skills)..."
+  "$SCRIPT_DIR/apply-custom-policies.sh" --sandbox "$SANDBOX_NAME" --skip-gemini 2>&1 || warn "Custom policies failed."
 else
   warn "apply-custom-policies.sh not found or not executable. Skipping."
 fi
