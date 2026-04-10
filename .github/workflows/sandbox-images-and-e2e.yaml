@@ -18,7 +18,7 @@ permissions:
 jobs:
   build-sandbox-images:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -34,8 +34,14 @@ jobs:
 
       - name: Save images to tarballs
         run: |
+          set -euo pipefail
           docker save nemoclaw-sandbox-test | gzip > /tmp/sandbox-test-image.tar.gz
           docker save nemoclaw-production | gzip > /tmp/isolation-image.tar.gz
+
+      - name: Verify tarballs
+        run: |
+          gzip -t /tmp/sandbox-test-image.tar.gz
+          gzip -t /tmp/isolation-image.tar.gz
 
       - name: Upload sandbox test image
         uses: actions/upload-artifact@v4
