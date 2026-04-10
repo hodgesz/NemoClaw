@@ -5,7 +5,7 @@ const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
-const { shellQuote } = require("./runner");
+const { shellQuote } = require("../../dist/lib/runner");
 
 /**
  * Create a spawnClaudeCodeProcess function that executes the Claude Code CLI
