@@ -117,6 +117,7 @@ describe("policies", () => {
         "brave",
         "brew",
         "discord",
+        "gemini-search",
         "github",
         "huggingface",
         "jira",
@@ -124,7 +125,9 @@ describe("policies", () => {
         "outlook",
         "pypi",
         "slack",
+        "tavily",
         "telegram",
+        "whatsapp",
       ];
       expect(names).toEqual(expected);
     });
