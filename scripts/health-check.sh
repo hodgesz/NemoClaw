@@ -320,6 +320,73 @@ check_rules() {
   fi
 }
 
+check_briefing() {
+  if should_skip "briefing"; then record "briefing" "skip" ""; return; fi
+  local status_file="/tmp/nemoclaw-briefing-status.json"
+  if [ ! -f "$status_file" ]; then
+    record "briefing" "skip" "No briefing status file (never ran?)"
+    return
+  fi
+  # Parse the status file
+  local status timestamp age_hours
+  status="$(grep -o '"status":"[^"]*"' "$status_file" | head -1 | cut -d'"' -f4)"
+  timestamp="$(grep -o '"timestamp":"[^"]*"' "$status_file" | head -1 | cut -d'"' -f4)"
+
+  # Check staleness — briefing should run daily, so >25h is stale
+  if [ -n "$timestamp" ]; then
+    local file_epoch now_epoch
+    file_epoch="$(date -jf '%Y-%m-%dT%H:%M:%SZ' "$timestamp" '+%s' 2>/dev/null || stat -f '%m' "$status_file")"
+    now_epoch="$(date '+%s')"
+    age_hours=$(( (now_epoch - file_epoch) / 3600 ))
+    if [ "$age_hours" -gt 25 ]; then
+      record "briefing" "fail" "Last briefing is ${age_hours}h old (stale)"
+      return
+    fi
+  fi
+
+  case "$status" in
+    ok)
+      record "briefing" "pass" "Last briefing succeeded ($timestamp)"
+      ;;
+    error:*)
+      local err_type="${status#error:}"
+      record "briefing" "fail" "Last briefing failed: $err_type ($timestamp)"
+      ;;
+    *)
+      record "briefing" "fail" "Unknown briefing status: $status"
+      ;;
+  esac
+}
+
+check_inference_live() {
+  if should_skip "inference_live"; then record "inference_live" "skip" ""; return; fi
+  # End-to-end inference probe: send a minimal prompt through the sandbox agent
+  # and verify we get a non-error response. Timeout after 30s to avoid blocking
+  # the health check for minutes on a hung provider.
+  local probe_out probe_exit
+  probe_out=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+    "openshell-${SANDBOX_NAME}" \
+    'timeout 30 openclaw agent --agent main -m "Reply with only the word: OK" 2>&1 | tail -5' \
+    2>&1) && probe_exit=0 || probe_exit=$?
+
+  if [ "$probe_exit" -ne 0 ]; then
+    record "inference_live" "fail" "Inference probe SSH/timeout (exit $probe_exit)"
+    return
+  fi
+
+  # Check for error patterns in the response
+  if echo "$probe_out" | grep -qiE "timed? out|timeout|ETIMEDOUT|connection refused|ECONNREFUSED|502|503|rate.limit|LLM.*error"; then
+    local err_snippet
+    err_snippet="$(echo "$probe_out" | grep -iE "timed? out|timeout|error|refused|502|503|rate" | head -1)"
+    record "inference_live" "fail" "Inference error: ${err_snippet:0:60}"
+  elif [ -z "$probe_out" ]; then
+    record "inference_live" "fail" "Inference probe returned empty response"
+  else
+    record "inference_live" "pass" "Inference probe OK"
+  fi
+}
+
 # ── Auto-fix functions ─────────────────────────────────────────
 # Each returns 0 if remediation was attempted (re-check warranted).
 
@@ -415,7 +482,7 @@ get_fix_func() {
   esac
 }
 
-REMEDIATION_ORDER=(docker gateway sandbox ssh inference dashboard bridge agent rules)
+REMEDIATION_ORDER=(docker gateway sandbox ssh inference inference_live dashboard bridge agent rules briefing)
 
 get_result_status() {
   local target="$1"
@@ -528,10 +595,12 @@ check_gateway
 check_sandbox
 check_ssh
 check_inference
+check_inference_live
 check_dashboard
 check_bridge
 check_agent
 check_rules
+check_briefing
 
 # ── Auto-fix pass ─────────────────────────────────────────────
 if [ "$AUTO_FIX" -eq 1 ] && [ "$CHECKS_FAILED" -gt 0 ]; then
