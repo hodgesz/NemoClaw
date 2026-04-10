@@ -422,6 +422,8 @@ check_inference_live() {
 
 # ── Auto-fix functions ─────────────────────────────────────────
 # Each returns 0 if remediation was attempted (re-check warranted).
+# These are invoked indirectly via get_fix_func().
+# shellcheck disable=SC2329
 
 fix_docker() {
   if [ "$(uname -s)" = "Darwin" ]; then
@@ -539,7 +541,7 @@ replace_result() {
   for i in "${!RESULTS[@]}"; do
     IFS='|' read -r rname _ _ <<<"${RESULTS[$i]}"
     if [ "$rname" = "$target" ]; then
-      RESULTS[$i]="${target}|${new_status}|${new_detail}"
+      RESULTS[i]="${target}|${new_status}|${new_detail}"
       return
     fi
   done

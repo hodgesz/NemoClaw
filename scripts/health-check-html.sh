@@ -86,8 +86,11 @@ fi
 # Build check rows
 ROWS=""
 while IFS= read -r line; do
+  # shellcheck disable=SC2001 # sed regex extraction too complex for parameter expansion
   name=$(echo "$line" | sed 's/.*"name": *"\([^"]*\)".*/\1/')
+  # shellcheck disable=SC2001
   check_status=$(echo "$line" | sed 's/.*"status": *"\([^"]*\)".*/\1/')
+  # shellcheck disable=SC2001
   detail=$(echo "$line" | sed 's/.*"detail": *"\([^"]*\)".*/\1/')
 
   # Sanitize values before embedding in HTML

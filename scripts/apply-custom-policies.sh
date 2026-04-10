@@ -262,6 +262,7 @@ step "Step 4/6: Restart gateway (reload patched code)"
 if dry "would kill and restart gateway process inside sandbox"; then
   :
 else
+  # shellcheck disable=SC2016 # single quotes intentional — runs inside sandbox
   GW_PID=$(sandbox_exec find-gw-pid sh -c '
     for f in /proc/[0-9]*/cmdline; do
       pid=$(echo "$f" | cut -d/ -f3)
@@ -278,6 +279,7 @@ else
     sleep 5
 
     # Check if it respawned
+    # shellcheck disable=SC2016
     NEW_GW_PID=$(sandbox_exec check-gw sh -c '
       for f in /proc/[0-9]*/cmdline; do
         pid=$(echo "$f" | cut -d/ -f3)
@@ -296,6 +298,7 @@ else
         "nohup openclaw gateway run --port 18789 --auth token --bind loopback > /tmp/gateway.log 2>&1 &" 2>/dev/null || true
       sleep 5
 
+      # shellcheck disable=SC2016
       NEW_GW_PID=$(sandbox_exec recheck-gw sh -c '
         for f in /proc/[0-9]*/cmdline; do
           pid=$(echo "$f" | cut -d/ -f3)
