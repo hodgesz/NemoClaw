@@ -408,10 +408,14 @@ check_inference_live() {
     return
   fi
 
+  # Strip stderr noise (Node.js warnings, setup lines) before checking for errors
+  local clean_out
+  clean_out="$(echo "$probe_out" | grep -vE 'UNDICI-EHPA|EnvHttpProxyAgent|trace-warnings|\(node:|\(Use .node')"
+
   # Check for error patterns in the response
-  if echo "$probe_out" | grep -qiE "timed? out|timeout|ETIMEDOUT|connection refused|ECONNREFUSED|502|503|rate.limit|LLM.*error"; then
+  if echo "$clean_out" | grep -qiE "timed? out|timeout|ETIMEDOUT|connection refused|ECONNREFUSED|502|503|rate.limit|LLM.*error"; then
     local err_snippet
-    err_snippet="$(echo "$probe_out" | grep -iE "timed? out|timeout|error|refused|502|503|rate" | head -1)"
+    err_snippet="$(echo "$clean_out" | grep -iE "timed? out|timeout|error|refused|502|503|rate" | head -1)"
     record "inference_live" "fail" "Inference error: ${err_snippet:0:60}"
   elif [ -z "$probe_out" ]; then
     record "inference_live" "fail" "Inference probe returned empty response"
