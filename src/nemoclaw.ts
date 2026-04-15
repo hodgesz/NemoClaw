@@ -6,6 +6,7 @@ const { execFileSync, spawnSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
+const { DASHBOARD_PORT } = require("./lib/ports");
 
 // ---------------------------------------------------------------------------
 // Color / style — respects NO_COLOR and non-TTY environments.
@@ -41,11 +42,16 @@ const registry = require("./lib/registry");
 const nim = require("./lib/nim");
 const policies = require("./lib/policies");
 const { parseGatewayInference } = require("./lib/inference-config");
+const { probeLocalProviderHealth } = require("./lib/local-inference");
 const { getVersion } = require("./lib/version");
 const onboardSession = require("./lib/onboard-session");
 const { parseLiveSandboxNames } = require("./lib/runtime-recovery");
 const { NOTICE_ACCEPT_ENV, NOTICE_ACCEPT_FLAG } = require("./lib/usage-notice");
 const { runDebugCommand } = require("./lib/debug-command");
+const {
+  runDeprecatedOnboardAliasCommand,
+  runOnboardCommand,
+} = require("./lib/onboard-command");
 const {
   captureOpenshellCommand,
   getInstalledOpenshellVersion,
@@ -61,6 +67,9 @@ const {
   runUninstallCommand,
 } = require("./lib/uninstall-command");
 const agentRuntime = require("../bin/lib/agent-runtime");
+const sandboxVersion = require("./lib/sandbox-version");
+const sandboxState = require("./lib/sandbox-state");
+const skillInstall = require("./lib/skill-install");
 
 // ── Global commands ──────────────────────────────────────────────
 
@@ -76,6 +85,7 @@ const GLOBAL_COMMANDS = new Set([
   "debug",
   "uninstall",
   "credentials",
+  "backup-all",
   "help",
   "--help",
   "-h",
@@ -87,7 +97,7 @@ const REMOTE_UNINSTALL_URL = buildVersionedUninstallUrl(getVersion());
 let OPENSHELL_BIN = null;
 const MIN_LOGS_OPENSHELL_VERSION = "0.0.7";
 const NEMOCLAW_GATEWAY_NAME = "nemoclaw";
-const DASHBOARD_FORWARD_PORT = "18789";
+const DASHBOARD_FORWARD_PORT = String(DASHBOARD_PORT);
 
 function getOpenshellBinary() {
   if (!OPENSHELL_BIN) {
@@ -209,7 +219,7 @@ function executeSandboxCommand(sandboxName, command) {
 
 /**
  * Check whether the OpenClaw gateway process is running inside the sandbox.
- * Uses the gateway's HTTP endpoint (port 18789) as the source of truth,
+ * Uses the gateway's HTTP endpoint (dashboard port) as the source of truth,
  * since the gateway runs as a separate user and pgrep may not see it.
  * Returns true (running), false (stopped), or null (cannot determine).
  */
@@ -244,7 +254,7 @@ function recoverSandboxProcesses(sandboxName) {
       "[ -f ~/.bashrc ] && . ~/.bashrc 2>/dev/null;",
       // Re-check liveness before touching anything — another caller may have
       // already recovered the gateway between our initial check and now (TOCTOU).
-      "if curl -sf --max-time 3 http://127.0.0.1:18789/ > /dev/null 2>&1; then echo ALREADY_RUNNING; exit 0; fi;",
+      `if curl -sf --max-time 3 http://127.0.0.1:${DASHBOARD_PORT}/ > /dev/null 2>&1; then echo ALREADY_RUNNING; exit 0; fi;`,
       // Clean stale lock files from the previous run (gateway checks these)
       "rm -rf /tmp/openclaw-*/gateway.*.lock 2>/dev/null;",
       // Clean stale temp files from the previous run
@@ -505,6 +515,7 @@ function getNamedGatewayLifecycleState() {
   return { state: "missing_named", status: status.output, gatewayInfo: gatewayInfo.output };
 }
 
+/** Attempt to recover the named NemoClaw gateway after a restart or connectivity loss. */
 async function recoverNamedGatewayRuntime() {
   const before = getNamedGatewayLifecycleState();
   if (before.state === "healthy_named") {
@@ -540,10 +551,45 @@ async function recoverNamedGatewayRuntime() {
   return { recovered: false, before, after, attempted: true };
 }
 
+/** Query sandbox presence and return its output with the live enforced policy. */
 function getSandboxGatewayState(sandboxName) {
   const result = captureOpenshell(["sandbox", "get", sandboxName]);
-  const output = result.output;
+  let output = result.output;
   if (result.status === 0) {
+    // `openshell sandbox get` returns the immutable baseline policy from sandbox
+    // creation, which does not include network_policies added later via
+    // `openshell policy set`. Replace the Policy section with the live policy
+    // from `policy get --full`, preserving the colored "Policy:" header and
+    // Sandbox info above it. (#1132)
+    const livePolicy = captureOpenshell(["policy", "get", "--full", sandboxName], {
+      ignoreError: true,
+    });
+    if (livePolicy.status === 0 && livePolicy.output.trim()) {
+      const rawLines = String(output).split("\n");
+      const cleanLines = stripAnsi(String(output)).split("\n");
+      const policyLineIdx = cleanLines.findIndex((l) => l.trim() === "Policy:");
+      if (policyLineIdx !== -1) {
+        // Keep everything before Policy (Sandbox info with colors),
+        // plus the original colored "Policy:" header line.
+        const before = rawLines.slice(0, policyLineIdx + 1).join("\n");
+        // Extract YAML content from policy get --full (skip metadata header before "---").
+        // Use a regex to handle varying line endings (\n, \r\n) and optional trailing whitespace.
+        const delimIdx = livePolicy.output.search(/^---\s*$/m);
+        const yamlPart = delimIdx !== -1
+          ? livePolicy.output.slice(delimIdx).replace(/^---\s*[\r\n]+/, "")
+          : livePolicy.output;
+        // Guard: only replace if the extracted content looks like policy YAML
+        // (starts with a YAML key like "version:" or "network_policies:").
+        // Avoids replacing with warnings or status text from unexpected output.
+        const trimmedYaml = yamlPart.trim();
+        const looksLikeError = /^(error|failed|invalid|warning|status)\b/i.test(trimmedYaml);
+        if (trimmedYaml && !looksLikeError && /^[a-z_][a-z0-9_]*\s*:/m.test(trimmedYaml)) {
+          // Add 2-space indent to match the original sandbox get output format.
+          const indented = trimmedYaml.split("\n").map((l) => (l ? "  " + l : l)).join("\n");
+          output = before + "\n\n" + indented + "\n";
+        }
+      }
+    }
     return { state: "present", output };
   }
   if (/\bNotFound\b|\bNot Found\b|sandbox not found/i.test(output)) {
@@ -559,6 +605,7 @@ function getSandboxGatewayState(sandboxName) {
   return { state: "unknown_error", output };
 }
 
+/** Print troubleshooting hints based on gateway lifecycle state in the output. */
 function printGatewayLifecycleHint(output = "", sandboxName = "", writer = console.error) {
   const cleanOutput = stripAnsi(output);
   if (/No gateway configured/i.test(cleanOutput)) {
@@ -780,88 +827,38 @@ function printDangerouslySkipPermissionsWarning() {
 
 // ── Commands ─────────────────────────────────────────────────────
 
-async function onboard(args) {
+function buildOnboardCommandDeps(args) {
   const { onboard: runOnboard } = require("./lib/onboard");
+  const { listAgents } = require("./lib/agent-defs");
+  return {
+    args,
+    noticeAcceptFlag: NOTICE_ACCEPT_FLAG,
+    noticeAcceptEnv: NOTICE_ACCEPT_ENV,
+    env: process.env,
+    runOnboard,
+    listAgents,
+    log: console.log,
+    error: console.error,
+    exit: (code) => process.exit(code),
+  };
+}
 
-  // Extract --from <path> before the unknown-arg validator: it takes a value
-  // so the set-based check would reject the value token as an unknown flag.
-  let fromDockerfile = null;
-  const fromIdx = args.indexOf("--from");
-  if (fromIdx !== -1) {
-    fromDockerfile = args[fromIdx + 1];
-    if (!fromDockerfile || fromDockerfile.startsWith("--")) {
-      console.error("  --from requires a path to a Dockerfile");
-      console.error(
-        `  Usage: nemoclaw onboard [--non-interactive] [--resume] [--recreate-sandbox] [--from <Dockerfile>] [${NOTICE_ACCEPT_FLAG}]`,
-      );
-      process.exit(1);
-    }
-    args = [...args.slice(0, fromIdx), ...args.slice(fromIdx + 2)];
-  }
-
-  let agentFlag = null;
-  const agentIdx = args.indexOf("--agent");
-  if (agentIdx !== -1) {
-    agentFlag = args[agentIdx + 1];
-    if (!agentFlag || agentFlag.startsWith("--")) {
-      console.error("  --agent requires a name");
-      process.exit(1);
-    }
-    const { listAgents } = require("../bin/lib/agent-defs");
-    const knownAgents = listAgents();
-    if (!knownAgents.includes(agentFlag)) {
-      console.error(`  Unknown agent '${agentFlag}'. Available: ${knownAgents.join(", ")}`);
-      process.exit(1);
-    }
-    args = [...args.slice(0, agentIdx), ...args.slice(agentIdx + 2)];
-  }
-
-  const allowedArgs = new Set([
-    "--non-interactive",
-    "--resume",
-    "--recreate-sandbox",
-    "--dangerously-skip-permissions",
-    NOTICE_ACCEPT_FLAG,
-  ]);
-  const unknownArgs = args.filter((arg) => !allowedArgs.has(arg));
-  if (unknownArgs.length > 0) {
-    console.error(`  Unknown onboard option(s): ${unknownArgs.join(", ")}`);
-    console.error(
-      `  Usage: nemoclaw onboard [--non-interactive] [--resume] [--recreate-sandbox] [--from <Dockerfile>] [--agent <name>] [--dangerously-skip-permissions] [${NOTICE_ACCEPT_FLAG}]`,
-    );
-    process.exit(1);
-  }
-  const nonInteractive = args.includes("--non-interactive");
-  const resume = args.includes("--resume");
-  const recreateSandbox = args.includes("--recreate-sandbox");
-  const dangerouslySkipPermissions = args.includes("--dangerously-skip-permissions");
-  const acceptThirdPartySoftware =
-    args.includes(NOTICE_ACCEPT_FLAG) || String(process.env[NOTICE_ACCEPT_ENV] || "") === "1";
-  await runOnboard({
-    nonInteractive,
-    resume,
-    recreateSandbox,
-    fromDockerfile,
-    acceptThirdPartySoftware,
-    agent: agentFlag,
-    dangerouslySkipPermissions,
-  });
+async function onboard(args) {
+  await runOnboardCommand(buildOnboardCommandDeps(args));
 }
 
 async function setup(args = []) {
-  console.log("");
-  console.log("  ⚠  `nemoclaw setup` is deprecated. Use `nemoclaw onboard` instead.");
-  console.log("");
-  await onboard(args);
+  await runDeprecatedOnboardAliasCommand({
+    ...buildOnboardCommandDeps(args),
+    kind: "setup",
+  });
 }
 
 async function setupSpark(args = []) {
-  console.log("");
-  console.log("  ⚠  `nemoclaw setup-spark` is deprecated.");
-  console.log("  Current OpenShell releases handle the old DGX Spark cgroup issue themselves.");
-  console.log("  Use `nemoclaw onboard` instead.");
-  console.log("");
-  await onboard(args);
+  await runDeprecatedOnboardAliasCommand({
+    ...buildOnboardCommandDeps(args),
+    kind: "setup-spark",
+  });
 }
 
 async function deploy(instanceName) {
@@ -919,7 +916,6 @@ function uninstall(args) {
     remoteScriptUrl: REMOTE_UNINSTALL_URL,
     env: process.env,
     spawnSyncImpl: spawnSync,
-    execFileSyncImpl: execFileSync,
     log: console.log,
     error: console.error,
     exit: (code) => process.exit(code),
@@ -1029,12 +1025,35 @@ async function listSandboxes() {
 
 async function sandboxConnect(sandboxName, { dangerouslySkipPermissions = false } = {}) {
   await ensureLiveSandboxOrExit(sandboxName);
+
+  // Version staleness check — warn but don't block
+  try {
+    const versionCheck = sandboxVersion.checkAgentVersion(sandboxName);
+    if (versionCheck.isStale) {
+      for (const line of sandboxVersion.formatStalenessWarning(sandboxName, versionCheck)) {
+        console.error(line);
+      }
+    }
+  } catch { /* non-fatal — don't block connect on version check failure */ }
+
   if (dangerouslySkipPermissions) {
     printDangerouslySkipPermissionsWarning();
     const policies = require("./lib/policies");
     policies.applyPermissivePolicy(sandboxName);
   }
   checkAndRecoverSandboxProcesses(sandboxName);
+  // Print a one-shot hint before dropping the user into the sandbox
+  // shell so a fresh user knows the first thing to type. Without this,
+  // `nemoclaw <name> connect` lands on a bare bash prompt and users
+  // ask "now what?" — see #465. Suppress the hint when stdout isn't a
+  // TTY so scripted callers don't get noise in their pipelines.
+  if (process.stdout.isTTY && !["1", "true"].includes(String(process.env.NEMOCLAW_NO_CONNECT_HINT || ""))) {
+    console.log("");
+    console.log(`  ${G}✓${R} Connecting to sandbox '${sandboxName}'`);
+    console.log(`  ${D}Inside the sandbox, run \`openclaw tui\` to start chatting with the agent.${R}`);
+    console.log(`  ${D}Type \`exit\` (or Ctrl-D) to return to the host shell.${R}`);
+    console.log("");
+  }
   const result = spawnSync(getOpenshellBinary(), ["sandbox", "connect", sandboxName], {
     stdio: "inherit",
     cwd: ROOT,
@@ -1049,16 +1068,42 @@ async function sandboxStatus(sandboxName) {
   const live = parseGatewayInference(
     captureOpenshell(["inference", "get"], { ignoreError: true }).output,
   );
+  const currentModel = (live && live.model) || (sb && sb.model) || "unknown";
+  const currentProvider = (live && live.provider) || (sb && sb.provider) || "unknown";
+  const localInferenceHealth =
+    typeof currentProvider === "string" ? probeLocalProviderHealth(currentProvider) : null;
   if (sb) {
     console.log("");
     console.log(`  Sandbox: ${sb.name}`);
-    console.log(`    Model:    ${(live && live.model) || sb.model || "unknown"}`);
-    console.log(`    Provider: ${(live && live.provider) || sb.provider || "unknown"}`);
+    console.log(`    Model:    ${currentModel}`);
+    console.log(`    Provider: ${currentProvider}`);
+    if (localInferenceHealth) {
+      console.log(
+        `    Inference: ${localInferenceHealth.ok ? `${G}healthy${R}` : `${_RD}unreachable${R}`} (${localInferenceHealth.endpoint})`,
+      );
+      if (!localInferenceHealth.ok) {
+        console.log(`      ${localInferenceHealth.detail}`);
+      }
+    }
     console.log(`    GPU:      ${sb.gpuEnabled ? "yes" : "no"}`);
     console.log(`    Policies: ${(sb.policies || []).join(", ") || "none"}`);
     if (sb.dangerouslySkipPermissions) {
       console.log(`    Permissions: dangerously-skip-permissions (open)`);
     }
+
+    // Agent version check
+    try {
+      const versionCheck = sandboxVersion.checkAgentVersion(sandboxName);
+      const agent = agentRuntime.getSessionAgent(sandboxName);
+      const agentName = agentRuntime.getAgentDisplayName(agent);
+      if (versionCheck.sandboxVersion) {
+        console.log(`    Agent:    ${agentName} v${versionCheck.sandboxVersion}`);
+      }
+      if (versionCheck.isStale) {
+        console.log(`    ${YW}Update:   v${versionCheck.expectedVersion} available${R}`);
+        console.log(`              Run \`nemoclaw ${sandboxName} rebuild\` to upgrade`);
+      }
+    } catch { /* non-fatal */ }
   }
 
   const lookup = await getReconciledSandboxGatewayState(sandboxName);
@@ -1253,10 +1298,152 @@ function sandboxPolicyList(sandboxName) {
   console.log("");
 }
 
-function cleanupSandboxServices(sandboxName) {
-  // Stop host services (cloudflared) and clean up PID directory.
-  const { stopAll } = require("./lib/services");
-  stopAll({ sandboxName });
+async function sandboxSkillInstall(sandboxName, args = []) {
+  const sub = args[0];
+  if (!sub || sub === "help" || sub === "--help" || sub === "-h") {
+    console.log("");
+    console.log("  Usage: nemoclaw <sandbox> skill install <path>");
+    console.log("");
+    console.log("  Deploy a skill directory to a running sandbox.");
+    console.log("  <path> must be a skill directory containing a SKILL.md (with 'name:' frontmatter),");
+    console.log("  or a direct path to a SKILL.md file. All non-dot files in the directory are uploaded.");
+    console.log("");
+    return;
+  }
+
+  if (sub !== "install") {
+    console.error(`  Unknown skill subcommand: ${sub}`);
+    console.error("  Valid subcommands: install");
+    process.exit(1);
+  }
+
+  const skillPath = args[1];
+  const extraArgs = args.slice(2);
+  if (extraArgs.length > 0) {
+    console.error(`  Unknown argument(s) for skill install: ${extraArgs.join(", ")}`);
+    console.error("  Usage: nemoclaw <sandbox> skill install <path>");
+    process.exit(1);
+  }
+  if (!skillPath) {
+    console.error("  Usage: nemoclaw <sandbox> skill install <path>");
+    console.error("  <path> must be a directory containing a SKILL.md file.");
+    process.exit(1);
+  }
+
+  const resolvedPath = path.resolve(skillPath);
+
+  // Accept a directory containing SKILL.md, or a direct path to SKILL.md.
+  let skillDir: string;
+  let skillMdPath: string;
+  if (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isDirectory()) {
+    skillDir = resolvedPath;
+    skillMdPath = path.join(resolvedPath, "SKILL.md");
+  } else if (fs.existsSync(resolvedPath) && resolvedPath.endsWith("SKILL.md")) {
+    skillDir = path.dirname(resolvedPath);
+    skillMdPath = resolvedPath;
+  } else {
+    console.error(`  No SKILL.md found at '${resolvedPath}'.`);
+    console.error("  <path> must be a skill directory or a direct path to SKILL.md.");
+    process.exit(1);
+  }
+
+  if (!fs.existsSync(skillMdPath)) {
+    console.error(`  No SKILL.md found in '${skillDir}'.`);
+    console.error("  The skill directory must contain a SKILL.md file.");
+    process.exit(1);
+  }
+
+  // 1. Validate frontmatter
+  let frontmatter;
+  try {
+    const content = fs.readFileSync(skillMdPath, "utf-8");
+    frontmatter = skillInstall.parseFrontmatter(content);
+  } catch (err) {
+    console.error(`  ${err.message}`);
+    process.exit(1);
+  }
+
+  const collected = skillInstall.collectFiles(skillDir);
+  if (collected.unsafePaths.length > 0) {
+    console.error(`  Skill directory contains files with unsafe characters:`);
+    for (const p of collected.unsafePaths) console.error(`    ${p}`);
+    console.error("  File names must match [A-Za-z0-9._-/]. Rename or remove them.");
+    process.exit(1);
+  }
+  if (collected.skippedDotfiles.length > 0) {
+    console.log(`  ${D}Skipping ${collected.skippedDotfiles.length} hidden path(s): ${collected.skippedDotfiles.join(", ")}${R}`);
+  }
+  const fileLabel = collected.files.length === 1 ? "1 file" : `${collected.files.length} files`;
+  console.log(`  ${G}✓${R} Validated SKILL.md (name: ${frontmatter.name}, ${fileLabel})`);
+
+  // 2. Ensure sandbox is live
+  await ensureLiveSandboxOrExit(sandboxName);
+
+  // 3. Resolve agent and paths
+  const agent = agentRuntime.getSessionAgent(sandboxName);
+  const paths = skillInstall.resolveSkillPaths(agent, frontmatter.name);
+
+  // 4. Get SSH config
+  const sshConfigResult = captureOpenshell(["sandbox", "ssh-config", sandboxName], {
+    ignoreError: true,
+  });
+  if (sshConfigResult.status !== 0) {
+    console.error("  Failed to obtain SSH configuration for the sandbox.");
+    process.exit(1);
+  }
+
+  const tmpSshConfig = path.join(os.tmpdir(), `nemoclaw-ssh-skill-${process.pid}-${Date.now()}.conf`);
+  fs.writeFileSync(tmpSshConfig, sshConfigResult.output, { mode: 0o600 });
+
+  try {
+    const ctx = { configFile: tmpSshConfig, sandboxName };
+
+    // 5. Check if skill already exists (update vs fresh install)
+    const isUpdate = skillInstall.checkExisting(ctx, paths);
+
+    // 6. Upload skill directory
+    const { uploaded, failed } = skillInstall.uploadDirectory(ctx, skillDir, paths.uploadDir);
+    if (failed.length > 0) {
+      console.error(`  Failed to upload ${failed.length} file(s): ${failed.join(", ")}`);
+      process.exit(1);
+    }
+    console.log(`  ${G}✓${R} Uploaded ${uploaded} file(s) to sandbox`);
+
+    // 7. Post-install (OpenClaw mirror + refresh, or restart hint).
+    //    Skip session refresh on updates — the agent already knows the skill;
+    //    clearing sessions would destroy chat history unnecessarily.
+    const post = skillInstall.postInstall(ctx, paths, skillDir, { skipRefresh: isUpdate });
+    for (const msg of post.messages) {
+      if (msg.startsWith("Warning:")) {
+        console.error(`  ${YW}${msg}${R}`);
+      } else {
+        console.log(`  ${D}${msg}${R}`);
+      }
+    }
+
+    // 8. Verify
+    const verified = skillInstall.verifyInstall(ctx, paths);
+    if (verified) {
+      const verb = isUpdate ? "updated" : "installed";
+      console.log(`  ${G}✓${R} Skill '${frontmatter.name}' ${verb}`);
+    } else {
+      console.error(`  Skill uploaded but verification failed at ${paths.uploadDir}/SKILL.md`);
+      process.exit(1);
+    }
+  } finally {
+    try {
+      fs.unlinkSync(tmpSshConfig);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function cleanupSandboxServices(sandboxName, { stopHostServices = false } = {}) {
+  if (stopHostServices) {
+    const { stopAll } = require("./lib/services");
+    stopAll({ sandboxName });
+  }
   try {
     fs.rmSync(`/tmp/nemoclaw-services-${sandboxName}`, { recursive: true, force: true });
   } catch {
@@ -1272,9 +1459,10 @@ function cleanupSandboxServices(sandboxName) {
 async function sandboxDestroy(sandboxName, args = []) {
   const skipConfirm = args.includes("--yes") || args.includes("--force");
   if (!skipConfirm) {
-    const answer = await askPrompt(
-      `  ${YW}Destroy sandbox '${sandboxName}'?${R} This cannot be undone. [y/N]: `,
-    );
+    console.log(`  ${YW}Destroy sandbox '${sandboxName}'?${R}`);
+    console.log("  This will permanently delete the sandbox and all workspace files inside it.");
+    console.log("  This cannot be undone.");
+    const answer = await askPrompt("  Type 'yes' to confirm, or press Enter to cancel [y/N]: ");
     if (answer.trim().toLowerCase() !== "y" && answer.trim().toLowerCase() !== "yes") {
       console.log("  Cancelled.");
       return;
@@ -1285,8 +1473,6 @@ async function sandboxDestroy(sandboxName, args = []) {
   const sb = registry.getSandbox(sandboxName);
   if (sb && sb.nimContainer) nim.stopNimContainerByName(sb.nimContainer);
   else nim.stopNimContainer(sandboxName);
-
-  cleanupSandboxServices(sandboxName);
 
   console.log(`  Deleting sandbox '${sandboxName}'...`);
   const deleteResult = runOpenshell(["sandbox", "delete", sandboxName], {
@@ -1302,6 +1488,13 @@ async function sandboxDestroy(sandboxName, args = []) {
     console.error(`  Failed to destroy sandbox '${sandboxName}'.`);
     process.exit(deleteResult.status || 1);
   }
+
+  const shouldStopHostServices =
+    (deleteResult.status === 0 || alreadyGone) &&
+    registry.listSandboxes().sandboxes.length === 1 &&
+    !!registry.getSandbox(sandboxName);
+
+  cleanupSandboxServices(sandboxName, { stopHostServices: shouldStopHostServices });
 
   const removed = registry.removeSandbox(sandboxName);
   const session = onboardSession.loadSession();
@@ -1325,6 +1518,246 @@ async function sandboxDestroy(sandboxName, args = []) {
   console.log(`  ${G}✓${R} Sandbox '${sandboxName}' destroyed`);
 }
 
+// ── Rebuild ──────────────────────────────────────────────────────
+
+function _rebuildLog(msg) {
+  console.error(`  ${D}[rebuild ${new Date().toISOString()}] ${msg}${R}`);
+}
+
+async function sandboxRebuild(sandboxName, args = []) {
+  const verbose = args.includes("--verbose") || args.includes("-v") || process.env.NEMOCLAW_REBUILD_VERBOSE === "1";
+  const log = verbose ? _rebuildLog : () => {};
+  const skipConfirm = args.includes("--yes") || args.includes("--force");
+  const sb = registry.getSandbox(sandboxName);
+  if (!sb) {
+    console.error(`  Sandbox '${sandboxName}' not found in registry.`);
+    process.exit(1);
+  }
+
+  // Multi-agent guard (temporary — until swarm lands)
+  if (sb.agents && sb.agents.length > 1) {
+    console.error("  Multi-agent sandbox rebuild is not yet supported.");
+    console.error("  Back up state manually and recreate with `nemoclaw onboard`.");
+    process.exit(1);
+  }
+
+  const agent = agentRuntime.getSessionAgent(sandboxName);
+  const agentName = agentRuntime.getAgentDisplayName(agent);
+
+  // Version check — show what's changing
+  const versionCheck = sandboxVersion.checkAgentVersion(sandboxName);
+  console.log("");
+  console.log(`  ${B}Rebuild sandbox '${sandboxName}'${R}`);
+  if (versionCheck.sandboxVersion) {
+    console.log(`    Current:  ${agentName} v${versionCheck.sandboxVersion}`);
+  }
+  if (versionCheck.expectedVersion) {
+    console.log(`    Target:   ${agentName} v${versionCheck.expectedVersion}`);
+  }
+  console.log("");
+
+  if (!skipConfirm) {
+    console.log("  This will:");
+    console.log("    1. Back up workspace state");
+    console.log("    2. Destroy and recreate the sandbox with the current image");
+    console.log("    3. Restore workspace state into the new sandbox");
+    console.log("");
+    const answer = await askPrompt("  Proceed? [y/N]: ");
+    if (answer.trim().toLowerCase() !== "y" && answer.trim().toLowerCase() !== "yes") {
+      console.log("  Cancelled.");
+      return;
+    }
+  }
+
+  // Step 1: Ensure sandbox is live for backup
+  log("Checking sandbox liveness: openshell sandbox list");
+  const isLive = captureOpenshell(["sandbox", "list"], { ignoreError: true });
+  log(`openshell sandbox list exit=${isLive.status}, output=${(isLive.output || "").substring(0, 200)}`);
+  const liveNames = parseLiveSandboxNames(isLive.output || "");
+  log(`Live sandboxes: ${Array.from(liveNames).join(", ") || "(none)"}`);
+  if (!liveNames.has(sandboxName)) {
+    console.error(`  Sandbox '${sandboxName}' is not running. Cannot back up state.`);
+    console.error("  Start it first or recreate with `nemoclaw onboard --recreate-sandbox`.");
+    process.exit(1);
+  }
+
+  // Step 2: Backup
+  console.log("  Backing up sandbox state...");
+  log(`Agent type: ${sb.agent || "openclaw"}, stateDirs from manifest`);
+  const backup = sandboxState.backupSandboxState(sandboxName);
+  log(`Backup result: success=${backup.success}, backed=${backup.backedUpDirs.join(",")}, failed=${backup.failedDirs.join(",")}`);
+  if (!backup.success) {
+    console.error("  Failed to back up sandbox state.");
+    if (backup.backedUpDirs.length > 0) {
+      console.error(`  Partial backup: ${backup.backedUpDirs.join(", ")}`);
+    }
+    if (backup.failedDirs.length > 0) {
+      console.error(`  Failed: ${backup.failedDirs.join(", ")}`);
+    }
+    console.error("  Aborting rebuild to prevent data loss.");
+    process.exit(1);
+  }
+  console.log(`  ${G}\u2713${R} State backed up (${backup.backedUpDirs.length} directories)`);
+  console.log(`    Backup: ${backup.manifest.backupPath}`);
+
+  // Step 3: Delete sandbox without tearing down gateway or session.
+  // sandboxDestroy() cleans up the gateway when it's the last sandbox and
+  // nulls session.sandboxName — both break the immediate onboard --resume.
+  console.log("  Deleting old sandbox...");
+  const sbMeta = registry.getSandbox(sandboxName);
+  log(`Registry entry: agent=${sbMeta?.agent}, agentVersion=${sbMeta?.agentVersion}, nimContainer=${sbMeta?.nimContainer}`);
+  if (sbMeta && sbMeta.nimContainer) nim.stopNimContainerByName(sbMeta.nimContainer);
+  else nim.stopNimContainer(sandboxName);
+
+  log(`Running: openshell sandbox delete ${sandboxName}`);
+  const deleteResult = runOpenshell(["sandbox", "delete", sandboxName], {
+    ignoreError: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const { alreadyGone } = getSandboxDeleteOutcome(deleteResult);
+  log(`Delete result: exit=${deleteResult.status}, alreadyGone=${alreadyGone}`);
+  if (deleteResult.status !== 0 && !alreadyGone) {
+    console.error("  Failed to delete sandbox. Aborting rebuild.");
+    console.error("  State backup is preserved at: " + backup.manifest.backupPath);
+    process.exit(deleteResult.status || 1);
+  }
+  registry.removeSandbox(sandboxName);
+  log(`Registry after remove: ${JSON.stringify(registry.listSandboxes().sandboxes.map(s => s.name))}`);
+  console.log(`  ${G}\u2713${R} Old sandbox deleted`);
+
+  // Step 4: Recreate via onboard --resume
+  console.log("");
+  console.log("  Creating new sandbox with current image...");
+
+  // Force the sandbox name so onboard recreates with the same name.
+  // Mark session resumable and point at this sandbox; set env var as fallback.
+  const sessionBefore = onboardSession.loadSession();
+  log(`Session before update: sandboxName=${sessionBefore?.sandboxName}, status=${sessionBefore?.status}, resumable=${sessionBefore?.resumable}, provider=${sessionBefore?.provider}, model=${sessionBefore?.model}`);
+
+  onboardSession.updateSession((s) => {
+    s.sandboxName = sandboxName;
+    s.resumable = true;
+    s.status = "in_progress";
+    return s;
+  });
+  process.env.NEMOCLAW_SANDBOX_NAME = sandboxName;
+
+  const sessionAfter = onboardSession.loadSession();
+  log(`Session after update: sandboxName=${sessionAfter?.sandboxName}, status=${sessionAfter?.status}, resumable=${sessionAfter?.resumable}, provider=${sessionAfter?.provider}, model=${sessionAfter?.model}`);
+  log(`Env: NEMOCLAW_SANDBOX_NAME=${process.env.NEMOCLAW_SANDBOX_NAME}, NEMOCLAW_RECREATE_SANDBOX=${process.env.NEMOCLAW_RECREATE_SANDBOX}`);
+  log("Calling onboard({ resume: true, nonInteractive: true, recreateSandbox: true })");
+
+  const { onboard } = require("./lib/onboard");
+  await onboard({
+    resume: true,
+    nonInteractive: true,
+    recreateSandbox: true,
+  });
+
+  log("onboard() returned successfully");
+
+  // Step 5: Restore
+  console.log("");
+  console.log("  Restoring workspace state...");
+  log(`Restoring from: ${backup.manifest.backupPath} into sandbox: ${sandboxName}`);
+  const restore = sandboxState.restoreSandboxState(sandboxName, backup.manifest.backupPath);
+  log(`Restore result: success=${restore.success}, restored=${restore.restoredDirs.join(",")}, failed=${restore.failedDirs.join(",")}`);
+  if (!restore.success) {
+    console.error(`  Partial restore: ${restore.restoredDirs.join(", ") || "none"}`);
+    console.error(`  Failed: ${restore.failedDirs.join(", ")}`);
+    console.error(`  Manual restore available from: ${backup.manifest.backupPath}`);
+  } else {
+    console.log(`  ${G}\u2713${R} State restored (${restore.restoredDirs.length} directories)`);
+  }
+
+  // Step 6: Post-restore agent-specific migration
+  const agentDef = agent ? require("./lib/agent-defs").loadAgent(agent.name) : require("./lib/agent-defs").loadAgent("openclaw");
+  if (agentDef.name === "openclaw") {
+    // openclaw doctor --fix validates and repairs directory structure.
+    // Idempotent and safe — catches structural changes between OpenClaw versions
+    // (new symlinks, new data dirs, etc.) that the restored state may be missing.
+    log("Running openclaw doctor --fix inside sandbox for post-upgrade structure repair");
+    const doctorResult = executeSandboxCommand(sandboxName, "openclaw doctor --fix");
+    log(`doctor --fix: exit=${doctorResult?.status}, stdout=${(doctorResult?.stdout || "").substring(0, 200)}`);
+    if (doctorResult && doctorResult.status === 0) {
+      console.log(`  ${G}\u2713${R} Post-upgrade structure check passed`);
+    } else {
+      console.log(`  ${D}Post-upgrade structure check skipped (doctor returned ${doctorResult?.status ?? "null"})${R}`);
+    }
+  }
+  // Hermes: no explicit post-restore step needed. Hermes's SessionDB._init_schema()
+  // auto-migrates state.db (SQLite) on first connection via sequential ALTER TABLE
+  // migrations (idempotent, schema_version tracked). ensure_hermes_home() repairs
+  // missing directories implicitly. The NemoClaw plugin's skill cache refreshes on
+  // on_session_start. Gateway startup is non-fatal if state.db migration fails.
+
+  // Step 7: Update registry with new version
+  registry.updateSandbox(sandboxName, {
+    agentVersion: agentDef.expectedVersion || null,
+  });
+  log(`Registry updated: agentVersion=${agentDef.expectedVersion}`);
+
+  console.log("");
+  if (restore.success) {
+    console.log(`  ${G}\u2713${R} Sandbox '${sandboxName}' rebuilt successfully`);
+    if (versionCheck.expectedVersion) {
+      console.log(`    Now running: ${agentName} v${versionCheck.expectedVersion}`);
+    }
+  } else {
+    console.log(`  ${YW}\u26a0${R} Sandbox '${sandboxName}' rebuilt but state restore was incomplete`);
+    console.log(`    Backup available at: ${backup.manifest.backupPath}`);
+  }
+}
+
+// ── Pre-upgrade backup ───────────────────────────────────────────
+
+/**
+ * Back up all registered sandboxes. Called by install.sh before upgrading
+ * NemoClaw or OpenShell so sandbox state is recoverable if the upgrade
+ * destroys sandbox contents.
+ */
+function backupAll() {
+  const { sandboxes } = registry.listSandboxes();
+  if (sandboxes.length === 0) {
+    console.log("  No sandboxes registered. Nothing to back up.");
+    return;
+  }
+
+  // Check which sandboxes are actually live
+  const liveList = captureOpenshell(["sandbox", "list"], { ignoreError: true });
+  const liveNames = parseLiveSandboxNames(liveList.output || "");
+
+  let backed = 0;
+  let failed = 0;
+  let skipped = 0;
+  for (const sb of sandboxes) {
+    if (!liveNames.has(sb.name)) {
+      console.log(`  ${D}Skipping '${sb.name}' (not running)${R}`);
+      skipped++;
+      continue;
+    }
+    console.log(`  Backing up '${sb.name}'...`);
+    const result = sandboxState.backupSandboxState(sb.name);
+    if (result.success) {
+      console.log(`  ${G}\u2713${R} ${sb.name}: ${result.backedUpDirs.length} dirs → ${result.manifest.backupPath}`);
+      backed++;
+    } else {
+      console.error(`  ${_RD}✗${R} ${sb.name}: backup failed (${result.failedDirs.join(", ")})`);
+      failed++;
+    }
+  }
+  console.log("");
+  console.log(`  Pre-upgrade backup: ${backed} backed up, ${failed} failed, ${skipped} skipped`);
+  if (backed > 0) {
+    console.log(`  Backups stored in: ~/.nemoclaw/rebuild-backups/`);
+  }
+  // Exit non-zero if any live sandbox failed to back up — the upgrade hook
+  // in install.sh treats this as non-fatal but logs a warning.
+  if (failed > 0) {
+    process.exit(1);
+  }
+}
+
 // ── Help ─────────────────────────────────────────────────────────
 
 function help() {
@@ -1342,7 +1775,11 @@ function help() {
     nemoclaw <name> connect          Shell into a running sandbox
     nemoclaw <name> status           Sandbox health + NIM status
     nemoclaw <name> logs ${D}[--follow]${R}  Stream sandbox logs
+    nemoclaw <name> rebuild          Upgrade sandbox to current agent version ${D}(--yes to skip prompt)${R}
     nemoclaw <name> destroy          Stop NIM + delete sandbox ${D}(--yes to skip prompt)${R}
+
+  ${G}Skills:${R}
+    nemoclaw <name> skill install <path>  Deploy a skill directory to the sandbox
 
   ${G}Policy Presets:${R}
     nemoclaw <name> policy-add       Add a network or filesystem policy preset ${D}(--dry-run to preview)${R}
@@ -1366,8 +1803,11 @@ function help() {
     nemoclaw credentials list        List stored credential keys
     nemoclaw credentials reset <KEY> Remove a stored credential so onboard re-prompts
 
+  ${G}Backup:${R}
+    nemoclaw backup-all              Back up all sandbox state before upgrade
+
   Cleanup:
-    nemoclaw uninstall [flags]       Run uninstall.sh (local first, curl fallback)
+    nemoclaw uninstall [flags]       Run uninstall.sh (local only; no remote fallback)
 
   ${G}Uninstall flags:${R}
     --yes                            Skip the confirmation prompt
@@ -1428,6 +1868,9 @@ const [cmd, ...args] = process.argv.slice(2);
       case "list":
         await listSandboxes();
         break;
+      case "backup-all":
+        backupAll();
+        break;
       case "--version":
       case "-v": {
         console.log(`nemoclaw v${getVersion()}`);
@@ -1441,6 +1884,12 @@ const [cmd, ...args] = process.argv.slice(2);
   }
 
   // Sandbox-scoped commands: nemoclaw <name> <action>
+  // If the registry doesn't know this name but the action is connect or skill,
+  // attempt recovery — the sandbox may still be live with a stale registry.
+  if (!registry.getSandbox(cmd) && (args[0] === "connect" || args[0] === "skill")) {
+    validateName(cmd, "sandbox name");
+    await recoverRegistryEntries({ requestedSandboxName: cmd });
+  }
   const sandbox = registry.getSandbox(cmd);
   if (sandbox) {
     validateName(cmd, "sandbox name");
@@ -1468,21 +1917,18 @@ const [cmd, ...args] = process.argv.slice(2);
       case "destroy":
         await sandboxDestroy(cmd, actionArgs);
         break;
+      case "skill":
+        await sandboxSkillInstall(cmd, actionArgs);
+        break;
+      case "rebuild":
+        await sandboxRebuild(cmd, actionArgs);
+        break;
       default:
         console.error(`  Unknown action: ${action}`);
-        console.error(`  Valid actions: connect, status, logs, policy-add, policy-list, destroy`);
+        console.error(`  Valid actions: connect, status, logs, policy-add, policy-list, skill, rebuild, destroy`);
         process.exit(1);
     }
     return;
-  }
-
-  if (args[0] === "connect") {
-    validateName(cmd, "sandbox name");
-    await recoverRegistryEntries({ requestedSandboxName: cmd });
-    if (registry.getSandbox(cmd)) {
-      await sandboxConnect(cmd);
-      return;
-    }
   }
 
   // Unknown command — suggest

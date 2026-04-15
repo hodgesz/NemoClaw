@@ -14,8 +14,10 @@ export interface SandboxEntry {
   provider?: string | null;
   gpuEnabled?: boolean;
   policies?: string[];
+  policyTier?: string | null;
   agent?: string | null;
   dangerouslySkipPermissions?: boolean;
+  agentVersion?: string | null;
 }
 
 export interface SandboxRegistry {
@@ -158,9 +160,11 @@ export function registerSandbox(entry: SandboxEntry): void {
       provider: entry.provider || null,
       gpuEnabled: entry.gpuEnabled || false,
       policies: entry.policies || [],
+      policyTier: entry.policyTier || null,
       agent: entry.agent || null,
       dangerouslySkipPermissions:
         entry.dangerouslySkipPermissions === true ? true : undefined,
+      agentVersion: entry.agentVersion || null,
     };
     if (!data.defaultSandbox) {
       data.defaultSandbox = entry.name;
