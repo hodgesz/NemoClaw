@@ -459,20 +459,10 @@ fix_gateway() {
 }
 
 fix_inference() {
-  # Restart LiteLLM if not responding on port 4000.
-  # Auth uses AWS_BEARER_TOKEN_BEDROCK (bearer token), not IAM/SSO.
+  # Restart LiteLLM via its LaunchAgent if not responding on port 4000.
   if ! curl -sf --max-time 2 http://localhost:4000/health >/dev/null 2>&1; then
-    if command -v litellm >/dev/null 2>&1; then
-      if [ -f /tmp/litellm.pid ]; then
-        kill "$(cat /tmp/litellm.pid)" 2>/dev/null || true
-      fi
-      AWS_BEARER_TOKEN_BEDROCK="${AWS_BEARER_TOKEN_BEDROCK:-}" \
-        AWS_REGION_NAME="${AWS_REGION_NAME:-us-east-1}" \
-        nohup litellm --model bedrock/us.anthropic.claude-sonnet-4-6 --port 4000 \
-        >/tmp/litellm.log 2>&1 &
-      echo $! >/tmp/litellm.pid
-      sleep 5
-    fi
+    launchctl kickstart -k "gui/$(id -u)/com.nemoclaw.litellm" 2>/dev/null || true
+    sleep 8
   fi
   # Re-create the compatible-endpoint provider
   if command -v openshell >/dev/null 2>&1; then
@@ -482,6 +472,11 @@ fix_inference() {
       --config "OPENAI_BASE_URL=http://host.openshell.internal:4000/v1" 2>/dev/null || true
   fi
   return 0
+}
+
+fix_inference_live() {
+  # inference_live failure usually means LiteLLM is down — restart it
+  fix_inference
 }
 
 fix_dashboard() {
@@ -519,6 +514,7 @@ get_fix_func() {
     bridge) echo "fix_bridge" ;;
     agent) echo "fix_agent" ;;
     rules) echo "fix_rules" ;;
+    inference_live) echo "fix_inference_live" ;;
     *) echo "" ;; # sandbox, ssh: not auto-fixable
   esac
 }

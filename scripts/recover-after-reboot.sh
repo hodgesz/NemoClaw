@@ -154,37 +154,24 @@ else
   fi
 fi
 
-# ── Step 3b: Start LiteLLM if needed for Bedrock ────────────────
+# ── Step 3b: Verify LiteLLM proxy (Bedrock inference) ──────────────
+# LiteLLM is managed by com.nemoclaw.litellm LaunchAgent (KeepAlive).
+# We just wait for it to be ready rather than starting it ourselves.
 if [ "$PROVIDER" = "bedrock" ] || [ -z "$PROVIDER" ]; then
-  # Start LiteLLM if not already running (needed for Bedrock inference)
-  if ! curl -s --max-time 2 http://localhost:4000/health >/dev/null 2>&1; then
-    if [ "$PROVIDER" = "bedrock" ] || [ -z "$PROVIDER" ]; then
-      if [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then
-        if ! dry "would start LiteLLM for Bedrock"; then
-          info "Starting LiteLLM for Bedrock..."
-          nohup litellm --model bedrock/us.anthropic.claude-sonnet-4-6 --port 4000 \
-            >/tmp/litellm.log 2>&1 &
-          echo $! >/tmp/litellm.pid
-          # Wait for it to be ready
-          for _ in $(seq 1 15); do
-            if curl -s --max-time 2 http://localhost:4000/health >/dev/null 2>&1; then
-              break
-            fi
-            sleep 1
-          done
-          if curl -s --max-time 2 http://localhost:4000/health >/dev/null 2>&1; then
-            info "LiteLLM ready (PID $(cat /tmp/litellm.pid))."
-          else
-            warn "LiteLLM may still be starting. Check /tmp/litellm.log if inference fails."
-          fi
-        fi
-      else
-        warn "AWS_BEARER_TOKEN_BEDROCK not set. LiteLLM not started."
-        warn "Set it and re-run, or switch to a different provider."
+  if ! dry "would wait for LiteLLM LaunchAgent"; then
+    litellm_ready=0
+    for _ in $(seq 1 15); do
+      if curl -s --max-time 2 http://localhost:4000/health >/dev/null 2>&1; then
+        litellm_ready=1
+        break
       fi
+      sleep 2
+    done
+    if [ "$litellm_ready" -eq 1 ]; then
+      info "LiteLLM proxy is healthy on port 4000."
+    else
+      warn "LiteLLM not responding on port 4000 after 30s. Check: launchctl list | grep litellm"
     fi
-  else
-    info "LiteLLM already running on port 4000."
   fi
 fi
 

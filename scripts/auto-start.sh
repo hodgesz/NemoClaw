@@ -142,38 +142,21 @@ fi
 
 info "Gateway state: $(openshell status 2>&1 | head -3 | tr '\n' ' ')"
 
-# ── Step 3b: Start LiteLLM proxy (Bedrock inference) ───────────────
-# The sandbox routes inference through a LiteLLM proxy on the host
-# (compatible-endpoint → localhost:4000). Auth uses a Bedrock bearer
-# token (AWS_BEARER_TOKEN_BEDROCK), NOT IAM/SSO credentials.
-if ! curl -sf --max-time 2 http://127.0.0.1:4000/health >/dev/null 2>&1; then
-  if command -v litellm >/dev/null 2>&1; then
-    if [ -z "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then
-      warn "AWS_BEARER_TOKEN_BEDROCK not set. LiteLLM will fail to authenticate with Bedrock."
-    fi
-    info "Starting LiteLLM proxy (bedrock/claude-sonnet-4-6 on port 4000)..."
-    AWS_BEARER_TOKEN_BEDROCK="${AWS_BEARER_TOKEN_BEDROCK:-}" \
-      AWS_REGION_NAME="${AWS_REGION_NAME:-us-east-1}" \
-      nohup litellm --model bedrock/us.anthropic.claude-sonnet-4-6 --port 4000 \
-      >/tmp/litellm.log 2>&1 &
-    echo $! >/tmp/litellm.pid
-    # Wait for it to be ready
-    for _ in $(seq 1 10); do
-      if curl -sf --max-time 2 http://127.0.0.1:4000/health >/dev/null 2>&1; then
-        break
-      fi
-      sleep 2
-    done
-    if curl -sf --max-time 2 http://127.0.0.1:4000/health >/dev/null 2>&1; then
-      info "LiteLLM ready (PID $(cat /tmp/litellm.pid))."
-    else
-      warn "LiteLLM may still be starting. Check /tmp/litellm.log if inference fails."
-    fi
-  else
-    warn "litellm not found — inference via Bedrock will not work."
+# ── Step 3b: Verify LiteLLM proxy (Bedrock inference) ─────────────
+# LiteLLM is managed by com.nemoclaw.litellm LaunchAgent (KeepAlive).
+# We just wait for it to be ready rather than starting it ourselves.
+litellm_ready=0
+for _ in $(seq 1 15); do
+  if curl -sf --max-time 2 http://127.0.0.1:4000/health >/dev/null 2>&1; then
+    litellm_ready=1
+    break
   fi
+  sleep 2
+done
+if [ "$litellm_ready" -eq 1 ]; then
+  info "LiteLLM proxy is healthy on port 4000."
 else
-  info "LiteLLM already running on port 4000."
+  warn "LiteLLM not responding on port 4000 after 30s. Check: launchctl list | grep litellm"
 fi
 
 # ── Step 3c: Re-create inference providers ─────────────────────────
