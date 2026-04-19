@@ -220,21 +220,55 @@ else
   warn "Neither BRAVE_SEARCH_API_KEY nor GEMINI_API_KEY set. Skipping."
 fi
 
-# ── Step 2: Update config hash ──────────────────────────────────
-# Only needed when Step 1 modified openclaw.json. When --skip-gemini is
-# set, the entrypoint's NEMOCLAW_MODEL_OVERRIDE handles hash recomputation.
+# ── Step 1b: Strip in-sandbox telegram channel ─────────────────
+# The sandbox openclaw.json ships with channels.telegram configured
+# against the same bot token our host-side scripts/telegram-bridge.js
+# uses. Two pollers on one token causes:
+#   - duplicate replies (bridge answers /status, openclaw answers
+#     "not authorized to use this command" because its auth list is
+#     separate from the bridge's ALLOWED_CHAT_IDS)
+#   - intermittent Telegram getUpdates 409 conflicts
+# We run the host bridge exclusively, so remove the sandbox's copy.
+step "Step 1b/6: Remove sandbox telegram channel"
 
-if [ "$SKIP_GEMINI" -eq 1 ]; then
-  step "Step 2/6: Config hash update (skipped — entrypoint handles this)"
+if dry "would strip channels.telegram from openclaw.json"; then
+  :
 else
-  step "Step 2/6: Config hash update"
-  if dry "would update config hash"; then
-    :
+  sandbox_exec read-cfg-tg cat /sandbox/.openclaw/openclaw.json >/tmp/oc-cfg-tg.json 2>/dev/null
+  STRIPPED=$(python3 -c "
+import json
+cfg = json.load(open('/tmp/oc-cfg-tg.json'))
+ch = cfg.get('channels', {})
+if 'telegram' in ch:
+    ch.pop('telegram')
+    cfg['channels'] = ch
+    json.dump(cfg, open('/tmp/oc-cfg-tg.json', 'w'), indent=2)
+    print('STRIPPED')
+else:
+    print('ABSENT')
+" 2>&1)
+  if [ "$STRIPPED" = "STRIPPED" ]; then
+    sandbox_exec write-cfg-tg sh -c 'chmod 644 /sandbox/.openclaw/openclaw.json && cat > /sandbox/.openclaw/openclaw.json && chmod 444 /sandbox/.openclaw/openclaw.json' </tmp/oc-cfg-tg.json
+    info "Sandbox telegram channel removed (host bridge owns polling)."
   else
-    sandbox_exec fix-hash sh -c \
-      'sha256sum /sandbox/.openclaw/openclaw.json > /sandbox/.openclaw/.config-hash && chmod 444 /sandbox/.openclaw/.config-hash'
-    info "Config hash updated."
+    info "Sandbox telegram channel already absent."
   fi
+  rm -f /tmp/oc-cfg-tg.json
+fi
+
+# ── Step 2: Update config hash ──────────────────────────────────
+# Needed whenever Step 1 or Step 1b modified openclaw.json. When
+# --skip-gemini is set, the entrypoint's NEMOCLAW_MODEL_OVERRIDE
+# handles hash recomputation for the model block — but Step 1b may
+# still have written, so recompute regardless.
+step "Step 2/6: Config hash update"
+
+if dry "would update config hash"; then
+  :
+else
+  sandbox_exec fix-hash sh -c \
+    'chmod 644 /sandbox/.openclaw/.config-hash 2>/dev/null || true; sha256sum /sandbox/.openclaw/openclaw.json > /sandbox/.openclaw/.config-hash && chmod 444 /sandbox/.openclaw/.config-hash'
+  info "Config hash updated."
 fi
 
 # ── Step 3: Fetch-guard DNS patch ───────────────────────────────
