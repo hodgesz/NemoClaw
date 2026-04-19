@@ -11,7 +11,7 @@
 #   1. Inject Gemini web search config into openclaw.json (NemoClaw #773 workaround)
 #   2. Update config hash (prevents "integrity check FAILED" from nemoclaw-start)
 #   3. Patch OpenClaw fetch-guard for web search DNS (NemoClaw #1252 / OpenClaw #396)
-#   4. Restart the gateway process to load patched code
+#   4. Ensure the gateway is running (start it if not, leave it alone if it is)
 #   5. Wait for gateway + approve device pairing (NemoClaw #1310)
 #   6. Re-install custom skills (morning briefing, ADHD planner, personal CRM)
 #
@@ -90,10 +90,26 @@ if ! docker info >/dev/null 2>&1; then
   fail "Docker is not running."
 fi
 
-# Find the sandbox container ID
+# Find the sandbox container ID.
+#
+# After a host reboot there can be several `sandbox-from` containers
+# registered in containerd (stale + current). Only one of them has a
+# running task — that's the one we need. Cross-reference the container
+# list against `tasks list` and pick the container whose task is RUNNING.
 find_container() {
-  docker exec "$CLUSTER_CONTAINER" ctr -n k8s.io containers list 2>/dev/null \
-    | grep 'sandbox-from' | awk '{print $1}' | head -1
+  local running_tasks candidates
+  running_tasks="$(docker exec "$CLUSTER_CONTAINER" ctr -n k8s.io tasks list 2>/dev/null \
+    | awk 'NR>1 && $3=="RUNNING" {print $1}')"
+  candidates="$(docker exec "$CLUSTER_CONTAINER" ctr -n k8s.io containers list 2>/dev/null \
+    | grep 'sandbox-from' | awk '{print $1}')"
+  # Intersect: return the first candidate that also has a running task.
+  for cid in $candidates; do
+    if printf '%s\n' "$running_tasks" | grep -qx "$cid"; then
+      echo "$cid"
+      return 0
+    fi
+  done
+  return 1
 }
 
 CONTAINER_ID="$(find_container)"
@@ -108,6 +124,35 @@ sandbox_exec() {
   shift
   docker exec -i "$CLUSTER_CONTAINER" ctr -n k8s.io task exec \
     --exec-id "$exec_id" --user 0 "$CONTAINER_ID" "$@"
+}
+
+# Poll for openclaw-gateway to appear inside the sandbox. Gateway cold-start
+# takes 10-20s (node spawn + channel setup + port bind), so a single fixed
+# sleep is unreliable. Returns the PID on stdout, empty on timeout.
+wait_for_gateway() {
+  local timeout="${1:-30}"
+  local elapsed=0
+  local pid=""
+  while [ "$elapsed" -lt "$timeout" ]; do
+    # shellcheck disable=SC2016 # single quotes intentional — runs inside sandbox
+    pid=$(sandbox_exec "wait-gw-${elapsed}" sh -c '
+      for f in /proc/[0-9]*/cmdline; do
+        first=$(tr "\0" "\n" < "$f" 2>/dev/null | head -1)
+        if [ "$first" = "openclaw-gateway" ]; then
+          pid=$(echo "$f" | cut -d/ -f3)
+          echo "$pid"
+          break
+        fi
+      done
+    ' 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+      echo "$pid"
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  return 1
 }
 
 # ── Step 1: Inject web search config ─────────────────────────────
@@ -256,17 +301,24 @@ else:
   fi
 fi
 
-# ── Step 4: Restart gateway process ─────────────────────────────
-step "Step 4/6: Restart gateway (reload patched code)"
+# ── Step 4: Ensure gateway is running ───────────────────────────
+# Previously this step killed the running gateway to force a reload of
+# patched code. That was harmful: openclaw has no supervisor, so killing
+# the gateway just leaves it dead, and spawning a replacement while the
+# old one is still shutting down causes a Telegram `getUpdates` 409
+# conflict that kills the new one too. We now only start the gateway
+# when it isn't already running.
+step "Step 4/6: Ensure gateway is running"
 
-if dry "would kill and restart gateway process inside sandbox"; then
+if dry "would start gateway if not running"; then
   :
 else
   # shellcheck disable=SC2016 # single quotes intentional — runs inside sandbox
   GW_PID=$(sandbox_exec find-gw-pid sh -c '
     for f in /proc/[0-9]*/cmdline; do
-      pid=$(echo "$f" | cut -d/ -f3)
-      if tr "\0" " " < "$f" 2>/dev/null | grep -q "openclaw-gateway"; then
+      first=$(tr "\0" "\n" < "$f" 2>/dev/null | head -1)
+      if [ "$first" = "openclaw-gateway" ]; then
+        pid=$(echo "$f" | cut -d/ -f3)
         echo "$pid"
         break
       fi
@@ -274,53 +326,21 @@ else
   ' 2>/dev/null || true)
 
   if [ -n "$GW_PID" ]; then
-    sandbox_exec kill-gw sh -c "kill $GW_PID" 2>/dev/null || true
-    info "Killed gateway (PID $GW_PID). Waiting for respawn..."
-    sleep 5
-
-    # Check if it respawned
-    # shellcheck disable=SC2016
-    NEW_GW_PID=$(sandbox_exec check-gw sh -c '
-      for f in /proc/[0-9]*/cmdline; do
-        pid=$(echo "$f" | cut -d/ -f3)
-        if tr "\0" " " < "$f" 2>/dev/null | grep -q "openclaw-gateway"; then
-          echo "$pid"
-          break
-        fi
-      done
-    ' 2>/dev/null || true)
-
-    if [ -n "$NEW_GW_PID" ]; then
-      info "Gateway respawned (PID $NEW_GW_PID)."
-    else
-      warn "Gateway did not respawn automatically. Starting manually..."
-      ssh -o ConnectTimeout=10 "openshell-${SANDBOX_NAME}" \
-        "nohup openclaw gateway run --port 18789 --auth token --bind loopback > /tmp/gateway.log 2>&1 &" 2>/dev/null || true
-      sleep 5
-
-      # shellcheck disable=SC2016
-      NEW_GW_PID=$(sandbox_exec recheck-gw sh -c '
-        for f in /proc/[0-9]*/cmdline; do
-          pid=$(echo "$f" | cut -d/ -f3)
-          if tr "\0" " " < "$f" 2>/dev/null | grep -q "openclaw-gateway"; then
-            echo "$pid"
-            break
-          fi
-        done
-      ' 2>/dev/null || true)
-
-      if [ -n "$NEW_GW_PID" ]; then
-        info "Gateway started manually (PID $NEW_GW_PID)."
-      else
-        warn "Gateway failed to start. Web search and gateway-dependent tools may not work."
-      fi
-    fi
+    info "Gateway already running (PID $GW_PID). Leaving it alone."
   else
-    warn "No gateway process found. Starting gateway..."
+    info "No gateway process found. Starting gateway..."
+    # setsid + </dev/null fully detaches the gateway from the SSH session so
+    # it survives when ssh closes. Plain `nohup ... &` is not reliable here —
+    # after reboot the child can still be reaped when ssh exits.
     ssh -o ConnectTimeout=10 "openshell-${SANDBOX_NAME}" \
-      "nohup openclaw gateway run --port 18789 --auth token --bind loopback > /tmp/gateway.log 2>&1 &" 2>/dev/null || true
-    sleep 5
-    info "Gateway start attempted."
+      'setsid sh -c "nohup openclaw gateway run --port 18789 --auth token --bind loopback >/tmp/gateway.log 2>&1 </dev/null &"' 2>/dev/null || true
+
+    NEW_GW_PID=$(wait_for_gateway 30 || true)
+    if [ -n "$NEW_GW_PID" ]; then
+      info "Gateway started (PID $NEW_GW_PID)."
+    else
+      warn "Gateway failed to start within 30s. Dashboard on port 18789 will be unreachable."
+    fi
   fi
 fi
 
@@ -397,7 +417,7 @@ echo "  │                                                      │"
 printf "  │  Sandbox:     %-38s│\n" "$SANDBOX_NAME"
 printf "  │  Gemini:      %-38s│\n" "${GEMINI_API_KEY:+configured}"
 printf "  │  Fetch-guard: %-38s│\n" "patched"
-printf "  │  Gateway:     %-38s│\n" "restarted"
+printf "  │  Gateway:     %-38s│\n" "verified"
 printf "  │  Pairing:     %-38s│\n" "checked"
 printf "  │  Skills:      %-38s│\n" "$([ "$SKIP_SKILLS" -eq 1 ] && echo 'skipped' || echo 'installed')"
 echo "  │                                                      │"
