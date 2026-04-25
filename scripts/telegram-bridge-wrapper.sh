@@ -60,5 +60,5 @@ trap cleanup EXIT
 # ── Run bridge in foreground ─────────────────────────────────────
 # Use exec so launchd tracks the node process directly.
 # Write PID file first (exec replaces this process, keeping the same PID).
-echo $$ > "$PIDDIR/telegram-bridge.pid"
+echo $$ >"$PIDDIR/telegram-bridge.pid"
 exec node "$SCRIPT_DIR/telegram-bridge.js"
