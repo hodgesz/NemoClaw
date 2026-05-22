@@ -677,6 +677,14 @@ Clear the stored credentials for a messaging channel and rebuild the sandbox so 
 Running `remove` for a channel that was never configured is a no-op against the credentials file and still triggers the rebuild prompt.
 When the bridge provider is attached to a live sandbox, NemoClaw detaches it before deleting the provider from the OpenShell gateway.
 If the matching built-in policy preset is applied, such as `telegram`, `discord`, `slack`, or `whatsapp`, NemoClaw also removes that preset so the upstream API is no longer allow-listed after the channel is gone.
+NemoClaw also strips the channel from `session.policyPresets` so a subsequent `onboard --resume` does not re-apply the preset on the next rebuild.
+
+For QR-paired channels (today: WhatsApp), NemoClaw destructively clears the in-sandbox session directory before the rebuild so the `state_dirs` backup does not restore the auth blob and let the channel reconnect:
+
+- OpenClaw: `/sandbox/.openclaw/<channel>/` (for example `/sandbox/.openclaw/whatsapp/`).
+- Hermes: `/sandbox/.hermes/platforms/<channel>/` (for example `/sandbox/.hermes/platforms/whatsapp/`).
+
+The cleanup tries `openshell sandbox exec` first and falls back to SSH if the exec wrapper does not return the success sentinel. If both transports fail (the sandbox is stopped, the gateway is down, or SSH cannot reach it) the command refuses to proceed to the rebuild and asks you to start the sandbox and re-run, so a half-removed state cannot leave stale Baileys auth files behind for the next rebuild to restore.
 
 ```console
 $ nemoclaw my-assistant channels remove telegram

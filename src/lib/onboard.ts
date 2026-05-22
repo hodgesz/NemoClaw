@@ -36,6 +36,7 @@ const {
 const {
   buildSandboxConfigSyncScript,
   writeSandboxConfigSyncFile,
+  runSandboxConfigSync,
 }: typeof import("./onboard/config-sync") = require("./onboard/config-sync");
 const dockerGpuPatch: typeof import("./onboard/docker-gpu-patch") = require("./onboard/docker-gpu-patch");
 const dockerGpuLocalInference: typeof import("./onboard/docker-gpu-local-inference") = require("./onboard/docker-gpu-local-inference");
@@ -7930,28 +7931,21 @@ async function setupMessagingChannels(
 
 // ── Step 7: OpenClaw ─────────────────────────────────────────────
 
-async function setupOpenclaw(sandboxName: string, model: string, provider: string): Promise<void> {
-  step(7, 8, `Setting up ${agentProductName()} inside sandbox`);
-
-  const selectionConfig = getProviderSelectionConfig(provider, model);
-  if (selectionConfig) {
-    const sandboxConfig = {
-      ...selectionConfig,
-      onboardedAt: new Date().toISOString(),
-    };
-    const script = buildSandboxConfigSyncScript(sandboxConfig);
-    const scriptFile = writeSandboxConfigSyncFile(script);
-    try {
-      const scriptContent = fs.readFileSync(scriptFile, "utf-8");
-      run(openshellArgv(["sandbox", "connect", sandboxName]), {
+function syncNemoClawConfigInSandbox(sandboxName: string, provider: string, model: string): void {
+  runSandboxConfigSync(sandboxName, {
+    getSelectionConfig: () => getProviderSelectionConfig(provider, model),
+    runConnectScript: (name, scriptContent) => {
+      run(openshellArgv(["sandbox", "connect", name]), {
         stdio: ["pipe", "ignore", "inherit"],
         input: scriptContent,
       });
-    } finally {
-      cleanupTempDir(scriptFile, "nemoclaw-sync");
-    }
-  }
+    },
+  });
+}
 
+async function setupOpenclaw(sandboxName: string, model: string, provider: string): Promise<void> {
+  step(7, 8, `Setting up ${agentProductName()} inside sandbox`);
+  syncNemoClawConfigInSandbox(sandboxName, provider, model);
   console.log(`  ✓ ${agentProductName()} gateway launched inside sandbox`);
 }
 
@@ -9920,9 +9914,6 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
         runCaptureOpenshell,
         openshellShellCommand,
         openshellBinary: getOpenshellBinary(),
-        buildSandboxConfigSyncScript,
-        writeSandboxConfigSyncFile,
-        cleanupTempDir,
         startRecordedStep,
         skippedStepMessage,
       });
@@ -9932,6 +9923,10 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
       const resumeOpenclaw = resume && sandboxName && isOpenclawReady(sandboxName);
       if (resumeOpenclaw) {
         skippedStepMessage("openclaw", sandboxName);
+        // Rebuild leaves /sandbox/.nemoclaw/config.json as Dockerfile's
+        // zero-byte placeholder; re-sync to avoid loadOnboardConfig
+        // SyntaxError. Fixes #3999.
+        syncNemoClawConfigInSandbox(sandboxName, provider, model);
         onboardSession.markStepComplete(
           "openclaw",
           toSessionUpdates({ sandboxName, provider, model, hermesAuthMethod, hermesToolGateways }),
