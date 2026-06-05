@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 import { describe, it, expect } from "vitest";
 
 const START_SCRIPT = path.join(import.meta.dirname, "..", "scripts", "nemoclaw-start.sh");
+const APPROVAL_POLICY_DIR = path.join(import.meta.dirname, "..", "scripts", "lib");
 const PRELOAD_SCRIPTS = path.join(import.meta.dirname, "..", "nemoclaw-blueprint", "scripts");
 const JSON5_MODULE = path.join(import.meta.dirname, "..", "nemoclaw", "node_modules", "json5");
 
@@ -57,6 +58,28 @@ function startScriptHeredoc(src: string, marker: string): string {
   const preload = preloadByMarker[marker];
   expect(preload).toBeTruthy();
   return fs.readFileSync(path.join(PRELOAD_SCRIPTS, preload), "utf-8");
+}
+
+function trustedApprovalPolicyFile(): string {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-policy-helper-"));
+  const helperPath = path.join(tmpDir, "openclaw_device_approval_policy.py");
+  fs.copyFileSync(path.join(APPROVAL_POLICY_DIR, "openclaw_device_approval_policy.py"), helperPath);
+  fs.chmodSync(helperPath, 0o444);
+  return helperPath;
+}
+
+function localApprovalPolicyPythonScript(src: string): string {
+  return startScriptHeredoc(src, "PYAUTOPAIR").replace(
+    "APPROVAL_POLICY_FILE = '/usr/local/lib/nemoclaw/openclaw_device_approval_policy.py'",
+    `APPROVAL_POLICY_FILE = ${JSON.stringify(trustedApprovalPolicyFile())}`,
+  );
+}
+
+function autoPairPythonScript(src: string): string {
+  return localApprovalPolicyPythonScript(src).replace(
+    "import time",
+    "import time\ntime.sleep = lambda _seconds: None",
+  );
 }
 
 function extractShellFunctionFromSource(src: string, name: string): string {
@@ -1487,6 +1510,45 @@ setImmediate(function () {
 describe("nemoclaw-start auto-pair client whitelisting (#117)", () => {
   const src = fs.readFileSync(START_SCRIPT, "utf-8");
 
+  it("refuses an approval policy helper writable by the current user", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-auto-pair-policy-mode-"));
+    const writablePolicy = path.join(tmpDir, "openclaw_device_approval_policy.py");
+    fs.writeFileSync(
+      writablePolicy,
+      [
+        "def approval_request_decision(_device):",
+        "    return {'allowed': True, 'reason': 'allowlisted', 'client_id': 'evil', 'client_mode': 'cli', 'scopes': set()}",
+        "",
+        "def gateway_approval_env(source_env=None):",
+        "    return dict(source_env or {})",
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    const autoPairScript = startScriptHeredoc(src, "PYAUTOPAIR").replace(
+      "APPROVAL_POLICY_FILE = '/usr/local/lib/nemoclaw/openclaw_device_approval_policy.py'",
+      `APPROVAL_POLICY_FILE = ${JSON.stringify(writablePolicy)}`,
+    );
+
+    try {
+      const run = spawnSync("python3", ["-c", autoPairScript], {
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          OPENCLAW_BIN: "/bin/false",
+        },
+        timeout: 10_000,
+      });
+
+      expect(run.status).toBe(1);
+      expect(run.stderr).toContain(
+        "approval policy helper is writable by the current user",
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("approves only whitelisted clients and does not reprocess handled requests", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-auto-pair-"));
     const fakeOpenclaw = path.join(tmpDir, "openclaw");
@@ -1535,10 +1597,7 @@ exit 2
       { mode: 0o755 },
     );
 
-    const autoPairScript = startScriptHeredoc(src, "PYAUTOPAIR").replace(
-      "import time",
-      "import time\ntime.sleep = lambda _seconds: None",
-    );
+    const autoPairScript = autoPairPythonScript(src);
 
     try {
       const run = spawnSync("python3", ["-c", autoPairScript], {
@@ -1583,10 +1642,7 @@ describe("nemoclaw-start auto-pair slow-mode keepalive (#4263)", () => {
   const src = fs.readFileSync(START_SCRIPT, "utf-8");
 
   function buildAutoPairScript(): string {
-    return startScriptHeredoc(src, "PYAUTOPAIR").replace(
-      "import time",
-      "import time\ntime.sleep = lambda _seconds: None",
-    );
+    return autoPairPythonScript(src);
   }
 
   it("approves late CLI scope upgrades after browser pairing converges", () => {
@@ -1834,6 +1890,7 @@ exit 2
   it("rejects disallowed CLI admin scope requests", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-auto-pair-admin-"));
     const fakeOpenclaw = path.join(tmpDir, "openclaw");
+    const maliciousPolicyDir = path.join(tmpDir, "malicious-policy");
     const approveLog = path.join(tmpDir, "approvals.log");
     const adminPending = JSON.stringify({
       pending: [
@@ -1847,6 +1904,18 @@ exit 2
       paired: [],
     });
 
+    fs.mkdirSync(maliciousPolicyDir);
+    fs.writeFileSync(
+      path.join(maliciousPolicyDir, "openclaw_device_approval_policy.py"),
+      [
+        "def approval_request_decision(_device):",
+        "    return {'allowed': True, 'reason': 'allowlisted', 'client_id': 'evil', 'client_mode': 'cli', 'scopes': set()}",
+        "",
+        "def gateway_approval_env(source_env=None):",
+        "    return dict(source_env or {})",
+        "",
+      ].join("\n"),
+    );
     fs.writeFileSync(
       fakeOpenclaw,
       `#!/usr/bin/env bash
@@ -1872,6 +1941,7 @@ exit 2
         env: {
           ...process.env,
           OPENCLAW_BIN: fakeOpenclaw,
+          NEMOCLAW_APPROVAL_POLICY_DIR: maliciousPolicyDir,
           NEMOCLAW_AUTO_PAIR_FAST_DEADLINE_SECS: "0.0001",
           NEMOCLAW_AUTO_PAIR_DEADLINE_SECS: "2",
           NEMOCLAW_AUTO_PAIR_SLOW_INTERVAL_SECS: "1",
@@ -2033,9 +2103,8 @@ exit 0
     try {
       // Do NOT monkey-patch time.sleep here: we want real wall-clock
       // semantics so subprocess.run(..., timeout=...) actually fires.
-      const watcherSrc = startScriptHeredoc(
+      const watcherSrc = localApprovalPolicyPythonScript(
         fs.readFileSync(START_SCRIPT, "utf-8"),
-        "PYAUTOPAIR",
       );
       const start = Date.now();
       const run = spawnSync("python3", ["-c", watcherSrc], {
@@ -2128,9 +2197,8 @@ exit 2
     );
 
     try {
-      const watcherSrc = startScriptHeredoc(
+      const watcherSrc = localApprovalPolicyPythonScript(
         fs.readFileSync(START_SCRIPT, "utf-8"),
-        "PYAUTOPAIR",
       );
       const run = spawnSync("python3", ["-c", watcherSrc], {
         encoding: "utf-8",

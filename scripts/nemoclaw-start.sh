@@ -1725,9 +1725,31 @@ start_auto_pair() {
   fi
   OPENCLAW_BIN="$OPENCLAW" nohup "${run_prefix[@]}" python3 - <<'PYAUTOPAIR' >>/tmp/auto-pair.log 2>&1 &
 import json
+import importlib.util
 import os
+import stat
 import subprocess
 import time
+
+APPROVAL_POLICY_FILE = '/usr/local/lib/nemoclaw/openclaw_device_approval_policy.py'
+
+
+def load_approval_policy(path):
+    helper_stat = os.stat(path)
+    mode = helper_stat.st_mode
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RuntimeError('approval policy helper is writable by group or other')
+    if helper_stat.st_uid == os.geteuid() and mode & stat.S_IWUSR:
+        raise RuntimeError('approval policy helper is writable by the current user')
+    spec = importlib.util.spec_from_file_location('openclaw_device_approval_policy', path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError('approval policy helper could not be loaded')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.approval_request_decision, module.gateway_approval_env
+
+
+approval_request_decision, gateway_approval_env = load_approval_policy(APPROVAL_POLICY_FILE)
 
 OPENCLAW = os.environ.get('OPENCLAW_BIN', 'openclaw')
 
@@ -1760,22 +1782,7 @@ HANDLED = set()  # Track rejected/approved requestIds to avoid reprocessing
 # (the gateway stores connectParams.client.id verbatim). This allowlist
 # is defense-in-depth, not a trust boundary. PR #690 adds one-shot exit,
 # timeout reduction, and token cleanup for a more comprehensive fix.
-ALLOWED_CLIENTS = {'openclaw-control-ui'}
-ALLOWED_MODES = {'webchat', 'cli'}
-ALLOWED_SCOPES = {'operator.pairing', 'operator.read', 'operator.write'}
-
-
-def requested_scopes(device):
-    if 'scopes' in device:
-        scopes = device.get('scopes')
-    elif 'requestedScopes' in device:
-        scopes = device.get('requestedScopes')
-    else:
-        return set()
-    if not isinstance(scopes, list):
-        return None
-    return {str(scope).strip() for scope in scopes if str(scope or '').strip()}
-
+# The approval_request_decision helper is shared with connect-time approvals.
 
 RUN_TIMEOUT_SECS = _env_seconds('NEMOCLAW_AUTO_PAIR_RUN_TIMEOUT_SECS', 10)
 
@@ -1795,10 +1802,7 @@ def run(*args, strip_gateway_env=False):
     # the fast→slow transition and the 8h deadline check.
     env = None
     if strip_gateway_env:
-        env = os.environ.copy()
-        env.pop('OPENCLAW_GATEWAY_URL', None)
-        env.pop('OPENCLAW_GATEWAY_PORT', None)
-        env.pop('OPENCLAW_GATEWAY_TOKEN', None)
+        env = gateway_approval_env(os.environ)
     try:
         proc = subprocess.run(
             args, capture_output=True, text=True, timeout=RUN_TIMEOUT_SECS, env=env,
@@ -1844,19 +1848,20 @@ while time.time() < DEADLINE:
             request_id = device.get('requestId')
             if not request_id or request_id in HANDLED:
                 continue
-            client_id = device.get('clientId', '')
-            client_mode = device.get('clientMode', '')
-            if client_id not in ALLOWED_CLIENTS and client_mode not in ALLOWED_MODES:
+            decision = approval_request_decision(device)
+            client_id = decision['client_id']
+            client_mode = decision['client_mode']
+            if decision['reason'] == 'unknown-client':
                 HANDLED.add(request_id)
                 print(f'[auto-pair] rejected unknown client={client_id} mode={client_mode}')
                 continue
-            scopes = requested_scopes(device)
-            if scopes is None:
+            if decision['reason'] == 'malformed-scopes':
                 HANDLED.add(request_id)
                 print(f'[auto-pair] rejected malformed scopes client={client_id} mode={client_mode}')
                 continue
-            if scopes and not scopes.issubset(ALLOWED_SCOPES):
+            if decision['reason'] == 'disallowed-scopes':
                 HANDLED.add(request_id)
+                scopes = decision['scopes']
                 print(f'[auto-pair] rejected disallowed scopes={sorted(scopes)} client={client_id} mode={client_mode}')
                 continue
             arc, aout, aerr = run(
