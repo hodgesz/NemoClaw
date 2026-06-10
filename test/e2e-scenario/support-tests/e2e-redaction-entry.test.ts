@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Single-entry contract for the framework redactor.
+ * Single-entry contract for the fixture redactor.
  *
  * Both per-test explicit secret values and canonical secret-shape
- * matches must flow through `redactString` so the framework has one
+ * matches must flow through `redactString` so the fixture layer has one
  * redaction entry point. This file asserts the contract so any future
  * helper that wants to add an explicit-value path stays inside the
  * canonical entry rather than introducing a parallel one.
@@ -17,10 +17,10 @@
 
 import { describe, expect, it } from "vitest";
 
-import { SecretStore } from "../framework/secrets.ts";
-import { redactString } from "../framework/redaction.ts";
+import { SecretStore } from "../fixtures/secrets.ts";
+import { redactString } from "../fixtures/redaction.ts";
 
-describe("framework redaction entry point", () => {
+describe("fixture redaction entry point", () => {
   it("redacts explicit values with [REDACTED] and canonical shapes with <REDACTED>", () => {
     const explicit = "test-secret-aBcD";
     const canonical = `nvapi-${"x".repeat(24)}`;

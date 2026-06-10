@@ -19,7 +19,7 @@ export interface TrustedProviderEndpoint {
 
 export interface TrustedProviderEndpointOptions {
   /**
-   * Static framework-owned trust configuration for external HTTPS provider
+   * Static fixture-owned trust configuration for external HTTPS provider
    * endpoints. Do not populate this from scenario manifests or user input.
    */
   allowedHosts?: readonly string[];

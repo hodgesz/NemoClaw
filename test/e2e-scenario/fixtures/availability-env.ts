@@ -18,9 +18,9 @@ export function buildAvailabilityProbeEnv(
 ): NodeJS.ProcessEnv {
   // Availability probes run outside live scenario phases, but they need
   // the same child-env and PATH policy. Add only Docker
-  // discovery knobs on top of the shared framework boundary.
+  // discovery knobs on top of the shared fixture boundary.
   return buildChildEnv(base, {
     additionalAllowedEnv: AVAILABILITY_PROBE_EXTRA_ENV_KEYS,
-    frameworkOverlay: {},
+    fixtureOverlay: {},
   });
 }

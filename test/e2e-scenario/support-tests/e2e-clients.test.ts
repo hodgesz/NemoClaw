@@ -5,22 +5,24 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 
-import { assertExitZero, type CommandRunner } from "../framework/clients/index.ts";
+import { assertExitZero, type CommandRunner } from "../fixtures/clients/index.ts";
 import {
   GatewayClient,
   HostCliClient,
   ProviderClient,
   SandboxClient,
   StateClient,
+  trustedSandboxShellScript,
   trustedProviderEndpoint,
-} from "../framework/clients/index.ts";
+  type TrustedSandboxShellScript,
+} from "../fixtures/clients/index.ts";
 import type {
   ShellProbeResult,
   ShellProbeRunOptions,
   TrustedShellCommand,
-} from "../framework/shell-probe.ts";
+} from "../fixtures/shell-probe.ts";
 
 interface RunnerCall {
   command: string;
@@ -145,7 +147,7 @@ describe("E2E fixture clients", () => {
 
     expect(runner.calls[0]).toEqual({
       command: "openshell",
-      args: ["sandbox", "exec", "assistant", "--", "echo", "ok"],
+      args: ["sandbox", "exec", "-n", "assistant", "--", "echo", "ok"],
       options: {
         artifactName: "sandbox-exec-assistant",
       },
@@ -192,12 +194,73 @@ describe("E2E fixture clients", () => {
     expect(runner.calls[0]?.args).toEqual([
       "sandbox",
       "exec",
+      "-n",
       "assistant",
       "--",
       "sh",
       "-c",
       "echo '$TOKEN' && rm -rf /tmp/not-real",
     ]);
+  });
+
+  it("sandbox client wraps shell scripts with the named sandbox exec form", async () => {
+    const runner = new FakeRunner();
+    const sandbox = new SandboxClient(runner, { openshellPath: "openshell" });
+    const script = trustedSandboxShellScript("echo ready");
+
+    expectTypeOf<
+      Parameters<SandboxClient["execShell"]>[1]
+    >().toEqualTypeOf<TrustedSandboxShellScript>();
+
+    await sandbox.execShell("assistant", script, {
+      artifactName: "custom-exec-shell",
+      timeoutMs: 123,
+    });
+
+    expect(runner.calls[0]).toEqual({
+      command: "openshell",
+      args: ["sandbox", "exec", "-n", "assistant", "--", "sh", "-lc", "echo ready"],
+      options: {
+        artifactName: "custom-exec-shell",
+        timeoutMs: 123,
+      },
+    });
+  });
+
+  it("sandbox client requires trusted non-empty shell scripts", () => {
+    expect(() => trustedSandboxShellScript("")).toThrow(/must not be empty/);
+    expectTypeOf<Parameters<SandboxClient["execShell"]>[1]>().not.toEqualTypeOf<string>();
+  });
+
+  it("sandbox client uploads host files into a sandbox", async () => {
+    const runner = new FakeRunner();
+    const sandbox = new SandboxClient(runner, { openshellPath: "openshell" });
+
+    await sandbox.upload("assistant", "/tmp/local.js", "/tmp/remote.js", {
+      timeoutMs: 123,
+    });
+
+    expect(runner.calls[0]).toEqual({
+      command: "openshell",
+      args: ["sandbox", "upload", "assistant", "/tmp/local.js", "/tmp/remote.js"],
+      options: {
+        artifactName: "sandbox-upload-assistant",
+        timeoutMs: 123,
+      },
+    });
+  });
+
+  it("sandbox client rejects flag-shaped upload paths before command construction", async () => {
+    const runner = new FakeRunner();
+    const sandbox = new SandboxClient(runner, { openshellPath: "openshell" });
+
+    expect(() => sandbox.upload("assistant", "--local", "/tmp/remote.js")).toThrow(
+      /sandbox upload local path is invalid/,
+    );
+    expect(() => sandbox.upload("assistant", "/tmp/local.js", "--remote")).toThrow(
+      /sandbox upload remote path is invalid/,
+    );
+    expect(runner.calls).toEqual([]);
   });
 
   it("provider client parses JSON from curl output", async () => {

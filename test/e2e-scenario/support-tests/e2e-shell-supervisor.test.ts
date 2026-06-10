@@ -10,22 +10,22 @@
  *      with SIGTERM -> SIGKILL escalation, so a bash child that
  *      ignores SIGTERM (e.g. `trap "" TERM`) still dies on timeout.
  *
- * Both come from the leaf modules under framework/shell/, so the
+ * Both come from the leaf modules under fixtures/shell/, so the
  * assertions live here at the leaf level. The end-to-end behaviour
  * (orchestrator log redaction, fixture artifact persistence, probe
- * outcome mapping) stays covered by the existing framework-tests
+ * outcome mapping) stays covered by the existing support-tests
  * (e2e-phase-orchestrators, e2e-fixture-context).
  */
 
 import { spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
 
-import { superviseChild } from "../framework/shell/supervisor.ts";
-import { trustedShellCommand, validateShellToken } from "../framework/shell/trusted-command.ts";
+import { superviseChild } from "../fixtures/shell/supervisor.ts";
+import { trustedShellCommand, validateShellToken } from "../fixtures/shell/trusted-command.ts";
 
 const NUL = String.fromCharCode(0);
 
-describe("framework/shell/trusted-command", () => {
+describe("fixtures/shell/trusted-command", () => {
   it("validateShellToken rejects NUL bytes with a labelled error", () => {
     expect(() => validateShellToken(`a${NUL}b`, "argv[0]")).toThrowError(
       /argv\[0\] cannot contain NUL bytes/,
@@ -68,7 +68,7 @@ describe("framework/shell/trusted-command", () => {
   });
 });
 
-describe("framework/shell/supervisor", () => {
+describe("fixtures/shell/supervisor", () => {
   it("returns exitCode 0 when the child exits cleanly", async () => {
     const child = spawn("bash", ["-c", "exit 0"], {
       detached: true,

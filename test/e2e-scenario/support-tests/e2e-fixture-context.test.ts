@@ -7,15 +7,15 @@ import path from "node:path";
 
 import { describe, expect, expectTypeOf, it } from "vitest";
 
-import { ArtifactSink, createArtifactSink } from "../framework/artifacts.ts";
-import { assertCleanupPassed, CleanupRegistry } from "../framework/cleanup.ts";
-import { test as e2eTest } from "../framework/e2e-test.ts";
-import { SecretStore } from "../framework/secrets.ts";
+import { ArtifactSink, createArtifactSink } from "../fixtures/artifacts.ts";
+import { assertCleanupPassed, CleanupRegistry } from "../fixtures/cleanup.ts";
+import { test as e2eTest } from "../fixtures/e2e-test.ts";
+import { SecretStore } from "../fixtures/secrets.ts";
 import {
   ShellProbe,
   trustedShellCommand,
   type TrustedShellCommand,
-} from "../framework/shell-probe.ts";
+} from "../fixtures/shell-probe.ts";
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 

@@ -165,7 +165,7 @@ export class LifecyclePhaseFixture {
     // Final step: drive the user-visible action that exposed #4423.
     // We invoke status through the host CLI client so artifacts are
     // captured and the command goes through the same
-    // shellProbe/redaction layer the rest of the framework uses.
+    // shellProbe/redaction layer the rest of the fixture code uses.
     // Status is allowed to fail (exit non-zero) because on unfixed
     // code it intentionally fails after destroying state — the
     // post-action invariants are checked by state-validation.

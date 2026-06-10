@@ -7,7 +7,7 @@ import {
   shouldRunBranchValidationE2E,
   shouldRunInstallerIntegration,
   shouldRunLiveE2EScenarios,
-} from "../framework/live-project-gate.ts";
+} from "../fixtures/live-project-gate.ts";
 import config from "../../../vitest.config.ts";
 import { readYaml, type WorkflowStep } from "../../helpers/e2e-workflow-contract.ts";
 

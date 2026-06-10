@@ -8,18 +8,18 @@ import {
   SandboxClient,
   trustedProviderEndpoint,
   type CommandRunner,
-} from "../framework/clients/index.ts";
-import type { E2EScenarioFixtures } from "../framework/e2e-test.ts";
+} from "../fixtures/clients/index.ts";
+import type { E2EScenarioFixtures } from "../fixtures/e2e-test.ts";
 import {
   inferenceRouteUrl,
   RuntimePhaseFixture,
   type NemoClawInstance,
-} from "../framework/phases/index.ts";
+} from "../fixtures/phases/index.ts";
 import type {
   ShellProbeResult,
   ShellProbeRunOptions,
   TrustedShellCommand,
-} from "../framework/shell-probe.ts";
+} from "../fixtures/shell-probe.ts";
 
 interface RunnerCall {
   command: string;
@@ -111,6 +111,7 @@ describe("runtime phase fixture", () => {
         args: [
           "sandbox",
           "exec",
+          "-n",
           "e2e-ubuntu-repo-cloud-openclaw",
           "--",
           "curl",
@@ -170,6 +171,7 @@ describe("runtime phase fixture", () => {
     expect(call?.args).toEqual([
       "sandbox",
       "exec",
+      "-n",
       "e2e-ubuntu-repo-cloud-openclaw",
       "--",
       "curl",
@@ -183,7 +185,7 @@ describe("runtime phase fixture", () => {
       "https://inference.local/v1/chat/completions",
     ]);
     expect(call?.args).not.toContain("sh");
-    const payload = JSON.parse(call?.args[11] ?? "{}");
+    const payload = JSON.parse(call?.args[12] ?? "{}");
     expect(payload).toEqual({
       model: "default",
       messages: [{ role: "user", content: "Reply with ok" }],
@@ -207,6 +209,7 @@ describe("runtime phase fixture", () => {
       args: [
         "sandbox",
         "exec",
+        "-n",
         "e2e-ubuntu-repo-cloud-openclaw",
         "--",
         "curl",

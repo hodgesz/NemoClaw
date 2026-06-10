@@ -11,5 +11,10 @@ export {
   type ProviderJsonResponse,
   type TrustedProviderEndpoint,
 } from "./provider.ts";
-export { SandboxClient, validateSandboxName } from "./sandbox.ts";
+export {
+  SandboxClient,
+  trustedSandboxShellScript,
+  type TrustedSandboxShellScript,
+  validateSandboxName,
+} from "./sandbox.ts";
 export { StateClient } from "./state.ts";

@@ -9,7 +9,7 @@ import type { ChildProcess } from "node:child_process";
  *
  * Spec ownership: detached process-group cleanup, SIGTERM -> SIGKILL
  * escalation, timeout enforcement, and AbortSignal handling are
- * FRAMEWORK INFRASTRUCTURE. Every TS spawn site delegates here so the
+ * FIXTURE INFRASTRUCTURE. Every TS spawn site delegates here so the
  * cleanup contract stays in one place. Callers keep their own spawn()
  * call so per-site argv contracts (literal `bash -c` scripts with
  * positional argv, host-CLI argv arrays, trusted-command descriptors)

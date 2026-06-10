@@ -5,7 +5,7 @@
  * Trusted command descriptor + NUL-byte guard shared by every E2E
  * TypeScript spawn site.
  *
- * Spec ownership: command shape validation is FRAMEWORK INFRASTRUCTURE,
+ * Spec ownership: command shape validation is FIXTURE INFRASTRUCTURE,
  * not a per-helper concern. Whether the spawn site is the fixture layer
  * (ShellProbe), the phase orchestrator (PhaseOrchestrator.runAction /
  * runShellStep), or the probe helpers (spawnBash, runHostCmd, docs /

@@ -12,9 +12,9 @@ import type { TrustedShellCommand } from "./shell/trusted-command.ts";
  *
  * The lifecycle boundary (detached process-group cleanup, SIGTERM ->
  * SIGKILL escalation, timeout, AbortSignal) is owned by
- * framework/shell/supervisor.ts and shared with the phase orchestrator
+ * fixtures/shell/supervisor.ts and shared with the phase orchestrator
  * and probe helpers. The trusted-command brand + NUL-byte guard live
- * in framework/shell/trusted-command.ts. This file layers the
+ * in fixtures/shell/trusted-command.ts. This file layers the
  * fixture-specific policy on top: redaction at the canonical entry
  * point, artefact persistence, and explicit-env-by-default.
  */

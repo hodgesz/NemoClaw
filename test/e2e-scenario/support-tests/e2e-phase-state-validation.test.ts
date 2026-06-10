@@ -7,20 +7,20 @@ import path from "node:path";
 
 import { describe, expect, expectTypeOf, it } from "vitest";
 
-import { ArtifactSink } from "../framework/artifacts.ts";
+import { ArtifactSink } from "../fixtures/artifacts.ts";
 import {
   GatewayClient,
   HostCliClient,
   SandboxClient,
   type CommandRunner,
-} from "../framework/clients/index.ts";
-import type { E2EScenarioFixtures } from "../framework/e2e-test.ts";
-import { StateValidationPhaseFixture, type NemoClawInstance } from "../framework/phases/index.ts";
+} from "../fixtures/clients/index.ts";
+import type { E2EScenarioFixtures } from "../fixtures/e2e-test.ts";
+import { StateValidationPhaseFixture, type NemoClawInstance } from "../fixtures/phases/index.ts";
 import type {
   ShellProbeResult,
   ShellProbeRunOptions,
   TrustedShellCommand,
-} from "../framework/shell-probe.ts";
+} from "../fixtures/shell-probe.ts";
 
 interface RunnerCall {
   command: string;
@@ -222,6 +222,7 @@ describe("state-validation phase fixture", () => {
       args: [
         "sandbox",
         "exec",
+        "-n",
         "e2e-ubuntu-repo-cloud-openclaw",
         "--",
         "curl",

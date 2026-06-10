@@ -3,19 +3,19 @@
 
 import { describe, expect, expectTypeOf, it } from "vitest";
 
-import { HostCliClient, SandboxClient, type CommandRunner } from "../framework/clients/index.ts";
-import type { E2EScenarioFixtures } from "../framework/e2e-test.ts";
+import { HostCliClient, SandboxClient, type CommandRunner } from "../fixtures/clients/index.ts";
+import type { E2EScenarioFixtures } from "../fixtures/e2e-test.ts";
 import {
   buildBackupContainerName,
   LifecyclePhaseFixture,
   type LifecycleCleanup,
-} from "../framework/phases/lifecycle.ts";
-import type { NemoClawInstance } from "../framework/phases/index.ts";
+} from "../fixtures/phases/lifecycle.ts";
+import type { NemoClawInstance } from "../fixtures/phases/index.ts";
 import type {
   ShellProbeResult,
   ShellProbeRunOptions,
   TrustedShellCommand,
-} from "../framework/shell-probe.ts";
+} from "../fixtures/shell-probe.ts";
 
 interface RunnerCall {
   command: string;

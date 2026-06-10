@@ -7,15 +7,15 @@ import path from "node:path";
 
 import { describe, expect, expectTypeOf, it } from "vitest";
 
-import { ArtifactSink } from "../framework/artifacts.ts";
-import { HostCliClient, type CommandRunner } from "../framework/clients/index.ts";
-import type { E2EScenarioFixtures } from "../framework/e2e-test.ts";
-import { EnvironmentPhaseFixture, type DockerRuntimeReady } from "../framework/phases/index.ts";
+import { ArtifactSink } from "../fixtures/artifacts.ts";
+import { HostCliClient, type CommandRunner } from "../fixtures/clients/index.ts";
+import type { E2EScenarioFixtures } from "../fixtures/e2e-test.ts";
+import { EnvironmentPhaseFixture, type DockerRuntimeReady } from "../fixtures/phases/index.ts";
 import type {
   ShellProbeResult,
   ShellProbeRunOptions,
   TrustedShellCommand,
-} from "../framework/shell-probe.ts";
+} from "../fixtures/shell-probe.ts";
 import type { ScenarioEnvironment } from "../scenarios/types.ts";
 
 interface RunnerCall {

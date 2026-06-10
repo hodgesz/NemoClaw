@@ -10,7 +10,7 @@ const SENSITIVE_NAME_PATTERN = /(api[_-]?key|token|secret|password|credential)/i
  *
  * Holds the per-test view of `process.env` and lets fixtures discover
  * sensitive values by name. Redaction itself is owned by the canonical
- * entry point in framework/redaction.ts; this class only
+ * entry point in fixtures/redaction.ts; this class only
  * supplies the explicit values it knows about and delegates. There is
  * no separate fixture redaction pattern source.
  */

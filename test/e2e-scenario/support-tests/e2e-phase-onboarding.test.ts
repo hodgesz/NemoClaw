@@ -6,16 +6,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { ArtifactSink } from "../framework/artifacts.ts";
-import { HostCliClient, type CommandRunner } from "../framework/clients/index.ts";
-import type { E2EScenarioFixtures } from "../framework/e2e-test.ts";
-import { OnboardingPhaseFixture, type OnboardingSecrets } from "../framework/phases/index.ts";
-import type { EnvironmentReady } from "../framework/phases/index.ts";
+import { ArtifactSink } from "../fixtures/artifacts.ts";
+import { HostCliClient, type CommandRunner } from "../fixtures/clients/index.ts";
+import type { E2EScenarioFixtures } from "../fixtures/e2e-test.ts";
+import { OnboardingPhaseFixture, type OnboardingSecrets } from "../fixtures/phases/index.ts";
+import type { EnvironmentReady } from "../fixtures/phases/index.ts";
 import type {
   ShellProbeResult,
   ShellProbeRunOptions,
   TrustedShellCommand,
-} from "../framework/shell-probe.ts";
+} from "../fixtures/shell-probe.ts";
 
 interface RunnerCall {
   command: string;

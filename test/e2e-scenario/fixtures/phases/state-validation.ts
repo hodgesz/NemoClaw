@@ -19,7 +19,7 @@ import type { ExpectedState, StateProbeId } from "../../scenarios/types.ts";
 import type { NemoClawInstance } from "./onboarding.ts";
 
 // Mirror of `src/lib/state/registry.ts::REGISTRY_FILE`. The fixture
-// owns its own copy because the framework code must not import from
+// owns its own copy because the fixture code must not import from
 // `src/lib/**` (CLI source) — that boundary keeps the live runner
 // honest about probing only host-observable state.
 const NEMOCLAW_REGISTRY_RELPATH = [".nemoclaw", "sandboxes.json"] as const;

@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Framework-owned secret hygiene at the spawn boundary.
+ * Fixture-owned secret hygiene at the spawn boundary.
  *
- * Spec ownership: redaction and child-env minimization are FRAMEWORK
+ * Spec ownership: redaction and child-env minimization are FIXTURE
  * INFRASTRUCTURE, not a per-action / per-script / per-workflow concern.
- * Children spawned by framework command boundaries must (a) receive a minimal,
- * typed env (framework allowlist + per-action declared `secretEnv`
+ * Children spawned by fixture command boundaries must (a) receive a minimal,
+ * typed env (fixture allowlist + per-action declared `secretEnv`
  * passthrough only), and (b) have their stdout/stderr passed through
  * redaction before any byte reaches an evidence log or
  * PhaseResult.message. There is no opt-out flag, no env switch, no
@@ -16,17 +16,17 @@
  * rest of this PR.
  *
  * Pattern source-of-truth: src/lib/security/secret-patterns.ts. We
- * import the canonical regex sets and apply them here so framework
- * redaction stays in lockstep with product-runtime redaction without
- * coupling the framework to product runtime modules.
+ * mirror the canonical regex sources here (validated by parity tests) so
+ * fixture-layer redaction stays in lockstep with product-runtime redaction
+ * without coupling the fixture layer to product runtime modules.
  *
  * Tests:
- *   test/e2e-scenario/framework-tests/e2e-redaction-entry.test.ts
- *   test/e2e-scenario/framework-tests/e2e-redaction-parity.test.ts
- *   test/e2e-scenario/framework-tests/e2e-phase-environment.test.ts
+ *   test/e2e-scenario/support-tests/e2e-redaction-entry.test.ts
+ *   test/e2e-scenario/support-tests/e2e-redaction-parity.test.ts
+ *   test/e2e-scenario/support-tests/e2e-phase-environment.test.ts
  *     - canonical token redaction parity with product runtime patterns
  *     - explicit per-test redaction values
- *     - child-env allowlist filtering for framework probes
+ *     - child-env allowlist filtering for fixture probes
  */
 
 import type { Readable, Writable } from "node:stream";
@@ -34,19 +34,19 @@ import type { Readable, Writable } from "node:stream";
 const REDACTED = "<REDACTED>";
 const EXPLICIT_REDACTED = "[REDACTED]";
 
-// Framework-local mirror of src/lib/security/secret-patterns.ts. The
-// framework deliberately does not import from src/lib/security/ so it
+// Fixture-local mirror of src/lib/security/secret-patterns.ts. The
+// fixture layer deliberately does not import from src/lib/security/ so it
 // stays decoupled from product runtime modules and the cross-tsconfig
 // boundary. A parity test
-// (test/e2e-scenario/framework-tests/e2e-redaction-parity.test.ts)
+// (test/e2e-scenario/support-tests/e2e-redaction-parity.test.ts)
 // asserts these regex sources stay in lockstep with the canonical
 // product source so adding a token shape there keeps both layers
 // honest at once.
 // Exported only so the parity test
-// (test/e2e-scenario/framework-tests/e2e-redaction-parity.test.ts) can
+// (test/e2e-scenario/support-tests/e2e-redaction-parity.test.ts) can
 // import the actual RegExp values rather than parsing source text.
 // Production code in this module continues to use them via the local
-// binding; nothing in the framework runtime imports these.
+// binding; nothing in the fixture runtime imports these.
 export const TOKEN_PREFIX_PATTERNS: RegExp[] = [
   /nvapi-[A-Za-z0-9_-]{10,}/g,
   /nvcf-[A-Za-z0-9_-]{10,}/g,
@@ -110,11 +110,11 @@ export function redactString(text: string, explicitValues?: Iterable<string>): s
   return out;
 }
 
-// Env keys the framework guarantees children may always see. Anything
-// outside this set, outside FRAMEWORK_ENV_PREFIXES, and not declared
+// Env keys the fixture layer guarantees children may always see. Anything
+// outside this set, outside FIXTURE_ENV_PREFIXES, and not declared
 // in PhaseAction.secretEnv / AssertionStep.secretEnv is dropped before
 // the child spawns.
-const FRAMEWORK_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
+const FIXTURE_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
   "PATH",
   "HOME",
   "SHELL",
@@ -134,12 +134,12 @@ const FRAMEWORK_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
   "NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE",
 ]);
 
-const FRAMEWORK_ENV_PREFIXES: readonly string[] = ["E2E_", "NEMOCLAW_LOG_"];
+const FIXTURE_ENV_PREFIXES: readonly string[] = ["E2E_", "NEMOCLAW_LOG_"];
 
 // Shape required of any declared secretEnv key — must look like a
 // secret-bearing variable. Prevents accidental allowlisting of
 // non-secret values via the secretEnv channel and keeps the
-// "framework-allowlist vs declared-secret" distinction honest.
+// "fixture-allowlist vs declared-secret" distinction honest.
 const SECRET_ENV_KEY_SHAPE =
   /^[A-Z][A-Z0-9_]*(?:API[_]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PASSPHRASE|PRIVATE[_]?KEY|ACCESS[_]?KEY)$/;
 
@@ -150,20 +150,20 @@ export function isValidSecretEnvKey(key: string): boolean {
 export interface BuildChildEnvOptions {
   /** Per-action / per-step declared secret-bearing env keys to pass through. */
   secretEnv?: readonly string[];
-  /** Additional non-secret env keys required by a framework-owned spawn helper. */
+  /** Additional non-secret env keys required by a fixture-owned spawn helper. */
   additionalAllowedEnv?: readonly string[];
-  /** Framework-controlled overlay (E2E_CONTEXT_DIR, E2E_PHASE, E2E_*_ID). */
-  frameworkOverlay: NodeJS.ProcessEnv;
+  /** Fixture-controlled overlay (E2E_CONTEXT_DIR, E2E_PHASE, E2E_*_ID). */
+  fixtureOverlay: NodeJS.ProcessEnv;
 }
 
 /**
  * Build the child's env from `base` (typically `process.env`) by
  * keeping only:
- *   1. keys in FRAMEWORK_ENV_ALLOWLIST
- *   2. keys starting with one of FRAMEWORK_ENV_PREFIXES
+ *   1. keys in FIXTURE_ENV_ALLOWLIST
+ *   2. keys starting with one of FIXTURE_ENV_PREFIXES
  *   3. non-secret keys explicitly declared in `opts.additionalAllowedEnv`
  *   4. keys explicitly declared in `opts.secretEnv` (validated shape)
- * then layering `opts.frameworkOverlay` on top.
+ * then layering `opts.fixtureOverlay` on top.
  *
  * Throws if a `secretEnv` entry doesn't match the secret-key shape;
  * better to fail loudly at compile/runtime than silently leak a
@@ -176,11 +176,11 @@ export function buildChildEnv(
   const out: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(base)) {
     if (value === undefined) continue;
-    if (FRAMEWORK_ENV_ALLOWLIST.has(key)) {
+    if (FIXTURE_ENV_ALLOWLIST.has(key)) {
       out[key] = value;
       continue;
     }
-    if (FRAMEWORK_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) {
+    if (FIXTURE_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) {
       out[key] = value;
       continue;
     }
@@ -208,14 +208,14 @@ export function buildChildEnv(
       out[key] = base[key];
     }
   }
-  Object.assign(out, opts.frameworkOverlay);
+  Object.assign(out, opts.fixtureOverlay);
   // The install action drops nemoclaw / openshell shims under
   // ~/.local/bin (the historical repo-current install location).
   // On Ubuntu GH runners ~/.local/bin is on the default PATH; on
   // self-hosted GPU runners and inside WSL it often is not, so the
   // onboarding action's child runs without nemoclaw on PATH and
   // dies with 'nemoclaw: command not found'. Add ~/.local/bin to
-  // every child's PATH at the framework boundary so the install
+  // every child's PATH at the fixture boundary so the install
   // location is consistent across phases. Idempotent equivalent of
   // the install-path-refresh.sh nemoclaw_ensure_local_bin_on_path
   // helper, applied centrally instead of per-script.
@@ -250,15 +250,15 @@ export function pipeRedacted(
 }
 
 /**
- * Compact array of all framework env keys the child sees by default.
+ * Compact array of all fixture env keys the child sees by default.
  * Exported for tests/diagnostics; do not use to bypass the boundary.
  */
-export function frameworkEnvAllowlistSnapshot(): {
+export function fixtureEnvAllowlistSnapshot(): {
   keys: string[];
   prefixes: string[];
 } {
   return {
-    keys: [...FRAMEWORK_ENV_ALLOWLIST].sort(),
-    prefixes: [...FRAMEWORK_ENV_PREFIXES],
+    keys: [...FIXTURE_ENV_ALLOWLIST].sort(),
+    prefixes: [...FIXTURE_ENV_PREFIXES],
   };
 }
