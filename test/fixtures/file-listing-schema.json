@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "directory": {
+      "type": "string",
+      "description": "The directory that was listed"
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "type": { "type": "string", "enum": ["file", "directory", "symlink"] },
+          "size_bytes": { "type": "number" }
+        },
+        "required": ["name", "type"]
+      }
+    },
+    "total_count": { "type": "number" }
+  },
+  "required": ["directory", "files", "total_count"]
+}

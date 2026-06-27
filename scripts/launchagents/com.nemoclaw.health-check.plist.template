@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nemoclaw.health-check</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO_DIR__/scripts/health-check.sh</string>
+        <string>--sandbox</string>
+        <string>__SANDBOX__</string>
+        <string>--alert</string>
+        <string>telegram</string>
+        <string>--auto-fix</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>600</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/nemoclaw-health-check.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/nemoclaw-health-check.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/usr/local/bin:/opt/homebrew/bin:__NODE_BIN__:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>TELEGRAM_BOT_TOKEN</key>
+        <string>__TELEGRAM_BOT_TOKEN__</string>
+        <key>TELEGRAM_CHAT_ID</key>
+        <string>__TELEGRAM_CHAT_ID__</string>
+    </dict>
+</dict>
+</plist>
