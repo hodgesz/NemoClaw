@@ -159,42 +159,38 @@ else
   warn "LiteLLM not responding on port 4000 after 30s. Check: launchctl list | grep litellm"
 fi
 
-# ── Step 3c: Re-create inference providers ─────────────────────────
-# Providers are stateless gateway config that may not survive restarts.
-# Delete-and-recreate is safe and idempotent.
-info "Ensuring inference providers..."
+# ── Step 3c: Verify inference provider (read-only) ────────────────
+# Providers are baked at onboard and bound in the gateway (stateless config
+# that DOES survive gateway restarts). The old code hardcoded stale
+# Bedrock/Ollama/NVIDIA providers regardless of which provider the sandbox
+# actually uses — wrong for a gemini-api sandbox. We now read the sandbox's
+# recorded provider and only verify it's registered (warn if not). We never
+# recreate stale providers here.
+info "Verifying inference provider..."
 
-ensure_provider() {
-  local name="$1" type="$2" cred="$3" config="$4"
-  openshell provider delete "$name" 2>/dev/null || true
-  if openshell provider create --name "$name" --type "$type" \
-    --credential "$cred" --config "$config" 2>&1 | grep -q "Created"; then
-    info "Provider '$name' ready."
+provider=""
+SANDBOXES_JSON="$HOME/.nemoclaw/sandboxes.json"
+if [ -f "$SANDBOXES_JSON" ] && command -v node >/dev/null 2>&1; then
+  provider="$(SB="$SANDBOX_NAME" SB_JSON="$SANDBOXES_JSON" node -e "
+    try {
+      const s = require(process.env.SB_JSON);
+      const sb = (s.sandboxes || {})[process.env.SB] || {};
+      process.stdout.write(sb.provider || '');
+    } catch {}
+  " 2>/dev/null || true)"
+fi
+
+if [ -z "$provider" ]; then
+  warn "No provider recorded in ~/.nemoclaw/sandboxes.json for '$SANDBOX_NAME'. Skipping provider check."
+elif command -v openshell >/dev/null 2>&1; then
+  # Strip ANSI — openshell colorizes even when piped.
+  if openshell provider list 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -q -- "$provider"; then
+    info "Inference provider '$provider' is registered."
   else
-    info "Provider '$name' already exists (OK)."
-  fi
-}
-
-ensure_provider "ollama-local" "openai" \
-  "OPENAI_API_KEY=ollama" \
-  "OPENAI_BASE_URL=http://host.openshell.internal:11434/v1"
-
-ensure_provider "bedrock-litellm" "openai" \
-  "OPENAI_API_KEY=dummy" \
-  "OPENAI_BASE_URL=http://host.openshell.internal:4000/v1"
-
-ensure_provider "compatible-endpoint" "openai" \
-  "OPENAI_API_KEY=dummy" \
-  "OPENAI_BASE_URL=http://host.openshell.internal:4000/v1"
-
-if [ -n "${NVIDIA_API_KEY:-}" ]; then
-  if ! openshell provider list 2>&1 | grep -q "nvidia-prod"; then
-    ensure_provider "nvidia-prod" "nvidia" \
-      "NVIDIA_API_KEY=${NVIDIA_API_KEY}" \
-      "NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1"
+    warn "Inference provider '$provider' not registered. Re-onboard or set via 'openshell inference set'."
   fi
 else
-  warn "NVIDIA_API_KEY not set. nvidia-prod provider not created."
+  warn "openshell CLI not found; cannot verify provider '$provider'."
 fi
 
 # ── Step 4: Recover sandbox (triggers OpenClaw process recovery) ───
@@ -232,35 +228,28 @@ else
 fi
 
 # ── Step 4c: Apply custom sandbox configurations ─────────────────
-# Model config is now handled by NEMOCLAW_MODEL_OVERRIDE env var at sandbox
-# creation (PR #1633). The custom-policies script is still needed for:
-#   - Fetch-guard DNS patch (NemoClaw #1252, still open)
-#   - Gateway restart (to reload patched code)
-#   - Device pairing, custom skill installation
+# apply-custom-policies.sh is now a thin skill-installer + read-only verifier
+# (it no longer mutates openclaw.json, applies a fetch-guard patch, or restarts
+# the gateway — all owned upstream now). It only re-installs custom skills and
+# verifies provider + telegram channel.
 if [ -x "$SCRIPT_DIR/apply-custom-policies.sh" ]; then
-  info "Applying custom sandbox configurations (fetch-guard, skills)..."
-  "$SCRIPT_DIR/apply-custom-policies.sh" --sandbox "$SANDBOX_NAME" --skip-gemini 2>&1 || warn "Custom policies failed."
+  info "Applying custom sandbox configurations (skills, verify provider/channel)..."
+  "$SCRIPT_DIR/apply-custom-policies.sh" --sandbox "$SANDBOX_NAME" 2>&1 || warn "Custom policies failed."
 else
   warn "apply-custom-policies.sh not found or not executable. Skipping."
 fi
 
-# Wait for the in-sandbox gateway to finish restarting (apply-custom-policies
-# kills and respawns it to reload the fetch-guard patch). Give it up to 30s.
-info "Waiting for in-sandbox gateway to be ready..."
-gw_inner_elapsed=0
-while [ "$gw_inner_elapsed" -lt 30 ]; do
-  if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-    "openshell-${SANDBOX_NAME}" \
-    'curl -sf --max-time 2 http://127.0.0.1:18789/ >/dev/null 2>&1' 2>/dev/null; then
-    info "In-sandbox gateway is responding."
-    break
-  fi
-  sleep 5
-  gw_inner_elapsed=$((gw_inner_elapsed + 5))
-done
-if [ "$gw_inner_elapsed" -ge 30 ]; then
-  warn "In-sandbox gateway may still be starting. Dashboard check may fail initially."
+# Read-only gateway health probe (no restart loop: there's no patch to reload,
+# and the in-sandbox nemoclaw-start supervisor (#4710 + #2757) owns gateway
+# health). One soft probe for the summary log only.
+info "Probing in-sandbox gateway health..."
+if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+  "openshell-${SANDBOX_NAME}" \
+  'curl -sf --max-time 2 http://127.0.0.1:18789/health >/dev/null 2>&1' 2>/dev/null; then
+  info "In-sandbox gateway is responding on :18789."
+else
+  warn "In-sandbox gateway not responding on :18789 yet (may still be booting; supervisor will recover)."
 fi
 
 # ── Step 4d: Setup DNS proxy ─────────────────────────────────────
