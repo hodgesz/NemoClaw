@@ -21,12 +21,9 @@
 const net = require("net");
 const http = require("http");
 
-const LISTEN_PORT = parseInt(
-  process.argv.find((_, i, a) => a[i - 1] === "--listen") || "9222",
-  10,
-);
-const TARGET = process.argv.find((_, i, a) => a[i - 1] === "--target")
-  || "host.openshell.internal:9223";
+const LISTEN_PORT = parseInt(process.argv.find((_, i, a) => a[i - 1] === "--listen") || "9222", 10);
+const TARGET =
+  process.argv.find((_, i, a) => a[i - 1] === "--target") || "host.openshell.internal:9223";
 const PROXY_HOST = "10.200.0.1";
 const PROXY_PORT = 3128;
 

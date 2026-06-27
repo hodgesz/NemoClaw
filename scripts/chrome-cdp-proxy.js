@@ -92,5 +92,7 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 server.listen(LISTEN_PORT, "0.0.0.0", () => {
-  console.log(`[cdp-proxy] Listening on 0.0.0.0:${LISTEN_PORT} → Chrome CDP at ${TARGET_HOST}:${TARGET_PORT}`);
+  console.log(
+    `[cdp-proxy] Listening on 0.0.0.0:${LISTEN_PORT} → Chrome CDP at ${TARGET_HOST}:${TARGET_PORT}`,
+  );
 });

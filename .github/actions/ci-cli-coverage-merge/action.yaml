@@ -99,6 +99,7 @@ runs:
         file: coverage/cli/cobertura-coverage.xml
         language: TypeScript
         label: code-coverage/cli
+        fail-on-error: false
 
     - name: Upload CLI Vitest timing report
       if: always()

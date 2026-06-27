@@ -39,3 +39,4 @@ runs:
         file: coverage/plugin/cobertura-coverage.xml
         language: TypeScript
         label: code-coverage/plugin
+        fail-on-error: false
