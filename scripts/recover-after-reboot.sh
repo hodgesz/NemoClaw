@@ -175,51 +175,70 @@ if [ "$PROVIDER" = "bedrock" ] || [ -z "$PROVIDER" ]; then
   fi
 fi
 
-# ── Step 4: Re-create providers ──────────────────────────────────
-step "Step 4/6: Ensuring inference providers exist"
+# ── Step 4: Verify inference provider (read-only) ────────────────
+# Providers are baked at onboard and persist in the gateway (stateless config
+# that survives reboots). The old code hardcoded stale Bedrock/Ollama/NVIDIA
+# provider re-creates regardless of the sandbox's actual backend — wrong for
+# a gemini-api sandbox. We now read the sandbox's recorded provider and only
+# verify it's registered (warn if not). The --provider switch (Step 4b) below
+# is the only path that actively changes inference.
+step "Step 4/6: Verify inference provider (read-only)"
 
+if dry "would verify the sandbox's inference provider is registered"; then
+  :
+else
+  provider=""
+  SANDBOXES_JSON="$HOME/.nemoclaw/sandboxes.json"
+  if [ -f "$SANDBOXES_JSON" ] && command -v node >/dev/null 2>&1; then
+    provider="$(SB="$SANDBOX_NAME" SB_JSON="$SANDBOXES_JSON" node -e "
+      try {
+        const s = require(process.env.SB_JSON);
+        const sb = (s.sandboxes || {})[process.env.SB] || {};
+        process.stdout.write(sb.provider || '');
+      } catch {}
+    " 2>/dev/null || true)"
+  fi
+
+  if [ -z "$provider" ]; then
+    warn "No provider recorded in ~/.nemoclaw/sandboxes.json for '$SANDBOX_NAME'. Skipping provider check."
+  elif ! command -v openshell >/dev/null 2>&1; then
+    warn "openshell CLI not found; cannot verify provider '$provider'."
+  elif openshell provider list 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -q -- "$provider"; then
+    info "Inference provider '$provider' is registered."
+  else
+    warn "Inference provider '$provider' not registered. Re-onboard or set via 'openshell inference set'."
+  fi
+fi
+
+# ── Step 4b: Switch provider if requested ────────────────────────
+# This is the ONLY path that actively changes inference — opt-in via
+# --provider. Because Step 4 no longer unconditionally re-creates stale
+# providers, the switch ensures its target provider exists (create-or-confirm
+# before 'openshell inference set'). With no --provider, recovery leaves the
+# baked onboard provider untouched.
 ensure_provider() {
   local name="$1" type="$2" cred="$3" config="$4"
-  if dry "would create provider $name"; then return; fi
-  # Delete-and-recreate is safe — providers are stateless config.
+  # Providers are stateless config — delete-and-recreate is safe + idempotent.
   openshell provider delete "$name" 2>/dev/null || true
   if openshell provider create --name "$name" --type "$type" \
     --credential "$cred" --config "$config" 2>&1 | grep -q "Created"; then
     info "Provider '$name' ready."
   else
-    warn "Provider '$name' may already exist (OK)."
+    info "Provider '$name' already exists (OK)."
   fi
 }
 
-ensure_provider "ollama-local" "openai" \
-  "OPENAI_API_KEY=ollama" \
-  "OPENAI_BASE_URL=http://host.openshell.internal:11434/v1"
-
-ensure_provider "bedrock-litellm" "openai" \
-  "OPENAI_API_KEY=dummy" \
-  "OPENAI_BASE_URL=http://host.openshell.internal:4000/v1"
-
-# compatible-endpoint is created by onboard when using custom provider (Bedrock)
-ensure_provider "compatible-endpoint" "openai" \
-  "OPENAI_API_KEY=dummy" \
-  "OPENAI_BASE_URL=http://host.openshell.internal:4000/v1"
-
-# nvidia-prod is created by onboard and persists in the gateway — check it
-if ! dry "would check nvidia-prod" && ! openshell provider list 2>&1 | grep -q "nvidia-prod"; then
-  if [ -n "${NVIDIA_API_KEY:-}" ]; then
-    ensure_provider "nvidia-prod" "nvidia" \
-      "NVIDIA_API_KEY=${NVIDIA_API_KEY}" \
-      "NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1"
-  else
-    warn "nvidia-prod provider missing and NVIDIA_API_KEY not set. Skipping."
-  fi
-fi
-
-# ── Step 4b: Switch provider if requested ────────────────────────
 if [ -n "$PROVIDER" ]; then
   case "$PROVIDER" in
     nvidia)
       if ! dry "would set inference to nvidia-prod"; then
+        if [ -n "${NVIDIA_API_KEY:-}" ]; then
+          ensure_provider "nvidia-prod" "nvidia" \
+            "NVIDIA_API_KEY=${NVIDIA_API_KEY}" \
+            "NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1"
+        else
+          warn "NVIDIA_API_KEY not set; cannot create nvidia-prod provider."
+        fi
         openshell inference set --provider nvidia-prod \
           --model nvidia/nemotron-3-super-120b-a12b --no-verify 2>&1
         info "Inference set to NVIDIA cloud."
@@ -227,6 +246,9 @@ if [ -n "$PROVIDER" ]; then
       ;;
     ollama)
       if ! dry "would set inference to ollama-local"; then
+        ensure_provider "ollama-local" "openai" \
+          "OPENAI_API_KEY=ollama" \
+          "OPENAI_BASE_URL=http://host.openshell.internal:11434/v1"
         openshell inference set --provider ollama-local \
           --model qwen3.5:35b-a3b-coding-nvfp4 --no-verify 2>&1
         info "Inference set to Ollama (local). Make sure Ollama is running."
@@ -234,6 +256,10 @@ if [ -n "$PROVIDER" ]; then
       ;;
     bedrock)
       if ! dry "would set inference to compatible-endpoint (Bedrock)"; then
+        # Bedrock routes through LiteLLM (com.nemoclaw.litellm LaunchAgent, :4000).
+        ensure_provider "compatible-endpoint" "openai" \
+          "OPENAI_API_KEY=dummy" \
+          "OPENAI_BASE_URL=http://host.openshell.internal:4000/v1"
         openshell inference set --provider compatible-endpoint \
           --model bedrock/us.anthropic.claude-sonnet-4-6 --no-verify 2>&1
         info "Inference set to Bedrock/Sonnet 4.6 via LiteLLM."
@@ -265,7 +291,7 @@ else
 fi
 
 # ── Step 5b: Apply custom sandbox configurations ────────────────
-step "Step 5b/6: Custom sandbox configurations (Gemini, fetch-guard, skills)"
+step "Step 5b/6: Custom sandbox configurations (skills, verify provider/channel)"
 
 if dry "would run apply-custom-policies.sh"; then
   :
