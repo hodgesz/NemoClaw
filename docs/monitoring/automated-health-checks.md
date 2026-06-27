@@ -36,10 +36,13 @@ The following table lists each check, what it probes, and how the probe works.
 | **gateway** | OpenShell gateway health | `openshell status` |
 | **sandbox** | Sandbox readiness | `openshell sandbox get <name>` |
 | **ssh** | SSH tunnel to sandbox | `ssh openshell-<name> 'echo ok'` |
-| **inference** | Inference endpoint (LiteLLM, Ollama, vLLM/NIM, NVIDIA cloud) | `curl` health endpoints, `openshell provider list` |
+| **inference** | Inference provider registered for the sandbox | reads the provider from `~/.nemoclaw/sandboxes.json`, verifies it via `openshell provider list` |
+| **inference_live** | End-to-end inference round-trip | runs a minimal `openclaw agent` prompt via SSH |
 | **dashboard** | Port forward to sandbox dashboard | `curl http://127.0.0.1:<port>/` |
-| **bridge** | Telegram bridge process | PID file liveness check |
+| **bridge** | *(skipped in v0.0.68)* | the host Telegram bridge was removed in the native-channels migration; inbound Telegram is the sandbox's native telegram channel. Always reports `skip`. |
 | **agent** | In-sandbox OpenClaw agent | `openclaw doctor` via SSH |
+| **rules** | No pending unapproved network rules | `openshell rule get <name>` |
+| **briefing** | Most recent morning-briefing result | reads `/tmp/nemoclaw-briefing-status.json` |
 
 ## Usage
 
@@ -58,8 +61,13 @@ $ ./scripts/health-check.sh --sandbox my-assistant
 Skip checks that are not relevant to your setup:
 
 ```console
-$ ./scripts/health-check.sh --skip bridge,agent
+$ ./scripts/health-check.sh --skip agent
 ```
+
+> Note: in v0.0.68 the `bridge` check is an always-`skip` stub (the host
+> Telegram bridge was removed in the native-channels migration; inbound
+> Telegram is the sandbox's native telegram channel). You don't need to
+> skip it explicitly.
 
 ### Output Modes
 
@@ -68,19 +76,22 @@ $ ./scripts/health-check.sh --skip bridge,agent
 ```console
 $ ./scripts/health-check.sh
 
-NemoClaw Health Check  (2026-04-06 08:15:00)
+NemoClaw Health Check  (2026-06-27 12:52:20)
 Sandbox: my-assistant  Gateway: nemoclaw
 
   ✓ docker: Docker daemon running
   ✓ gateway: Gateway 'nemoclaw' connected
   ✓ sandbox: Sandbox 'my-assistant' ready
   ✓ ssh: SSH tunnel to sandbox healthy
-  ✓ inference: LiteLLM (port 4000)
-  ✓ dashboard: Dashboard on port 18789
-  ✓ bridge: Telegram bridge running (PID 12345)
+  ✓ inference: Provider 'gemini-api' registered
+  ✓ inference_live: Inference probe OK
+  ✓ dashboard: Dashboard on port 18789 (HTTP 200)
+  – bridge: skipped
   ✓ agent: openclaw doctor: passed (exit 0)
+  ✓ rules: No pending network rules
+  ✓ briefing: Last briefing succeeded (2026-06-27T18:23:43Z)
 
-  All 8 checks passed (0 skipped)
+  All 10 checks passed (1 skipped)
 ```
 
 **JSON:** Machine-readable output for scripting and dashboards.
@@ -174,9 +185,17 @@ $ watch -n 60 ./scripts/health-check-html.sh --sandbox my-assistant
 
 The generated file is written to `/tmp/nemoclaw-status.html` by default, or specify `--output /path/to/file`.
 
-## Telegram /status Command
+## Telegram
 
-If you are running the Telegram bridge (`scripts/telegram-bridge.js`), send `/status` to the bot to get a health report directly in Telegram. This runs the same checks as the CLI script.
+In v0.0.68 the host-side Telegram bridge was removed in the native-channels
+migration — inbound Telegram is now the sandbox's **native telegram channel**
+(baked at onboard, polled by the in-sandbox `openclaw` process). The daily
+morning briefing is delivered directly through the Telegram Bot API by
+`scripts/morning-briefing.sh`; replies to the briefing arrive over the native
+channel. Verify the poller is healthy by checking the sandbox logs for recent
+`api.telegram.org/.../getUpdates` lines (allowed by the `telegram_bot` policy),
+or run `./scripts/health-check.sh` and look at the `agent` / `inference_live`
+checks.
 
 ## Configuration
 

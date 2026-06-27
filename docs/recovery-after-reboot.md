@@ -9,16 +9,25 @@ When your Mac reboots (or Docker Desktop restarts), the NemoClaw gateway contain
 **If running manually:** open Docker Desktop, wait for it to be ready, then:
 
 ```bash
-cd /Users/jonathanhodges/VsCodeProjects/nvidia/NemoClaw
+cd /Users/hodgesz/VsCodeProjects/nvidia/NemoClaw
 
 # Credentials are already in ~/.zshrc — just source to pick up latest values
 source ~/.zshrc
 
-# Recover everything (starts LiteLLM, gateway, providers, policy, bridge)
-./scripts/recover-after-reboot.sh --provider bedrock --services
+# Recover with no arguments: keep the baked-onboard inference provider, start
+# the in-sandbox services. The script never destroys the gateway or sandbox.
+./scripts/recover-after-reboot.sh
 ```
 
-The script waits for Docker, starts LiteLLM for Bedrock, restarts the gateway non-destructively, verifies the sandbox, re-creates providers, patches the network policy, restarts the port forward, and launches the Telegram bridge.
+Under v0.0.68 / OpenShell 0.0.44 the script is intentionally read-only about the
+sandbox internals: it waits for Docker, restarts the gateway non-destructively,
+verifies the sandbox survived, **verifies** (rather than re-creates) the recorded
+inference provider, reinstalls custom skills via `apply-custom-policies.sh`,
+re-creates the port forward, and (with `--services`) starts the host-side
+services. It no longer rewrites `openclaw.json`, re-applies the fetch-guard DNS
+patch, or kills/restarts the gateway process — those are owned by upstream
+`nemoclaw-start` and baked at onboard. Pass `--provider` only to **switch**
+providers; without it the baked provider is left untouched.
 
 ## Credential sources
 
@@ -39,7 +48,7 @@ When the user says "recover after reboot", Claude should follow these steps exac
 
 1. **Source credentials:** run `source ~/.zshrc` to load all tokens into the current shell
 2. **Wait for Docker:** run `docker info` in a loop — Docker Desktop can briefly respond then go away during startup, so verify it stays ready with two checks 5 seconds apart before proceeding
-3. **Run the recovery script:** `./scripts/recover-after-reboot.sh --provider bedrock --services`
+3. **Run the recovery script:** `./scripts/recover-after-reboot.sh` (no `--provider` — keep the baked-onboard provider; add `--services` only if the user wants the host-side services started). Do **not** pass `--provider bedrock` unless the user explicitly asks to *switch* to Bedrock/LiteLLM.
 4. **Verify:** run `nemoclaw my-assistant status` only AFTER the script completes successfully
 
 ## What survives a reboot
@@ -49,14 +58,14 @@ When the user says "recover after reboot", Claude should follow these steps exac
 | Docker volumes (k3s state, sandbox PVC) | Yes | Persist unless explicitly removed |
 | Sandbox pod + workspace files | Usually | k3s recovers the pod from its etcd state on the volume |
 | Gateway container | No | Must be restarted — but restarting reattaches to the existing volume |
-| Providers (ollama-local, bedrock-litellm) | No | Stateless config inside the gateway; re-created by the script |
-| Network policy customizations | Sometimes | If the sandbox pod survived, policy stays; script checks and patches if needed |
+| Inference providers (gateway-level) | Yes | Stateless config inside the gateway; recovery **verifies** the recorded provider (read-only). Only re-created if you pass `--provider` to switch. |
+| Network policy presets | Yes | Baked at onboard; persist on the sandbox |
 | Port forwards | No | Ephemeral; re-created by the script |
-| Telegram bridge / services | No | Host processes; re-created with `--services` |
+| Native Telegram channel | Yes | Baked at onboard; the in-sandbox `openclaw` process polls it. No host bridge in v0.0.68. |
+| Custom skills (fork-personal) | No | Reinstalled by `apply-custom-policies.sh` from `./skills/` |
 | SSH tunnel (gateway <-> sandbox) | Sometimes | Can break after reboot; if broken, requires full sandbox rebuild (see below) |
-| Gemini web search config in openclaw.json | Yes (if sandbox survived) | Lost on sandbox rebuild — must re-inject via docker exec (step 10 in rebuild procedure) |
-| OpenClaw fetch-guard DNS patch | No (lost on rebuild) | Must re-apply via docker exec after every rebuild (step 11) — see [NemoClaw #1252](https://github.com/NVIDIA/NemoClaw/issues/1252) |
-| Gateway device pairing | No (lost on rebuild) | Must re-approve device after rebuild or gateway restart (step 12) — see [NemoClaw #1310](https://github.com/NVIDIA/NemoClaw/issues/1310) |
+| `openclaw.json` (model, web search, native telegram channel) | Yes (if sandbox survived) | Baked at image build and hash-verified by `nemoclaw-start`. Not rewritten at runtime in v0.0.68. |
+| Web search (Brave) | Yes | Baked at onboard; works through the proxy without any runtime patch (the old fetch-guard DNS workaround is gone upstream). |
 
 ## What can go wrong
 
@@ -91,10 +100,9 @@ ssh -o ConnectTimeout=10 openshell-my-assistant 'echo hello'
 
 **Fix — full sandbox rebuild required:**
 
-```bash
-# 0. Kill any running Telegram bridge FIRST (prevents duplicate responses after rebuild)
-pkill -f telegram-bridge.js || true
+> Under v0.0.68 the rebuild is a **straight backup → destroy → onboard → restore**. Onboard now bakes the inference provider, native telegram channel, web search (Brave), and policy presets into the image, and `nemoclaw-start` hash-verifies `openclaw.json` at startup — so the old post-rebuild `docker exec` hacks (re-injecting Gemini web search, applying the fetch-guard DNS patch, rewriting `.config-hash`, killing the gateway process, approving the device) are obsolete and must NOT be re-applied. `apply-custom-policies.sh` only reinstalls custom skills and verifies the provider/channel read-only.
 
+```bash
 # 1. Back up workspace (if SSH still worked recently, use existing backup)
 ls ~/.nemoclaw/backups/
 # If no recent backup and SSH is broken, you cannot back up — use the last good backup
@@ -102,7 +110,8 @@ ls ~/.nemoclaw/backups/
 # 2. Destroy the sandbox
 echo "y" | nemoclaw my-assistant destroy
 
-# 3. Re-onboard (Bedrock example)
+# 3. Re-onboard (Bedrock-via-LiteLLM example).
+#    Everything below is baked at onboard by nemoclaw itself — no post-build hacks.
 source ~/.zshrc
 export NEMOCLAW_NON_INTERACTIVE=1
 export NEMOCLAW_SANDBOX_NAME="my-assistant"
@@ -113,134 +122,28 @@ export COMPATIBLE_API_KEY="dummy"
 export NEMOCLAW_POLICY_PRESETS="telegram,pypi,npm,slack,gemini-search"
 nemoclaw onboard --non-interactive
 
-# 4. Fix provider endpoint for sandbox access
-openshell provider delete compatible-endpoint
-openshell provider create --name compatible-endpoint --type openai \
-  --credential "OPENAI_API_KEY=dummy" \
-  --config "OPENAI_BASE_URL=http://host.openshell.internal:4000/v1"
-openshell inference set --provider compatible-endpoint \
-  --model "bedrock/us.anthropic.claude-sonnet-4-6" --no-verify
+# 4. Refresh SSH config (replace the openshell-my-assistant block, don't blindly append)
+openshell sandbox ssh-config my-assistant   # then edit ~/.ssh/config by hand
 
-# 5. Refresh SSH config
-openshell sandbox ssh-config my-assistant >> ~/.ssh/config
-
-# 6. Verify SSH works
+# 5. Verify SSH works
 ssh -o ConnectTimeout=10 openshell-my-assistant 'echo "SSH works!"'
 
-# 7. Restore workspace via SSH (scp won't work — no sftp-server in sandbox)
+# 6. Restore workspace via SSH (scp won't work — no sftp-server in sandbox)
 for f in SOUL.md USER.md IDENTITY.md AGENTS.md; do
   ssh openshell-my-assistant "cat > /sandbox/.openclaw/workspace/$f" \
     < ~/.nemoclaw/backups/<timestamp>/$f
 done
 
-# 8. Re-apply local policy + start services
-./scripts/recover-after-reboot.sh --provider bedrock --services
-
-# 9. Re-install any custom skills
-# Skills live at /sandbox/.openclaw-data/skills/<skill-id>/SKILL.md
-# Upload via: ssh openshell-my-assistant "cat > /path/SKILL.md" < local-file
-
-# 10. Re-apply Gemini web search config (NemoClaw issue #773 workaround)
-# The openclaw.json is rebuilt on sandbox creation, losing the web search config.
-# Find the sandbox container ID, then inject the config via docker exec.
-CONTAINER_ID=$(docker exec openshell-cluster-nemoclaw ctr -n k8s.io containers list 2>/dev/null \
-  | grep 'sandbox-from' | awk '{print $1}')
-docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
-  --exec-id gemini-cfg --user 0 "$CONTAINER_ID" \
-  sh -c 'cat /sandbox/.openclaw/openclaw.json' > /tmp/oc-cfg.json
-python3 -c "
-import json
-cfg = json.load(open('/tmp/oc-cfg.json'))
-cfg.setdefault('tools', {})['web'] = {
-    'search': {'enabled': True, 'provider': 'gemini',
-               'gemini': {'apiKey': '$(echo $GEMINI_API_KEY)'}},
-    'fetch': {'enabled': True}
-}
-json.dump(cfg, open('/tmp/oc-cfg.json', 'w'), indent=2)
-"
-docker exec -i openshell-cluster-nemoclaw ctr -n k8s.io task exec \
-  --exec-id gemini-write --user 0 "$CONTAINER_ID" \
-  sh -c 'cat > /sandbox/.openclaw/openclaw.json' < /tmp/oc-cfg.json
-rm /tmp/oc-cfg.json
-
-# 11. Apply all custom sandbox configurations (automated)
-# This single script handles steps 10-12 plus skill reinstalls.
-# Run it instead of the manual steps below.
+# 7. Reinstall custom skills + verify provider/channel (read-only)
 ./scripts/apply-custom-policies.sh --sandbox my-assistant
 
-# --- Manual steps (for reference, handled by apply-custom-policies.sh) ---
-
-# 11-manual. Patch OpenClaw fetch-guard for web search DNS (NemoClaw #1252 / OpenClaw #59005)
-# OpenClaw's fetch-guard does local DNS resolution before using the proxy, which fails
-# in the sandbox (k3s CoreDNS can't resolve external hostnames). This patch reorders
-# the code so TRUSTED_ENV_PROXY mode uses EnvHttpProxyAgent without DNS pinning.
-# Must re-apply after every sandbox rebuild.
-CONTAINER_ID=$(docker exec openshell-cluster-nemoclaw ctr -n k8s.io containers list 2>/dev/null \
-  | grep 'sandbox-from' | awk '{print $1}' | head -1)
-for FILE in $(docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
-  --exec-id find-guards --user 0 "$CONTAINER_ID" \
-  sh -c 'grep -rl "resolvePinnedHostname" /usr/local/lib/node_modules/openclaw/dist/' 2>/dev/null); do
-  docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
-    --exec-id "read-fg-$RANDOM" --user 0 "$CONTAINER_ID" cat "$FILE" > /tmp/fg-patch.js 2>&1
-  python3 -c "
-content = open('/tmp/fg-patch.js').read()
-old = '''let dispatcher = null;
-\t\ttry {
-\t\t\tconst pinned = await resolvePinnedHostnameWithPolicy(parsedUrl.hostname, {
-\t\t\t\tlookupFn: params.lookupFn,
-\t\t\t\tpolicy: params.policy
-\t\t\t});
-\t\t\tif (mode === GUARDED_FETCH_MODE.TRUSTED_ENV_PROXY && hasProxyEnvConfigured()) dispatcher = new EnvHttpProxyAgent();
-\t\t\telse if (params.pinDns !== false) dispatcher = createPinnedDispatcher(pinned);'''
-new = '''let dispatcher = null;
-\t\ttry {
-\t\t\tconst useTrustedEnvProxy = mode === GUARDED_FETCH_MODE.TRUSTED_ENV_PROXY && hasProxyEnvConfigured();
-\t\t\tif (useTrustedEnvProxy) {
-\t\t\t\tdispatcher = new EnvHttpProxyAgent();
-\t\t\t} else {
-\t\t\t\tconst pinned = await resolvePinnedHostnameWithPolicy(parsedUrl.hostname, {
-\t\t\t\t\tlookupFn: params.lookupFn,
-\t\t\t\t\tpolicy: params.policy
-\t\t\t\t});
-\t\t\t\tif (params.pinDns !== false) dispatcher = createPinnedDispatcher(pinned);
-\t\t\t}'''
-if old in content:
-    open('/tmp/fg-patch.js', 'w').write(content.replace(old, new))
-    print(f'PATCHED: {\"$FILE\"!r}')
-else:
-    print(f'SKIPPED: {\"$FILE\"!r}')
-"
-  docker exec -i openshell-cluster-nemoclaw ctr -n k8s.io task exec \
-    --exec-id "write-fg-$RANDOM" --user 0 "$CONTAINER_ID" \
-    sh -c "cat > $FILE" < /tmp/fg-patch.js 2>&1
-done
-rm /tmp/fg-patch.js 2>/dev/null
-
-# 11b. Update config hash (prevents "integrity check FAILED" from nemoclaw-start)
-docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
-  --exec-id fix-hash --user 0 "$CONTAINER_ID" \
-  sh -c 'sha256sum /sandbox/.openclaw/openclaw.json > /sandbox/.openclaw/.config-hash && chmod 444 /sandbox/.openclaw/.config-hash'
-
-# 11c. Restart the gateway process so it loads the patched fetch-guard files.
-# The container's init system respawns it automatically after kill.
-docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
-  --exec-id find-gw-pid --user 0 "$CONTAINER_ID" \
-  sh -c 'ls /proc/*/cmdline 2>/dev/null | while read f; do
-    pid=$(echo "$f" | cut -d/ -f3)
-    tr "\0" " " < "$f" 2>/dev/null | grep -q "openclaw-gateway" && echo "$pid"
-  done' | head -1 | xargs -I{} docker exec openshell-cluster-nemoclaw ctr -n k8s.io task exec \
-  --exec-id kill-gw --user 0 "$CONTAINER_ID" kill {}
-sleep 5  # wait for gateway respawn
-
-# 12. Approve device pairing (NemoClaw #1310)
-# After onboard or gateway restart, the CLI agent needs device approval to connect
-# to the gateway. Without this, the agent falls back to embedded mode (which works
-# but loses access to some gateway-only features).
-ssh openshell-my-assistant 'openclaw devices list 2>&1' | grep -oP '[0-9a-f-]{36}' | head -1 | \
-  xargs -I{} ssh openshell-my-assistant "openclaw devices approve {} 2>&1"
+# 8. Start host-side services (if used)
+./scripts/recover-after-reboot.sh --services
 ```
 
-**Prevention:** The recovery script (`recover-after-reboot.sh`) now checks SSH health after gateway restart (step 3). If SSH is broken, it warns early instead of continuing with a broken tunnel. Always back up workspace regularly — a broken SSH tunnel means you can't make a fresh backup.
+> Note: there is no standalone Telegram bridge process to kill in v0.0.68 (the host bridge was removed in the native-channels migration), so no `pkill -f telegram-bridge.js` step is needed before destroy. Inbound Telegram is the sandbox's native telegram channel, polled by the in-sandbox `openclaw` process.
+
+**Prevention:** The recovery script (`recover-after-reboot.sh`) checks SSH health after gateway restart (step 3). If SSH is broken, it warns early instead of continuing with a broken tunnel. Always back up workspace regularly — a broken SSH tunnel means you can't make a fresh backup.
 
 ### SSH config corruption (github.com routed through sandbox)
 
@@ -276,32 +179,7 @@ Host openshell-my-assistant
 
 ### Duplicate Telegram responses after rebuild
 
-**Symptom:** The agent sends every response twice in Telegram, but the dashboard only shows one.
-
-**Root cause:** The old Telegram bridge process (from before the rebuild) is still alive. `start-services.sh` tracks PIDs in `/tmp/nemoclaw-services/`, but a sandbox destroy + re-onboard can orphan the old process if the PID file was lost or the bridge was started in a different session. Both the old and new bridge poll the same Telegram bot, so every message gets processed twice.
-
-**Diagnosis:**
-
-```bash
-# Should show exactly ONE process — if you see two, that's the problem
-ps aux | grep telegram-bridge | grep -v grep
-```
-
-**Fix:**
-
-```bash
-pkill -f telegram-bridge.js
-# Then restart cleanly
-nemoclaw start
-# or: ./scripts/start-services.sh --sandbox my-assistant
-```
-
-**Prevention:** Always kill the bridge before destroying a sandbox:
-
-```bash
-pkill -f telegram-bridge.js || true
-nemoclaw my-assistant destroy
-```
+> **v0.0.68:** This failure mode no longer exists. There is no host-side Telegram bridge — `start-services.sh` only manages the `cloudflared` public tunnel, and inbound Telegram is the sandbox's single native telegram channel owned by the in-sandbox `openclaw` process. A destroy-and-re-onboard replaces that process wholesale, so there is no old bridge to orphan and no double polling. If you ever do see doubled responses, treat it as a separate bug (two `openclaw` processes in the same sandbox) rather than the old bridge-orphan story, and collect `nemoclaw my-assistant logs` before taking action.
 
 ## Usage
 
@@ -315,7 +193,7 @@ nemoclaw my-assistant destroy
 # Recovery + switch to Bedrock via LiteLLM
 ./scripts/recover-after-reboot.sh --provider bedrock
 
-# Recovery + start Telegram bridge and cloudflared
+# Recovery + start host-side services (cloudflared public tunnel)
 ./scripts/recover-after-reboot.sh --services
 
 # Recovery for a different sandbox
@@ -424,11 +302,11 @@ openshell inference set --provider compatible-endpoint \
 | `openclaw.json` (model identity) | Yes (rebuilt) | This is the point of the rebuild |
 | Workspace files (SOUL.md, etc.) | Yes (lost) | Restore from backup |
 | Session history | Yes (lost) | Fresh start |
-| Providers | No (gateway-level) | But may need re-pointing (step 4) |
+| Providers | No (gateway-level) | Re-point with `openshell inference set`, or `recover-after-reboot.sh --provider` (step 4) |
 | Network policy | Yes (reset to presets) | Re-add custom endpoints (step 5) |
 | Port forward | Yes (recreated) | Onboard restarts it |
-| Fetch-guard DNS patch | Yes (lost) | Re-apply via docker exec (step 11) |
-| Gateway device pairing | Yes (lost) | Re-approve device (step 12) |
+| Custom skills (fork-personal) | Yes (lost) | Reinstall via `apply-custom-policies.sh` |
+| Native Telegram channel | Yes (rebaked) | Baked at onboard; no manual re-inject |
 
 ### Files containing model identity (audit)
 
