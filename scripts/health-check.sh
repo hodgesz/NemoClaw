@@ -224,39 +224,39 @@ check_inference() {
     record "inference" "skip" ""
     return
   fi
-  # Check common inference endpoints; at least one should respond
-  local found=0 detail=""
-
-  # LiteLLM (Bedrock proxy)
-  if curl -sf --max-time 3 http://localhost:4000/health >/dev/null 2>&1; then
-    found=1
-    detail="LiteLLM (port 4000)"
+  # Read the sandbox's RECORDED inference provider from the local registry and
+  # verify it's registered in the gateway (read-only). The old code port-sniffed
+  # LiteLLM :4000 / Ollama :11434 / NIM :8000 / a 'nvidia-prod' provider — none of
+  # which is a gemini-api (or any non-OpenAI-endpoint) sandbox's actual backend,
+  # so it false-failed by design. check_inference_live (below) remains the
+  # authoritative end-to-end probe; this check is a quick provider gate.
+  if ! command -v openshell >/dev/null 2>&1; then
+    record "inference" "skip" "openshell CLI not found"
+    return
   fi
 
-  # Ollama
-  if curl -sf --max-time 3 http://localhost:11434/api/tags >/dev/null 2>&1; then
-    found=1
-    detail="${detail:+$detail, }Ollama (port 11434)"
+  local provider=""
+  local SANDBOXES_JSON="$HOME/.nemoclaw/sandboxes.json"
+  if [ -f "$SANDBOXES_JSON" ] && command -v node >/dev/null 2>&1; then
+    provider="$(SB="$SANDBOX_NAME" SB_JSON="$SANDBOXES_JSON" node -e "
+      try {
+        const s = require(process.env.SB_JSON);
+        const sb = (s.sandboxes || {})[process.env.SB] || {};
+        process.stdout.write(sb.provider || '');
+      } catch {}
+    " 2>/dev/null || true)"
   fi
 
-  # vLLM / NIM
-  if curl -sf --max-time 3 http://localhost:8000/v1/models >/dev/null 2>&1; then
-    found=1
-    detail="${detail:+$detail, }vLLM/NIM (port 8000)"
+  if [ -z "$provider" ]; then
+    record "inference" "skip" "No provider recorded for '$SANDBOX_NAME'"
+    return
   fi
 
-  # NVIDIA cloud (check via provider list if available)
-  if command -v openshell >/dev/null 2>&1; then
-    if openshell provider list 2>&1 | grep -q "nvidia-prod"; then
-      found=1
-      detail="${detail:+$detail, }NVIDIA cloud provider"
-    fi
-  fi
-
-  if [ "$found" -eq 1 ]; then
-    record "inference" "pass" "$detail"
+  # Strip ANSI — openshell colorizes even when piped.
+  if openshell provider list 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -q -- "$provider"; then
+    record "inference" "pass" "Provider '$provider' registered"
   else
-    record "inference" "fail" "No inference endpoint responding"
+    record "inference" "fail" "Provider '$provider' not registered"
   fi
 }
 
@@ -285,44 +285,14 @@ check_bridge() {
     record "bridge" "skip" ""
     return
   fi
-  # Durable state dir (out of /tmp, so the reaper can't delete the PID file
-  # under a running bridge). Must match telegram-bridge.js / the wrapper.
-  # Fall back to the legacy /tmp path so a bridge still running on pre-upgrade
-  # code (PID file not yet migrated) isn't false-flagged as down.
-  local piddir="${NEMOCLAW_STATE_DIR:-$HOME/Library/Application Support/nemoclaw/services-${SANDBOX_NAME}}"
-  local legacy_piddir="/tmp/nemoclaw-services-${SANDBOX_NAME}"
-  local pidfile="$piddir/telegram-bridge.pid"
-  local heartbeat="$piddir/telegram-bridge.heartbeat"
-  if [ ! -f "$pidfile" ] && [ -f "$legacy_piddir/telegram-bridge.pid" ]; then
-    pidfile="$legacy_piddir/telegram-bridge.pid"
-    heartbeat="$legacy_piddir/telegram-bridge.heartbeat"
-  fi
-  local pid
-  if [ -f "$pidfile" ] && pid=$(cat "$pidfile") && kill -0 "$pid" 2>/dev/null; then
-    # Process is alive — also check it's actually polling (fresh heartbeat),
-    # not wedged on a dead socket (the 2026-05-30 zombie case).
-    local hb_age=""
-    if [ -f "$heartbeat" ]; then
-      local now hb_ms hb_s
-      now=$(date +%s)
-      hb_ms=$(cat "$heartbeat" 2>/dev/null || echo 0)
-      hb_s=$((hb_ms / 1000))
-      hb_age=$((now - hb_s))
-    fi
-    if [ -n "$hb_age" ] && [ "$hb_age" -gt 90 ]; then
-      record "bridge" "fail" "Telegram bridge wedged (PID $pid, last poll ${hb_age}s ago)"
-    else
-      record "bridge" "pass" "Telegram bridge running (PID $pid)"
-    fi
-  else
-    # Bridge requires both TELEGRAM_BOT_TOKEN and NVIDIA_API_KEY (same as start-services.sh).
-    # Only report failure if both are set but the bridge is not running.
-    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${NVIDIA_API_KEY:-}" ]; then
-      record "bridge" "fail" "Telegram bridge not running (tokens are set)"
-    else
-      record "bridge" "skip" "Bridge prerequisites not set"
-    fi
-  fi
+  # The host Telegram bridge was removed in the v0.0.68 native-channels
+  # migration — inbound Telegram is now the sandbox's native telegram channel
+  # (verified by check_agent via openclaw, and indirectly by
+  # check_inference_live / the sandbox poller). There is nothing host-side to
+  # check here, so this always reports skipped rather than a false failure.
+  # The old PIDfile/heartbeat check would false-FAIL every run now that
+  # TELEGRAM_BOT_TOKEN is still set but no bridge process exists.
+  record "bridge" "skip" "Host bridge removed (native telegram channel in-sandbox)"
 }
 
 check_agent() {
@@ -450,8 +420,11 @@ check_inference_live() {
 
 # ── Auto-fix functions ─────────────────────────────────────────
 # Each returns 0 if remediation was attempted (re-check warranted).
-# These are invoked indirectly via get_fix_func().
+# These are invoked indirectly via get_fix_func() (a name->fn map dispatched
+# via "$func"), which shellcheck cannot trace statically — each gets a
+# per-function `# shellcheck disable=SC2329` (invoked indirectly).
 
+# shellcheck disable=SC2329
 fix_docker() {
   if [ "$(uname -s)" = "Darwin" ]; then
     open -a Docker 2>/dev/null || true
@@ -466,6 +439,7 @@ fix_docker() {
   return 0
 }
 
+# shellcheck disable=SC2329
 fix_gateway() {
   openshell gateway select "$GATEWAY_NAME" 2>/dev/null || true
   openshell gateway start --name "$GATEWAY_NAME" 2>&1 || true
@@ -482,27 +456,27 @@ fix_gateway() {
   return 0
 }
 
+# shellcheck disable=SC2329
 fix_inference() {
-  # Restart LiteLLM via its LaunchAgent if not responding on port 4000.
-  if ! curl -sf --max-time 2 http://localhost:4000/health >/dev/null 2>&1; then
-    launchctl kickstart -k "gui/$(id -u)/com.nemoclaw.litellm" 2>/dev/null || true
-    sleep 8
-  fi
-  # Re-create the compatible-endpoint provider
-  if command -v openshell >/dev/null 2>&1; then
-    openshell provider delete "compatible-endpoint" 2>/dev/null || true
-    openshell provider create --name "compatible-endpoint" --type "openai" \
-      --credential "OPENAI_API_KEY=dummy" \
-      --config "OPENAI_BASE_URL=http://host.openshell.internal:4000/v1" 2>/dev/null || true
-  fi
+  # No safe host-side auto-fix for a missing inference provider — blindly
+  # recreating the old Bedrock 'compatible-endpoint' provider is wrong for a
+  # gemini-api (or any non-LiteLLM) sandbox, and the provider's API key lives
+  # in the user's env, not here. The end-to-end probe (check_inference_live)
+  # is the authoritative signal; surface the problem to the user instead of
+  # papering over it. Returns 0 so remediation doesn't error.
+  warn "auto-fix: inference provider missing — re-onboard or 'openshell inference set' (not auto-fixed)"
   return 0
 }
 
+# shellcheck disable=SC2329
 fix_inference_live() {
-  # inference_live failure usually means LiteLLM is down — restart it
-  fix_inference
+  # inference_live failure usually means the provider/model is unreachable.
+  # Same reasoning as fix_inference — no safe blind auto-fix; surface it.
+  warn "auto-fix: live inference probe failed — check provider/model health (not auto-fixed)"
+  return 0
 }
 
+# shellcheck disable=SC2329
 fix_dashboard() {
   openshell forward stop "$DASHBOARD_PORT" 2>/dev/null || true
   openshell forward start --background "$DASHBOARD_PORT" "$SANDBOX_NAME" 2>&1 || true
@@ -510,20 +484,16 @@ fix_dashboard() {
   return 0
 }
 
+# shellcheck disable=SC2329
 fix_bridge() {
-  # The bridge runs under launchd (com.nemoclaw.telegram-bridge), not
-  # start-services.sh (which now only manages cloudflared). Prefer the
-  # watchdog — it restarts the job cleanly whether the bridge is dead or
-  # merely wedged. Fall back to a direct kickstart if the watchdog is absent.
-  if [ -x "$SCRIPT_DIR/bridge-watchdog.sh" ]; then
-    "$SCRIPT_DIR/bridge-watchdog.sh" --sandbox "$SANDBOX_NAME" 2>/dev/null || true
-  else
-    launchctl kickstart -k "gui/$(id -u)/com.nemoclaw.telegram-bridge" 2>/dev/null || true
-  fi
-  sleep 5
+  # The host Telegram bridge was removed in v0.0.68 (native telegram channel
+  # runs in-sandbox). There is nothing to fix host-side, and check_bridge
+  # always skips, so this never runs. Kept as a no-op to satisfy
+  # get_fix_func()'s case map.
   return 0
 }
 
+# shellcheck disable=SC2329
 fix_agent() {
   if [ -x "$SCRIPT_DIR/apply-custom-policies.sh" ]; then
     "$SCRIPT_DIR/apply-custom-policies.sh" --sandbox "$SANDBOX_NAME" 2>/dev/null || true
@@ -531,6 +501,7 @@ fix_agent() {
   return 0
 }
 
+# shellcheck disable=SC2329
 fix_rules() {
   openshell rule approve-all "$SANDBOX_NAME" 2>/dev/null || true
   return 0
