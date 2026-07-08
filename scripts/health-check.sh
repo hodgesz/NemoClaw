@@ -406,10 +406,15 @@ check_inference_live() {
   local clean_out
   clean_out="$(echo "$probe_out" | grep -vE 'UNDICI-EHPA|EnvHttpProxyAgent|trace-warnings|\(node:|\(Use .node')"
 
-  # Check for error patterns in the response
-  if echo "$clean_out" | grep -qiE "timed? out|timeout|ETIMEDOUT|connection refused|ECONNREFUSED|502|503|rate.limit|LLM.*error"; then
+  # Check for error patterns in the response. Include Gemini/Gateway
+  # failure signatures — `incomplete_result`, `GatewayClientRequestError`,
+  # `FailoverError`, and `API_KEY_INVALID` / "API key not valid" all indicate
+  # a broken inference path (revoked key, model error) that produces a
+  # non-empty but useless response. Without these the probe false-passed
+  # for an entire vacation while the Gemini key was stale.
+  if echo "$clean_out" | grep -qiE "timed? out|timeout|ETIMEDOUT|connection refused|ECONNREFUSED|502|503|rate.limit|LLM.*error|incomplete_result|GatewayClientRequestError|FailoverError|API_KEY_INVALID|API key not valid|incomplete terminal response"; then
     local err_snippet
-    err_snippet="$(echo "$clean_out" | grep -iE "timed? out|timeout|error|refused|502|503|rate" | head -1)"
+    err_snippet="$(echo "$clean_out" | grep -iE "timed? out|timeout|error|refused|502|503|rate|incomplete_result|GatewayClientRequestError|FailoverError|API_KEY_INVALID|API key not valid|incomplete terminal response" | head -1)"
     record "inference_live" "fail" "Inference error: ${err_snippet:0:60}"
   elif [ -z "$probe_out" ]; then
     record "inference_live" "fail" "Inference probe returned empty response"
