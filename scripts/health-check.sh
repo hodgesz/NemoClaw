@@ -108,6 +108,7 @@ done
 CHECKS_PASSED=0
 CHECKS_FAILED=0
 CHECKS_SKIPPED=0
+CHECKS_DEGRADED=0
 RESULTS=()
 
 should_skip() {
@@ -132,6 +133,7 @@ record() {
     pass) CHECKS_PASSED=$((CHECKS_PASSED + 1)) ;;
     fail) CHECKS_FAILED=$((CHECKS_FAILED + 1)) ;;
     skip) CHECKS_SKIPPED=$((CHECKS_SKIPPED + 1)) ;;
+    degraded) CHECKS_DEGRADED=$((CHECKS_DEGRADED + 1)) ;;
   esac
 
   if [ "$OUTPUT_MODE" = "pretty" ]; then
@@ -139,6 +141,7 @@ record() {
       pass) echo -e "  ${GREEN}✓${NC} ${name}: ${detail}" ;;
       fail) echo -e "  ${RED}✗${NC} ${name}: ${detail}" ;;
       skip) echo -e "  ${YELLOW}–${NC} ${name}: skipped" ;;
+      degraded) echo -e "  ${YELLOW}⚠${NC} ${name}: ${detail} (degraded — no alert)" ;;
     esac
   fi
 }
@@ -406,18 +409,35 @@ check_inference_live() {
   local clean_out
   clean_out="$(echo "$probe_out" | grep -vE 'UNDICI-EHPA|EnvHttpProxyAgent|trace-warnings|\(node:|\(Use .node')"
 
-  # Check for error patterns in the response. Include Gemini/Gateway
-  # failure signatures — `incomplete_result`, `GatewayClientRequestError`,
-  # `FailoverError`, and `API_KEY_INVALID` / "API key not valid" all indicate
-  # a broken inference path (revoked key, model error) that produces a
-  # non-empty but useless response. Without these the probe false-passed
-  # for an entire vacation while the Gemini key was stale.
-  if echo "$clean_out" | grep -qiE "timed? out|timeout|ETIMEDOUT|connection refused|ECONNREFUSED|502|503|rate.limit|LLM.*error|incomplete_result|GatewayClientRequestError|FailoverError|API_KEY_INVALID|API key not valid|incomplete terminal response"; then
+  # Check for error patterns in the response. Distinguish two failure
+  # classes:
+  #   - degraded: transient free-tier congestion. The free OpenRouter
+  #     router rate-limits (429 / `rate.limit`) or failovers between models
+  #     (`FailoverError`), and a reasoning model routed onto the tiny
+  #     "Reply with only the word: OK" probe may return an empty/null
+  #     response. None of this means NemoClaw is down — it clears on its
+  #     own when congestion lifts. Log it, but do NOT alert or fail the
+  #     exit code (it is non-actionable noise — see CHECKS_DEGRADED).
+  #   - fail: real breakage. Timeout, connection refused, 502/503,
+  #     `incomplete_result`, `GatewayClientRequestError`, `API_KEY_INVALID`
+  #     / "API key not valid" indicate a broken inference path (revoked
+  #     key, gateway down, model error). These produce a non-empty but
+  #     useless response and warrant a Telegram alert. Without these the
+  #     probe false-passed for an entire vacation while the Gemini key
+  #     was stale.
+  if echo "$clean_out" | grep -qiE "rate.limit|FailoverError"; then
     local err_snippet
-    err_snippet="$(echo "$clean_out" | grep -iE "timed? out|timeout|error|refused|502|503|rate|incomplete_result|GatewayClientRequestError|FailoverError|API_KEY_INVALID|API key not valid|incomplete terminal response" | head -1)"
+    err_snippet="$(echo "$clean_out" | grep -iE "rate|FailoverError" | head -1)"
+    record "inference_live" "degraded" "Free-tier congestion: ${err_snippet:0:60}"
+  elif echo "$clean_out" | grep -qiE "timed? out|timeout|ETIMEDOUT|connection refused|ECONNREFUSED|502|503|LLM.*error|incomplete_result|GatewayClientRequestError|API_KEY_INVALID|API key not valid|incomplete terminal response"; then
+    local err_snippet
+    err_snippet="$(echo "$clean_out" | grep -iE "timed? out|timeout|error|refused|502|503|incomplete_result|GatewayClientRequestError|API_KEY_INVALID|API key not valid|incomplete terminal response" | head -1)"
     record "inference_live" "fail" "Inference error: ${err_snippet:0:60}"
   elif [ -z "$probe_out" ]; then
-    record "inference_live" "fail" "Inference probe returned empty response"
+    # Empty response on a one-word probe is the classic reasoning-model-on-
+    # free-tier signature: the model burns its budget "thinking" and emits
+    # nothing. Transient — treat as degraded, not a hard failure.
+    record "inference_live" "degraded" "Inference probe returned empty response (likely free-tier reasoning model)"
   else
     record "inference_live" "pass" "Inference probe OK"
   fi
@@ -583,6 +603,7 @@ remediate_and_recheck() {
 
     # Save state
     local saved_passed=$CHECKS_PASSED saved_failed=$CHECKS_FAILED saved_skipped=$CHECKS_SKIPPED
+    local saved_degraded=$CHECKS_DEGRADED
     local saved_len=${#RESULTS[@]}
 
     # Re-run the check (it appends to RESULTS)
@@ -598,6 +619,7 @@ remediate_and_recheck() {
     CHECKS_PASSED=$saved_passed
     CHECKS_FAILED=$saved_failed
     CHECKS_SKIPPED=$saved_skipped
+    CHECKS_DEGRADED=$saved_degraded
 
     replace_result "$name" "$new_status" "$new_detail"
   done
@@ -606,6 +628,7 @@ remediate_and_recheck() {
   CHECKS_PASSED=0
   CHECKS_FAILED=0
   CHECKS_SKIPPED=0
+  CHECKS_DEGRADED=0
   local entry
   for entry in "${RESULTS[@]}"; do
     IFS='|' read -r _ rstatus _ <<<"$entry"
@@ -613,6 +636,7 @@ remediate_and_recheck() {
       pass) CHECKS_PASSED=$((CHECKS_PASSED + 1)) ;;
       fail) CHECKS_FAILED=$((CHECKS_FAILED + 1)) ;;
       skip) CHECKS_SKIPPED=$((CHECKS_SKIPPED + 1)) ;;
+      degraded) CHECKS_DEGRADED=$((CHECKS_DEGRADED + 1)) ;;
     esac
   done
 
@@ -624,6 +648,7 @@ remediate_and_recheck() {
         pass) echo -e "  ${GREEN}✓${NC} ${rname}: ${rdetail}" ;;
         fail) echo -e "  ${RED}✗${NC} ${rname}: ${rdetail}" ;;
         skip) echo -e "  ${YELLOW}–${NC} ${rname}: skipped" ;;
+        degraded) echo -e "  ${YELLOW}⚠${NC} ${rname}: ${rdetail} (degraded — no alert)" ;;
       esac
     done
   fi
@@ -653,14 +678,14 @@ if [ "$AUTO_FIX" -eq 1 ] && [ "$CHECKS_FAILED" -gt 0 ]; then
 fi
 
 # ── Output ─────────────────────────────────────────────────────
-TOTAL=$((CHECKS_PASSED + CHECKS_FAILED + CHECKS_SKIPPED))
+TOTAL=$((CHECKS_PASSED + CHECKS_FAILED + CHECKS_SKIPPED + CHECKS_DEGRADED))
 
 if [ "$OUTPUT_MODE" = "pretty" ]; then
   echo ""
   if [ "$CHECKS_FAILED" -eq 0 ]; then
-    echo -e "  ${GREEN}All $CHECKS_PASSED checks passed${NC} ($CHECKS_SKIPPED skipped)"
+    echo -e "  ${GREEN}All $CHECKS_PASSED checks passed${NC} ($CHECKS_SKIPPED skipped${CHECKS_DEGRADED:+, $CHECKS_DEGRADED degraded})"
   else
-    echo -e "  ${RED}$CHECKS_FAILED/$TOTAL checks failed${NC} ($CHECKS_PASSED passed, $CHECKS_SKIPPED skipped)"
+    echo -e "  ${RED}$CHECKS_FAILED/$TOTAL checks failed${NC} ($CHECKS_PASSED passed, $CHECKS_SKIPPED skipped${CHECKS_DEGRADED:+, $CHECKS_DEGRADED degraded})"
   fi
   echo ""
 fi
@@ -672,7 +697,7 @@ if [ "$OUTPUT_MODE" = "json" ]; then
   echo "  \"timestamp\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\","
   echo "  \"sandbox\": \"$safe_sandbox\","
   echo "  \"gateway\": \"$safe_gateway\","
-  echo "  \"summary\": { \"passed\": $CHECKS_PASSED, \"failed\": $CHECKS_FAILED, \"skipped\": $CHECKS_SKIPPED },"
+  echo "  \"summary\": { \"passed\": $CHECKS_PASSED, \"failed\": $CHECKS_FAILED, \"skipped\": $CHECKS_SKIPPED, \"degraded\": $CHECKS_DEGRADED },"
   echo "  \"checks\": ["
   first=1
   for result in "${RESULTS[@]}"; do
