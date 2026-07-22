@@ -310,7 +310,7 @@ check_agent() {
   doctor_out=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
     "openshell-${SANDBOX_NAME}" 'openclaw doctor 2>&1; echo "EXIT:$?"' 2>&1 || true)
-  doctor_exit=$(echo "$doctor_out" | grep -o 'EXIT:[0-9]*' | tail -1 | cut -d: -f2)
+  doctor_exit=$(echo "$doctor_out" | grep -o 'EXIT:[0-9]*' | tail -1 | cut -d: -f2 || true)
   if [ "${doctor_exit:-1}" = "0" ]; then
     record "agent" "pass" "openclaw doctor: passed (exit 0)"
   else

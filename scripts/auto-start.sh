@@ -203,6 +203,32 @@ else
   node "$REPO_DIR/bin/nemoclaw.js" "$SANDBOX_NAME" status 2>&1 || warn "Sandbox status check returned non-zero."
 fi
 
+# The OpenShell gateway can report healthy before its restored sandboxes finish
+# provisioning. Do not attempt SSH, policy updates, or gateway recovery until
+# the target sandbox is actually ready.
+sandbox_ready=0
+sandbox_waited=0
+sandbox_timeout=120
+while [ "$sandbox_waited" -le "$sandbox_timeout" ]; do
+  sandbox_state="$(openshell sandbox get "$SANDBOX_NAME" 2>&1 || true)"
+  if ! echo "$sandbox_state" | grep -qi "not ready" \
+    && echo "$sandbox_state" | grep -qiw "ready"; then
+    sandbox_ready=1
+    break
+  fi
+  if [ "$sandbox_waited" -eq "$sandbox_timeout" ]; then
+    break
+  fi
+  sleep 5
+  sandbox_waited=$((sandbox_waited + 5))
+done
+
+if [ "$sandbox_ready" -eq 1 ]; then
+  info "Sandbox '$SANDBOX_NAME' is ready (waited ${sandbox_waited}s)."
+else
+  warn "Sandbox '$SANDBOX_NAME' did not become ready within ${sandbox_timeout}s."
+fi
+
 # ── Step 4a: Verify SSH tunnel ────────────────────────────────────
 info "Verifying SSH tunnel to sandbox..."
 ssh_test=$(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
@@ -239,17 +265,34 @@ else
   warn "apply-custom-policies.sh not found or not executable. Skipping."
 fi
 
-# Read-only gateway health probe (no restart loop: there's no patch to reload,
-# and the in-sandbox nemoclaw-start supervisor (#4710 + #2757) owns gateway
-# health). One soft probe for the summary log only.
+# Recover the gateway explicitly when the sandbox survived a host restart but
+# its always-on agent process did not. `nemoclaw <name> recover` is idempotent
+# and owns the supported gateway + dashboard-forward recovery sequence.
 info "Probing in-sandbox gateway health..."
 if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
   -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
   "openshell-${SANDBOX_NAME}" \
   'curl -sf --max-time 2 http://127.0.0.1:18789/health >/dev/null 2>&1' 2>/dev/null; then
   info "In-sandbox gateway is responding on :18789."
+elif [ "$sandbox_ready" -eq 1 ]; then
+  warn "In-sandbox gateway is not responding on :18789; running supported recovery."
+  if command -v nemoclaw >/dev/null 2>&1; then
+    nemoclaw "$SANDBOX_NAME" recover 2>&1 || warn "Gateway recovery returned non-zero."
+  else
+    node "$REPO_DIR/bin/nemoclaw.js" "$SANDBOX_NAME" recover 2>&1 \
+      || warn "Gateway recovery returned non-zero."
+  fi
+
+  if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+    "openshell-${SANDBOX_NAME}" \
+    'curl -sf --max-time 2 http://127.0.0.1:18789/health >/dev/null 2>&1' 2>/dev/null; then
+    info "In-sandbox gateway recovered on :18789."
+  else
+    warn "In-sandbox gateway is still not responding after recovery."
+  fi
 else
-  warn "In-sandbox gateway not responding on :18789 yet (may still be booting; supervisor will recover)."
+  warn "Skipping gateway recovery because the sandbox is not ready."
 fi
 
 # ── Step 4d: Setup DNS proxy ─────────────────────────────────────
