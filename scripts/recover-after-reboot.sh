@@ -239,9 +239,12 @@ if [ -n "$PROVIDER" ]; then
         else
           warn "NVIDIA_API_KEY not set; cannot create nvidia-prod provider."
         fi
+        # GLM 5.2 on NVIDIA's free NIM endpoint (integrate.api.nvidia.com).
+        # Chosen over Nemotron for the free-tier liveness/briefing path so
+        # unattended probes don't drain paid Gemini credits. See CLAUDE.md.
         openshell inference set --provider nvidia-prod \
-          --model nvidia/nemotron-3-super-120b-a12b --no-verify 2>&1
-        info "Inference set to NVIDIA cloud."
+          --model z-ai/glm-5.2 --no-verify 2>&1
+        info "Inference set to NVIDIA cloud (GLM 5.2)."
       fi
       ;;
     ollama)

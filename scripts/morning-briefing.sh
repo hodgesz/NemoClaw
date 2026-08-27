@@ -44,7 +44,7 @@ CHAT_ID="${1:---chat-id}"
 
 # If first arg is --chat-id, take the next arg
 if [[ "$CHAT_ID" == "--chat-id" ]]; then
-  CHAT_ID="${2:-${TELEGRAM_CHAT_ID:-}}"
+  CHAT_ID="${2:-${TELEGRAM_CHAT_ID:-7236389286}}"
 fi
 
 # Use the same session ID as the Telegram bridge (tg-{chatId}) so that
@@ -134,34 +134,59 @@ EOF
 
 PROMPT_B64=$(printf '%s' "${AGENT_PROMPT}" | base64 | tr -d '\n')
 
-RESPONSE=$(ssh -o ConnectTimeout=15 "openshell-${SANDBOX_NAME}" \
-  "export NVIDIA_API_KEY=unused && nemoclaw-start openclaw agent --agent main \
-   -m \"\$(echo ${PROMPT_B64} | base64 -d)\" --session-id ${SESSION_ID}" 2>&1 \
-  | grep -v -e '\[SECURITY\]' -e 'Setting up NemoClaw' -e '\[gateway\]' -e 'UNDICI' \
-    -e '(node:' -e 'Use .node' -e 'pairing required' -e 'CAP_SET' \
-    -e 'privilege separation' -e 'Gateway target:' -e 'Source: local loopback' \
-    -e 'Config: /sandbox' -e 'Bind: loopback' -e 'getaddrinfo' \
-    -e 'tools websearch' -e 'Gateway agent failed' \
-    -e 'GatewayClientRequestError' -e 'abnormal closure' \
-    -e 'tools cron failed' -e '\[config\]' -e '\[channels\]' \
-    -e '\[plugins\]' -e '\[proxy\]' -e 'routing process' || true)
-
-# ── Detect error responses ───────────────────────────────────────
-# The agent may return an error message instead of a real briefing.
-# Detect known failure patterns and flag them so the health check can
-# distinguish success from failure, and the user gets a clear alert.
+# ── Run the agent with retry-on-empty ─────────────────────────────
+# The OpenRouter free router (openrouter/free) load-balances across ~28
+# free models, and some return null/empty or ramble about the task instead
+# of following it (e.g. nemotron-3-ultra free narrates the instruction).
+# A 200 with empty content is a "successful" call that produced nothing
+# usable. Retry up to 3 times with backoff — each retry is routed to a different
+# free model, so a subsequent attempt usually lands on a model that actually
+# answers. Mirrors Hermes's own retry loop (agent_runtime_helpers).
+MAX_ATTEMPTS=3
+RETRY_DELAY=15
 BRIEFING_STATUS="ok"
+RESPONSE=""
+for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+  RESPONSE=$(ssh -o ConnectTimeout=15 "openshell-${SANDBOX_NAME}" \
+    "export NVIDIA_API_KEY=unused && nemoclaw-start openclaw agent --agent main \
+     -m \"\$(echo ${PROMPT_B64} | base64 -d)\" --session-id ${SESSION_ID}" 2>&1 \
+    | grep -v -e '\[SECURITY\]' -e 'Setting up NemoClaw' -e '\[gateway\]' -e 'UNDICI' \
+      -e '(node:' -e 'Use .node' -e 'pairing required' -e 'CAP_SET' \
+      -e 'privilege separation' -e 'Gateway target:' -e 'Source: local loopback' \
+      -e 'Config: /sandbox' -e 'Bind: loopback' -e 'getaddrinfo' \
+      -e 'tools websearch' -e 'abnormal closure' \
+      -e 'tools cron failed' -e '\[config\]' -e '\[channels\]' \
+      -e '\[plugins\]' -e '\[proxy\]' -e 'routing process' || true)
 
-if [[ -z "$RESPONSE" ]]; then
-  RESPONSE="⚠️ Morning briefing failed — agent returned empty response."
-  BRIEFING_STATUS="error:empty"
-elif echo "$RESPONSE" | grep -qiE "timed? out|timeout|ETIMEDOUT|request.*(fail|error)|LLM.*(fail|error|timed)|inference.*(fail|error|unavailable)|connection refused|ECONNREFUSED|502|503|rate.limit"; then
-  # Wrap the error so the user knows this isn't a real briefing
-  RESPONSE="⚠️ Morning briefing failed — agent error:
+  # Detect error responses. The agent may return an error message instead
+  # of a real briefing — flag known failure patterns so the health check
+  # can distinguish success from failure, and the user gets a clear alert.
+  if [[ -z "$RESPONSE" ]]; then
+    # Empty — free router picked a null-returning model. Retry.
+    echo "briefing attempt ${attempt}: empty response, retrying in ${RETRY_DELAY}s..." >&2
+    if [[ "$attempt" -lt "$MAX_ATTEMPTS" ]]; then
+      sleep "$RETRY_DELAY"
+      continue
+    fi
+    RESPONSE="⚠️ Morning briefing failed — agent returned empty response after ${MAX_ATTEMPTS} attempts."
+    BRIEFING_STATUS="error:empty"
+  elif echo "$RESPONSE" | grep -qiE "timed? out|timeout|ETIMEDOUT|request.*(fail|error)|LLM.*(fail|error|timed)|inference.*(fail|error|unavailable)|connection refused|ECONNREFUSED|502|503|rate.limit|FailoverError|GatewayClientRequestError|Gateway agent failed"; then
+    # LLM/transport error — free models may be congested (429) or failover.
+    # Retry with backoff so the router can find an available model.
+    echo "briefing attempt ${attempt}: LLM/gateway error, retrying in ${RETRY_DELAY}s..." >&2
+    if [[ "$attempt" -lt "$MAX_ATTEMPTS" ]]; then
+      sleep "$RETRY_DELAY"
+      continue
+    fi
+    RESPONSE="⚠️ Morning briefing failed — agent error after ${MAX_ATTEMPTS} attempts:
 
 ${RESPONSE}"
-  BRIEFING_STATUS="error:llm"
-fi
+    BRIEFING_STATUS="error:llm"
+  else
+    # Got a usable response — stop retrying.
+    break
+  fi
+done
 
 # Write status for health-check.sh to read
 STATUS_FILE="/tmp/nemoclaw-briefing-status.json"

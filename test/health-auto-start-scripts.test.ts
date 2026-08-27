@@ -90,4 +90,43 @@ describe("host health and auto-start scripts", () => {
     expect(result.stdout).toContain("running supported recovery");
     expect(readFileSync(calls, "utf8")).toContain("my-assistant recover");
   });
+
+  it("records error:empty briefing status as degraded instead of fail", () => {
+    const statusFile = "/tmp/nemoclaw-briefing-status.json";
+    const originalContent = readFileSync(statusFile, "utf8");
+    try {
+      writeFileSync(
+        statusFile,
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          status: "error:empty",
+          chat_id: "test",
+        }),
+      );
+
+      const result = spawnSync(
+        "bash",
+        [
+          path.join(ROOT, "scripts/health-check.sh"),
+          "--json",
+          "--skip",
+          "docker,gateway,sandbox,ssh,inference,inference_live,dashboard,bridge,agent,rules",
+        ],
+        { encoding: "utf8" },
+      );
+
+      expect(result.status).toBe(0);
+      const output = JSON.parse(result.stdout);
+      expect(output.summary.failed).toBe(0);
+      expect(output.summary.degraded).toBe(1);
+      expect(output.checks).toContainEqual(
+        expect.objectContaining({
+          name: "briefing",
+          status: "degraded",
+        }),
+      );
+    } finally {
+      writeFileSync(statusFile, originalContent);
+    }
+  });
 });

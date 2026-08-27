@@ -375,6 +375,9 @@ check_briefing() {
     ok)
       record "briefing" "pass" "Last briefing succeeded ($timestamp)"
       ;;
+    error:empty)
+      record "briefing" "degraded" "Last briefing returned empty ($timestamp)"
+      ;;
     error:*)
       local err_type="${status#error:}"
       record "briefing" "fail" "Last briefing failed: $err_type ($timestamp)"
