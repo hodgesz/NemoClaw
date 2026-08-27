@@ -1,15 +1,21 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  buildDockerGpuMode,
   buildDockerGpuModeCandidates,
   type DockerContainerInspect,
   type DockerGpuPatchDeps,
+  dockerReportsNvidiaCdiDevices,
   recreateOpenShellDockerSandboxWithGpu,
   selectDockerGpuPatchMode,
-} from "../../../dist/lib/onboard/docker-gpu-patch";
+} from "./docker-gpu-patch";
 
 // Deps that surface an NVIDIA CDI spec at /etc/cdi/nvidia.yaml so
 // `dockerReportsNvidiaCdiDevices` reports CDI as available (the #4948 host
@@ -42,6 +48,37 @@ function inspectFixture(): DockerContainerInspect {
 }
 
 describe("docker-gpu-patch CDI-first mode selection (#4948)", () => {
+  it("maps default and explicit GPU devices to Docker --gpus values", () => {
+    expect(buildDockerGpuMode("gpus").args).toEqual(["--gpus", "all"]);
+    expect(buildDockerGpuMode("gpus", "nvidia.com/gpu=0").args).toEqual(["--gpus", "device=0"]);
+    expect(buildDockerGpuMode("gpus", "1,2").args).toEqual(["--gpus", "device=1,2"]);
+  });
+
+  it.each(["cdi", "gpus", "nvidia-runtime"] as const)(
+    "rejects an empty CDI identifier for the %s compatibility mode",
+    (kind) => {
+      expect(() => buildDockerGpuMode(kind, "nvidia.com/gpu=")).toThrow(
+        "must include an identifier",
+      );
+    },
+  );
+
+  it("uses Jetson NVIDIA runtime args without selecting generic --gpus or CDI candidates", () => {
+    expect(buildDockerGpuMode("nvidia-runtime", null, { backend: "jetson" }).args).toEqual([
+      "--runtime",
+      "nvidia",
+      "--env",
+      "NVIDIA_VISIBLE_DEVICES=all",
+      "--env",
+      "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+    ]);
+    expect(
+      buildDockerGpuModeCandidates("all", { backend: "jetson", cdiAvailable: true }).map(
+        (mode) => mode.kind,
+      ),
+    ).toEqual(["nvidia-runtime"]);
+  });
+
   it("prefers CDI over --gpus when the host advertises an NVIDIA CDI spec", () => {
     // Repro for #4948: on a Docker-CDI GPU host (e.g. Ubuntu 24.04 with
     // /etc/cdi/nvidia.yaml), `docker create --gpus all` is *accepted* so the
@@ -105,6 +142,297 @@ describe("docker-gpu-patch CDI-first mode selection (#4948)", () => {
     ]);
   });
 
+  it("does not accept a GPU mode probe with no exit status", () => {
+    const selected = selectDockerGpuPatchMode(
+      { image: "openshell/sandbox:abc" },
+      {
+        dockerCapture: vi.fn(() => ""),
+        dockerRun: vi.fn(() => ({ status: null, error: new Error("spawn timed out") })),
+        dockerRm: vi.fn(() => ({ status: 0 })),
+        readDir: vi.fn(() => null),
+        readFile: vi.fn(() => null),
+      },
+    );
+
+    expect(selected.mode).toBeNull();
+    expect(selected.attempts).toHaveLength(2);
+    expect(selected.attempts.map((attempt) => attempt.error)).toEqual([
+      "spawn timed out",
+      "spawn timed out",
+    ]);
+  });
+
+  it("can prohibit image pulls during GPU mode probes", () => {
+    const dockerRun = vi.fn<NonNullable<DockerGpuPatchDeps["dockerRun"]>>(() => ({
+      status: 0,
+      stdout: "probe-id",
+    }));
+
+    selectDockerGpuPatchMode(
+      { image: "openshell/sandbox:abc", pullPolicy: "never" },
+      {
+        dockerCapture: vi.fn(() => ""),
+        dockerRun,
+        dockerRm: vi.fn(() => ({ status: 0 })),
+        readDir: vi.fn(() => null),
+        readFile: vi.fn(() => null),
+      },
+    );
+
+    expect(dockerRun.mock.calls[0]?.[0]).toEqual(
+      expect.arrayContaining(["create", "--pull", "never", "openshell/sandbox:abc", "true"]),
+    );
+  });
+
+  it("falls back to NVIDIA runtime when Docker rejects --gpus", () => {
+    const dockerRun = vi
+      .fn()
+      .mockReturnValueOnce({ status: 1, stderr: "could not select device driver" })
+      .mockReturnValueOnce({ status: 0, stdout: "probe-id" });
+    const selected = selectDockerGpuPatchMode(
+      { image: "openshell/sandbox:abc" },
+      {
+        dockerCapture: vi.fn(() => ""),
+        dockerRun,
+        dockerRm: vi.fn(() => ({ status: 0 })),
+        readDir: vi.fn(() => null),
+        readFile: vi.fn(() => null),
+      },
+    );
+
+    expect(selected.mode?.kind).toBe("nvidia-runtime");
+    expect(selected.attempts.map((attempt) => attempt.mode.kind)).toEqual([
+      "gpus",
+      "nvidia-runtime",
+    ]);
+  });
+
+  it("retries a transient Docker Desktop WSL GPU-mode probe", () => {
+    const dockerRun = vi
+      .fn()
+      .mockReturnValueOnce({ status: 1, stderr: "request returned 500 Internal Server Error" })
+      .mockReturnValueOnce({ status: 0, stdout: "probe-id" });
+    const sleep = vi.fn();
+
+    const selected = selectDockerGpuPatchMode(
+      {
+        image: "openshell/sandbox:abc",
+        dockerDesktopWsl: true,
+      },
+      {
+        dockerCapture: vi.fn(() => ""),
+        dockerRun,
+        dockerRm: vi.fn(() => ({ status: 0 })),
+        sleep,
+      },
+    );
+
+    expect(selected.mode?.kind).toBe("gpus");
+    expect(selected.attempts.map((attempt) => [attempt.mode.kind, attempt.ok])).toEqual([
+      ["gpus", false],
+      ["gpus", true],
+    ]);
+    expect(sleep).toHaveBeenCalledOnce();
+    expect(sleep).toHaveBeenCalledWith(1);
+  });
+
+  it.each([
+    "could not select device driver with capabilities: [[gpu]]",
+    "No such image: image-500:latest",
+    "invalid reference format for image-503",
+  ])("does not retry permanent Docker Desktop WSL GPU-mode failure: %s", (stderr) => {
+    const dockerRun = vi.fn(() => ({ status: 1, stderr }));
+    const sleep = vi.fn();
+
+    const selected = selectDockerGpuPatchMode(
+      {
+        image: "openshell/sandbox:abc",
+        dockerDesktopWsl: true,
+      },
+      {
+        dockerCapture: vi.fn(() => ""),
+        dockerRun,
+        dockerRm: vi.fn(() => ({ status: 0 })),
+        sleep,
+      },
+    );
+
+    expect(selected.mode).toBeNull();
+    expect(selected.attempts.map((attempt) => attempt.mode.kind)).toEqual([
+      "gpus",
+      "nvidia-runtime",
+    ]);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("does not mutate again when probe cleanup remains ambiguous", () => {
+    const dockerRun = vi
+      .fn()
+      .mockReturnValueOnce({ status: 1, stderr: "request returned 500 Internal Server Error" })
+      .mockReturnValueOnce({ status: 0, stdout: '[{"Id":"probe-id"}]' });
+    const sleep = vi.fn();
+
+    const selected = selectDockerGpuPatchMode(
+      {
+        image: "openshell/sandbox:abc",
+        dockerDesktopWsl: true,
+      },
+      {
+        dockerCapture: vi.fn(() => ""),
+        dockerRun,
+        dockerRm: vi.fn(() => ({ status: 1, stderr: "daemon cleanup failed" })),
+        sleep,
+      },
+    );
+
+    expect(selected.mode).toBeNull();
+    expect(selected.attempts).toEqual([
+      expect.objectContaining({
+        ok: false,
+        error:
+          "request returned 500 Internal Server Error; cleanup could not confirm container removal",
+      }),
+    ]);
+    expect(dockerRun).toHaveBeenCalledTimes(2);
+    expect(dockerRun.mock.calls[1]?.[0]).toEqual([
+      "container",
+      "inspect",
+      expect.stringMatching(/^nemoclaw-gpu-probe-/),
+    ]);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("does not accept a successful probe when cleanup remains ambiguous", () => {
+    const dockerRun = vi
+      .fn()
+      .mockReturnValueOnce({ status: 0, stdout: "probe-id" })
+      .mockReturnValueOnce({ status: 0, stdout: '[{"Id":"probe-id"}]' });
+
+    const selected = selectDockerGpuPatchMode(
+      {
+        image: "openshell/sandbox:abc",
+        dockerDesktopWsl: true,
+      },
+      {
+        dockerCapture: vi.fn(() => ""),
+        dockerRun,
+        dockerRm: vi.fn(() => ({ status: 1, stderr: "daemon cleanup failed" })),
+        sleep: vi.fn(),
+      },
+    );
+
+    expect(selected.mode).toBeNull();
+    expect(selected.attempts).toEqual([
+      expect.objectContaining({
+        ok: false,
+        error: "Docker GPU probe succeeded, but cleanup could not confirm container removal",
+      }),
+    ]);
+    expect(dockerRun).toHaveBeenCalledTimes(2);
+  });
+
+  it("probes only NVIDIA runtime for Jetson Docker GPU mode", () => {
+    const dockerCapture = vi.fn(() => "");
+    const dockerRun = vi.fn(() => ({ status: 0, stdout: "probe-id" }));
+    const selected = selectDockerGpuPatchMode(
+      { image: "openshell/sandbox:abc", backend: "jetson" },
+      { dockerCapture, dockerRun, dockerRm: vi.fn(() => ({ status: 0 })) },
+    );
+
+    expect(selected.mode?.kind).toBe("nvidia-runtime");
+    expect(selected.attempts.map((attempt) => attempt.mode.kind)).toEqual(["nvidia-runtime"]);
+    expect(dockerRun).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        "create",
+        "--runtime",
+        "nvidia",
+        "--env",
+        "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+      ]),
+      expect.objectContaining({ ignoreError: true }),
+    );
+    expect(dockerCapture).not.toHaveBeenCalled();
+  });
+
+  it("prefers CDI only when Docker reports readable NVIDIA CDI specs", () => {
+    expect(buildDockerGpuModeCandidates("all", { cdiAvailable: false }).map((m) => m.kind)).toEqual(
+      ["gpus", "nvidia-runtime"],
+    );
+    expect(buildDockerGpuModeCandidates("all", { cdiAvailable: true }).map((m) => m.kind)).toEqual([
+      "cdi",
+      "gpus",
+      "nvidia-runtime",
+    ]);
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-docker-cdi-"));
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, "nvidia.yaml"),
+        "cdiVersion: 0.6.0\nkind: nvidia.com/gpu\ndevices:\n  - name: all\n",
+      );
+      expect(
+        dockerReportsNvidiaCdiDevices({
+          dockerCapture: vi.fn(() => JSON.stringify([tmpDir])),
+        }),
+      ).toBe(true);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("detects NVIDIA CDI specs in /etc/cdi when docker info reports no dirs (#3575)", () => {
+    const readDir = vi.fn((dirPath: string) => (dirPath === "/etc/cdi" ? ["nvidia.yaml"] : null));
+    const readFile = vi.fn((filePath: string) =>
+      filePath === "/etc/cdi/nvidia.yaml"
+        ? "cdiVersion: 0.6.0\nkind: nvidia.com/gpu\ndevices:\n  - name: all\n"
+        : null,
+    );
+    expect(
+      dockerReportsNvidiaCdiDevices({
+        dockerCapture: vi.fn(() => ""),
+        readDir,
+        readFile,
+      }),
+    ).toBe(true);
+    expect(readDir).toHaveBeenCalledWith("/etc/cdi");
+  });
+
+  it("returns false when default CDI dirs hold no NVIDIA specs", () => {
+    expect(
+      dockerReportsNvidiaCdiDevices({
+        dockerCapture: vi.fn(() => ""),
+        readDir: vi.fn(() => null),
+        readFile: vi.fn(() => null),
+      }),
+    ).toBe(false);
+  });
+
+  it("falls back to default CDI dirs even when docker info errors", () => {
+    const dockerCapture = vi.fn(() => {
+      throw new Error("docker daemon unreachable");
+    });
+    const readDir = vi.fn((dirPath: string) =>
+      dirPath === "/var/run/cdi" ? ["nvidia.json"] : null,
+    );
+    const readFile = vi.fn((filePath: string) =>
+      filePath === "/var/run/cdi/nvidia.json"
+        ? JSON.stringify({ cdiVersion: "0.6.0", kind: "nvidia.com/gpu" })
+        : null,
+    );
+    expect(dockerReportsNvidiaCdiDevices({ dockerCapture, readDir, readFile })).toBe(true);
+  });
+
+  it("does not re-scan a directory that docker info already reported", () => {
+    const readDir = vi.fn((dirPath: string) => (dirPath === "/etc/cdi" ? ["nvidia.yaml"] : null));
+    const readFile = vi.fn(() => "cdiVersion: 0.6.0\nkind: nvidia.com/gpu\n");
+    dockerReportsNvidiaCdiDevices({
+      dockerCapture: vi.fn(() => JSON.stringify(["/etc/cdi"])),
+      readDir,
+      readFile,
+    });
+    expect(readDir.mock.calls.filter(([dir]) => dir === "/etc/cdi").length).toBe(1);
+  });
+
   it("passes the CDI --device flag to docker run when recreating on a CDI host", () => {
     // Proves the selected CDI mode propagates into the actual recreate command
     // (`dockerRunDetached`), not just the selection result. This is the create
@@ -117,13 +445,16 @@ describe("docker-gpu-patch CDI-first mode selection (#4948)", () => {
     });
     const dockerRunDetached = vi.fn(() => ({ status: 0, stdout: "new-container-id\n" }));
     const host = cdiHostDeps();
+    const detectSandboxFallbackDns = vi.fn(() => null);
 
     const result = recreateOpenShellDockerSandboxWithGpu(
-      { sandboxName: "alpha", timeoutSecs: 1 },
+      { sandboxName: "alpha", timeoutSecs: 1, waitForSupervisor: false },
       {
         dockerCapture,
         readDir: host.readDir,
         readFile: host.readFile,
+        // Keep the unit test independent of the runner's resolver setup.
+        detectSandboxFallbackDns,
         dockerRun: vi.fn(() => ({ status: 0, stdout: "probe-id\n" })),
         dockerRunDetached,
         dockerRename: vi.fn(() => ({ status: 0 })),
@@ -135,6 +466,7 @@ describe("docker-gpu-patch CDI-first mode selection (#4948)", () => {
       },
     );
 
+    expect(detectSandboxFallbackDns).toHaveBeenCalledOnce();
     expect(result.mode.kind).toBe("cdi");
     expect(dockerRunDetached).toHaveBeenCalledWith(
       expect.arrayContaining(["--name", "openshell-alpha", "--device", "nvidia.com/gpu=all"]),

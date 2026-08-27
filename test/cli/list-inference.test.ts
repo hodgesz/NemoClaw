@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect } from "vitest";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { describe, expect, it } from "vitest";
 
 import {
-  HERMES_CLI,
   execTimeout,
+  HERMES_CLI,
   isCliErrorCandidate,
   readBufferOrStringProperty,
   readCliErrorOutput,
@@ -19,25 +19,27 @@ import {
 } from "./helpers";
 
 describe("CLI dispatch", () => {
-  it(
-    "redirects `inference set` to openshell when provider or model is missing",
-    () => {
-      for (const argv of [
+  it.each(
+    [
         "inference set 2>&1",
         "inference set --provider nvidia-prod 2>&1",
         "inference set --model nvidia/model 2>&1",
-      ]) {
-        const r = run(argv);
-        expect(r.code, `nemoclaw ${argv}`).toBe(1);
-        expect(r.out, `nemoclaw ${argv}`).toContain("Unknown nemoclaw command: inference set");
-        expect(r.out, `nemoclaw ${argv}`).toContain("This operation belongs to OpenShell.");
-        expect(r.out, `nemoclaw ${argv}`).toContain(
-          "Run: openshell inference set -g nemoclaw --model <model> --provider <provider>",
-        );
-        expect(r.out, `nemoclaw ${argv}`).not.toContain("Missing required flag");
-        expect(r.out, `nemoclaw ${argv}`).not.toContain("FailedFlagValidationError");
-        expect(r.out, `nemoclaw ${argv}`).not.toContain("node_modules/@oclif/core");
-      }
+      ],
+  )(
+    "keeps `inference set` inside NemoClaw when provider or model is missing [%s]",
+    (argv) => {
+      const r = run(argv);
+      expect(r.code, `nemoclaw ${argv}`).toBe(1);
+      expect(r.out, `nemoclaw ${argv}`).toContain(
+        "nemoclaw inference set requires --provider and --model",
+      );
+      expect(r.out, `nemoclaw ${argv}`).toContain(
+        "Run: nemoclaw inference set --provider <provider> --model <model> [--sandbox <name>]",
+      );
+      expect(r.out, `nemoclaw ${argv}`).not.toContain("openshell inference set");
+      expect(r.out, `nemoclaw ${argv}`).not.toContain("Missing required flag");
+      expect(r.out, `nemoclaw ${argv}`).not.toContain("FailedFlagValidationError");
+      expect(r.out, `nemoclaw ${argv}`).not.toContain("node_modules/@oclif/core");
 
       let hermesOut = "";
       let hermesCode = 0;
@@ -65,11 +67,11 @@ describe("CLI dispatch", () => {
         hermesCode = result.code;
       }
       expect(hermesCode).toBe(1);
-      expect(hermesOut).toContain("Unknown nemohermes command: inference set");
-      expect(hermesOut).toContain("This operation belongs to OpenShell.");
+      expect(hermesOut).toContain("nemohermes inference set requires --provider and --model");
       expect(hermesOut).toContain(
-        "Run: openshell inference set -g nemoclaw --model <model> --provider <provider>",
+        "Run: nemohermes inference set --provider <provider> --model <model> [--sandbox <name>]",
       );
+      expect(hermesOut).not.toContain("openshell inference set");
     },
     testTimeout(15_000),
   );
@@ -177,6 +179,7 @@ describe("CLI dispatch", () => {
         recoveredFromGateway: 0,
       },
       lastOnboardedSandbox: null,
+      incompleteOnboarding: null,
       sandboxes: [],
     });
   });
@@ -217,7 +220,7 @@ describe("CLI dispatch", () => {
     );
     fs.writeFileSync(
       path.join(localBin, "ps"),
-      ["#!/bin/sh", "echo '123 ssh openshell-alpha'", "exit 0"].join("\n"),
+      ["#!/bin/sh", "echo '123 ssh openshell-alpha.default'", "exit 0"].join("\n"),
       { mode: 0o755 },
     );
 
@@ -235,6 +238,7 @@ describe("CLI dispatch", () => {
         recoveredFromGateway: 0,
       },
       lastOnboardedSandbox: null,
+      incompleteOnboarding: null,
       sandboxes: [
         {
           name: "alpha",
@@ -245,7 +249,6 @@ describe("CLI dispatch", () => {
           agent: "openclaw",
           isDefault: true,
           activeSessionCount: 1,
-          connected: true,
           hostGpuDetected: false,
           sandboxGpuEnabled: true,
           sandboxGpuMode: null,
@@ -255,6 +258,93 @@ describe("CLI dispatch", () => {
         },
       ],
     });
+  });
+
+  it("list and global status report a resumable inference-route reservation separately (#10097)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-cli-incomplete-onboard-"));
+    const localBin = path.join(home, "bin");
+    const stateDir = path.join(home, ".nemoclaw");
+    fs.mkdirSync(localBin, { recursive: true });
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(stateDir, "sandboxes.json"),
+      JSON.stringify({
+        sandboxes: {
+          "sandbox-d": {
+            name: "sandbox-d",
+            provider: "nvidia-prod",
+            model: "nvidia/model",
+            pendingRouteReservation: true,
+            reservationSessionId: "session-d",
+          },
+        },
+        defaultSandbox: null,
+      }),
+      { mode: 0o600 },
+    );
+    fs.writeFileSync(
+      path.join(stateDir, "onboard-session.json"),
+      JSON.stringify({
+        version: 1,
+        sessionId: "session-d",
+        resumable: true,
+        status: "failed",
+        sandboxName: "sandbox-d",
+        lastStepStarted: "inference",
+        lastCompletedStep: "inference",
+        failure: {
+          step: "inference",
+          message: null,
+          recordedAt: "2026-08-24T10:00:00.000Z",
+          interrupted: true,
+        },
+      }),
+      { mode: 0o600 },
+    );
+    fs.writeFileSync(path.join(localBin, "openshell"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const env = { HOME: home, PATH: `${localBin}:${process.env.PATH || ""}` };
+
+    try {
+      const listText = runWithEnv("list", env);
+      expect(listText.code).toBe(0);
+      expect(listText.out).toContain("Incomplete onboarding:");
+      expect(listText.out).toContain("sandbox-d  interrupted at inference");
+      expect(listText.out).toContain("nemoclaw onboard --resume");
+      expect(listText.out).not.toContain("Sandboxes:");
+
+      const listJson = runWithEnv("list --json", env);
+      expect(listJson.code).toBe(0);
+      expect(JSON.parse(listJson.out)).toMatchObject({
+        incompleteOnboarding: {
+          name: "sandbox-d",
+          status: "failed",
+          step: "inference",
+          interrupted: true,
+          resumable: true,
+        },
+        sandboxes: [],
+      });
+
+      const statusText = runWithEnv("status", env);
+      expect(statusText.code).toBe(0);
+      expect(statusText.out).toContain("Incomplete onboarding:");
+      expect(statusText.out).toContain("sandbox-d  interrupted at inference");
+
+      const statusJson = runWithEnv("status --json", env);
+      expect(statusJson.code).toBe(0);
+      expect(JSON.parse(statusJson.out)).toMatchObject({
+        incompleteOnboarding: {
+          name: "sandbox-d",
+          status: "failed",
+          step: "inference",
+          interrupted: true,
+          resumable: true,
+        },
+        sandboxes: [],
+      });
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("list forwards oclif parse errors for unknown options", () => {

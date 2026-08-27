@@ -3,21 +3,14 @@
 
 import { Flags } from "@oclif/core";
 
-function nonEmptyFlag(description: string) {
-  return Flags.string({
-    description,
-    parse: async (input: string) => {
-      const trimmed = input.trim();
-      if (!trimmed) throw new Error(`${description} cannot be empty`);
-      return trimmed;
-    },
-  });
-}
-
 import { InferenceSetError, runInferenceSet } from "../../lib/actions/inference-set";
-import { CLI_NAME } from "../../lib/cli/branding";
+import { nonEmptyFlag } from "../../lib/cli/flag-helpers";
+import { inferenceSetRequiredFlagsFailureLines } from "../../lib/cli/inference-set-help";
 import { NemoClawCommand } from "../../lib/cli/nemoclaw-oclif-command";
+import { REASONING_EFFORT_VALUES } from "../../lib/onboard/reasoning-mode";
 
+// Global inference:set is paired with the sandbox-first sandbox:inference:set
+// command; both delegate to the shared runInferenceSet action.
 export default class InferenceSetCommand extends NemoClawCommand {
   static id = "inference:set";
   static strict = true;
@@ -25,7 +18,7 @@ export default class InferenceSetCommand extends NemoClawCommand {
   static description =
     "Update the OpenShell inference route and sync the running OpenClaw or Hermes sandbox config.";
   static usage = [
-    "inference set --provider <provider> --model <model> [--sandbox <name>] [--no-verify] [--endpoint-url <url>] [--credential-env <ENV>] [--inference-api <api>]",
+    "inference set --provider <provider> --model <model> [--sandbox <name>] [--no-verify] [--endpoint-url <url>] [--credential-env <ENV>] [--inference-api <api>] [--reasoning-effort <effort>]",
   ];
   static examples = [
     "<%= config.bin %> inference set --provider nvidia-prod --model nvidia/nemotron-3-super-120b-a12b",
@@ -52,12 +45,17 @@ export default class InferenceSetCommand extends NemoClawCommand {
       description:
         "Trusted API family to persist for compatible custom providers (openai-completions, anthropic-messages, openai-responses)",
     }),
+    "reasoning-effort": Flags.string({
+      description:
+        "Reasoning effort to send in the request body of a compatible OpenAI endpoint (low, medium, high, or default to clear it)",
+      options: [...REASONING_EFFORT_VALUES],
+    }),
   };
 
   public async run(): Promise<void> {
     const { flags } = await this.parse(InferenceSetCommand);
     if (!flags.provider || !flags.model) {
-      this.printOpenShellRedirect();
+      this.printRequiredFlags();
       return;
     }
     try {
@@ -69,6 +67,7 @@ export default class InferenceSetCommand extends NemoClawCommand {
         endpointUrl: flags["endpoint-url"] ?? null,
         credentialEnv: flags["credential-env"] ?? null,
         inferenceApi: flags["inference-api"] ?? null,
+        reasoningEffort: flags["reasoning-effort"] ?? null,
       });
     } catch (error) {
       if (error instanceof InferenceSetError) {
@@ -79,18 +78,9 @@ export default class InferenceSetCommand extends NemoClawCommand {
     }
   }
 
-  private printOpenShellRedirect(): void {
+  private printRequiredFlags(): void {
     this.failWithLines(
-      [
-        `  Unknown ${CLI_NAME} command: inference set`,
-        "",
-        "  This operation belongs to OpenShell.",
-        "  Run: openshell inference set -g nemoclaw --model <model> --provider <provider>",
-        `  To also sync the running sandbox config, pass --provider and --model to ${CLI_NAME} inference set.`,
-        "",
-        `  Run '${CLI_NAME} help' for NemoClaw commands.`,
-      ],
-      1,
+      inferenceSetRequiredFlagsFailureLines("inference set", " [--sandbox <name>]"),
     );
   }
 }

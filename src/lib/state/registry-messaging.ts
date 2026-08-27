@@ -1,13 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { hydrateDerivedSandboxMessagingPlanFields } from "../messaging/hydration";
 import type { SandboxMessagingPlan } from "../messaging/manifest";
+import { compactSandboxMessagingPlanForPersistence } from "../messaging/persistence";
 import {
-  compactSandboxMessagingPlanForPersistence,
-  hydrateDerivedSandboxMessagingPlanFields,
-} from "../messaging/persistence";
-import {
-  getActiveChannelIdsFromPlan,
   getConfiguredChannelIdsFromPlan,
   getDisabledChannelIdsFromPlan,
   parseSandboxMessagingPlan,
@@ -69,12 +66,6 @@ export function getConfiguredMessagingChannelsFromEntry(
   entry: EntryWithMessaging | null | undefined,
 ): string[] {
   return getConfiguredChannelIdsFromPlan(getMessagingPlanFromEntry(entry));
-}
-
-export function getActiveMessagingChannelsFromEntry(
-  entry: EntryWithMessaging | null | undefined,
-): string[] {
-  return getActiveChannelIdsFromPlan(getMessagingPlanFromEntry(entry));
 }
 
 export function getDisabledMessagingChannelsFromEntry(

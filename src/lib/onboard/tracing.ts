@@ -6,7 +6,13 @@ import * as trace from "../trace";
 
 type TraceFn<T> = () => T;
 
-const TRACE_TRUTHY_VALUES = new Set(["1", "true", "yes", "on"]);
+export const ONBOARD_TRACE_PHASE_NAMES = {
+  preflight: "nemoclaw.onboard.phase.preflight",
+  gateway: "nemoclaw.onboard.phase.gateway",
+  providerSelection: "nemoclaw.onboard.phase.provider_selection",
+  inference: "nemoclaw.onboard.phase.inference",
+  sandbox: "nemoclaw.onboard.phase.sandbox",
+} as const;
 
 export interface OnboardTraceOptions {
   resume?: boolean;
@@ -18,14 +24,6 @@ export interface OnboardTraceOptions {
 export interface OnboardTraceHandle {
   collector: ReturnType<typeof trace.getTraceCollector>;
   span: ReturnType<NonNullable<ReturnType<typeof trace.getTraceCollector>>["startSpan"]> | null;
-}
-
-export function isTruthyTraceEnv(value: unknown): boolean {
-  return TRACE_TRUTHY_VALUES.has(
-    String(value ?? "")
-      .trim()
-      .toLowerCase(),
-  );
 }
 
 function hasTracePath(value: unknown): boolean {
@@ -42,7 +40,7 @@ export function startOnboardTrace(
     fresh: opts.fresh === true,
     non_interactive: opts.nonInteractive === true || env.NEMOCLAW_NON_INTERACTIVE === "1",
     agent: opts.agent || env.NEMOCLAW_AGENT || null,
-    trace_enabled: isTruthyTraceEnv(env.NEMOCLAW_TRACE),
+    trace_enabled: trace.isTraceFlagEnabled(env.NEMOCLAW_TRACE),
     trace_file_enabled: hasTracePath(env.NEMOCLAW_TRACE_FILE),
     trace_dir_enabled: hasTracePath(env.NEMOCLAW_TRACE_DIR),
   });
@@ -56,7 +54,7 @@ export function finishOnboardTrace(handle: OnboardTraceHandle, completed: boolea
 }
 
 export function withPreflightTrace<T>(fn: TraceFn<T>): T {
-  return trace.withTraceSpan("nemoclaw.onboard.phase.preflight", {}, fn);
+  return trace.withTraceSpan(ONBOARD_TRACE_PHASE_NAMES.preflight, {}, fn);
 }
 
 export function withGatewayTrace<T>(
@@ -65,7 +63,7 @@ export function withGatewayTrace<T>(
   fn: TraceFn<T>,
 ): T {
   return trace.withTraceSpan(
-    "nemoclaw.onboard.phase.gateway",
+    ONBOARD_TRACE_PHASE_NAMES.gateway,
     { reuse_state: reuseState, gpu_passthrough: gpuPassthrough },
     fn,
   );
@@ -77,7 +75,7 @@ export function withProviderSelectionTrace<T>(
   fn: TraceFn<T>,
 ): T {
   return trace.withTraceSpan(
-    "nemoclaw.onboard.phase.provider_selection",
+    ONBOARD_TRACE_PHASE_NAMES.providerSelection,
     { sandbox_name: sandboxName, agent: agentName ?? null },
     fn,
   );
@@ -91,7 +89,7 @@ export function withInferenceTrace<T>(
   fn: TraceFn<T>,
 ): T {
   return trace.withTraceSpan(
-    "nemoclaw.onboard.phase.inference",
+    ONBOARD_TRACE_PHASE_NAMES.inference,
     { sandbox_name: sandboxName, provider, model, credential_env: credentialEnv },
     fn,
   );
@@ -105,7 +103,7 @@ export function withSandboxPhaseTrace<T>(
   fn: TraceFn<T>,
 ): T {
   return trace.withTraceSpan(
-    "nemoclaw.onboard.phase.sandbox",
+    ONBOARD_TRACE_PHASE_NAMES.sandbox,
     { sandbox_name: sandboxName, provider, model, agent: agentName ?? null },
     fn,
   );
@@ -151,12 +149,12 @@ export function withSandboxReadinessTrace<T>(
 export function withDashboardReadinessTrace<T>(
   sandboxName: string,
   port: string | number,
-  attempts: number,
+  timeoutSeconds: number,
   fn: TraceFn<T>,
 ): T {
   return trace.withTraceSpan(
     "nemoclaw.dashboard.readiness_wait",
-    { sandbox_name: sandboxName, port, attempts },
+    { sandbox_name: sandboxName, port, timeout_seconds: timeoutSeconds },
     fn,
   );
 }

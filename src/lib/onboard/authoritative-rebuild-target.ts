@@ -1,0 +1,276 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+import { findDashboardForwardOwner } from "./dashboard-port";
+import { resolveGatewayName } from "./gateway-binding";
+import type { InferenceRouteState } from "./inference-route";
+import type { PortProbeResult } from "./preflight";
+import { assertDashboardPortNotReserved } from "./preflight-ports";
+import {
+  createProviderRecoveryReceiptLedger,
+  type ProviderRecoveryReceipt,
+  validateRebuildProviderReconfigureHandoff,
+} from "./rebuild-route-handoff";
+import type { OnboardOptions } from "./types";
+
+export type AuthoritativeOnboardGatewayBinding = { name: string; port: number };
+
+export function authoritativeRebuildSandboxFlowOptions(
+  opts: Pick<OnboardOptions, "authoritativeResumeConfig" | "policyTier" | "rebuildPolicyPresets">,
+): {
+  authoritativeResumeConfig: boolean;
+  authoritativePolicyTier?: string | null;
+  rebuildPolicyPresets?: readonly string[];
+} {
+  if (opts.authoritativeResumeConfig !== true) return { authoritativeResumeConfig: false };
+  return {
+    authoritativeResumeConfig: true,
+    authoritativePolicyTier: opts.policyTier ?? null,
+    ...(Array.isArray(opts.rebuildPolicyPresets)
+      ? { rebuildPolicyPresets: [...opts.rebuildPolicyPresets] }
+      : {}),
+  };
+}
+
+export type AuthoritativeGatewayOptions = Pick<
+  OnboardOptions,
+  "authoritativeResumeConfig" | "targetGatewayName" | "targetGatewayPort" | "onboardLockAlreadyHeld"
+>;
+
+export type AuthoritativeRebuildPreflightOptions = Pick<
+  OnboardOptions,
+  "sandboxGpu" | "sandboxGpuDevice" | "noGpu" | "controlUiPort" | "allowDeferredN1xManagedVllm"
+> & {
+  authoritativeResumeConfig: true;
+  /** Internal prepared-backup recovery defers route repair to authoritative onboard. */
+  deferInferenceRouteUntilOnboard?: true;
+  model: string;
+  provider: string;
+  sandboxName: string;
+  targetGatewayName: string;
+  targetGatewayPort: number;
+};
+
+/** Project only the target-bound GPU and N1x intent into runtime preflight. */
+export function authoritativeRebuildRuntimePreflightOptions(
+  opts: AuthoritativeRebuildPreflightOptions,
+): Pick<OnboardOptions, "sandboxGpu" | "sandboxGpuDevice" | "noGpu"> & {
+  allowDeferredN1xManagedVllm: boolean;
+} {
+  return {
+    sandboxGpu: opts.sandboxGpu,
+    sandboxGpuDevice: opts.sandboxGpuDevice,
+    noGpu: opts.noGpu,
+    allowDeferredN1xManagedVllm: opts.allowDeferredN1xManagedVllm === true,
+  };
+}
+
+export function resolveAuthoritativeOnboardGatewayBinding(
+  opts: AuthoritativeGatewayOptions,
+): AuthoritativeOnboardGatewayBinding | null {
+  const hasName =
+    typeof opts.targetGatewayName === "string" && opts.targetGatewayName.trim() !== "";
+  const hasPort = opts.targetGatewayPort !== undefined && opts.targetGatewayPort !== null;
+  if (
+    opts.onboardLockAlreadyHeld === true &&
+    (!opts.authoritativeResumeConfig || !hasName || !hasPort)
+  ) {
+    throw new Error(
+      "The internal onboard lock handoff requires an authoritative rebuild resume with a target gateway.",
+    );
+  }
+  if (!hasName && !hasPort) return null;
+  if (!opts.authoritativeResumeConfig || !hasName || !hasPort) {
+    throw new Error(
+      "An internal target gateway name and port may be supplied only together for an authoritative rebuild resume.",
+    );
+  }
+  const name = opts.targetGatewayName?.trim() ?? "";
+  const port = Number(opts.targetGatewayPort);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(
+      `Invalid authoritative rebuild gateway port '${String(opts.targetGatewayPort)}'.`,
+    );
+  }
+  if (resolveGatewayName(port) !== name) {
+    throw new Error(`Authoritative rebuild gateway '${name}' does not match port ${port}.`);
+  }
+  return { name, port };
+}
+
+export type AuthoritativeRebuildTarget = {
+  deferInferenceRouteUntilOnboard?: true;
+  sandboxName: string;
+  provider: string;
+  model: string;
+  targetGatewayName: string;
+  controlUiPort: number | null;
+};
+
+/** Validate the one-shot authority to reconstruct a provider during a locked rebuild resume. */
+function validateRebuildHandoff(
+  opts: OnboardOptions,
+  target: {
+    sandboxName: string | null;
+    provider: string | null;
+    model: string | null;
+    credentialEnv: string | null;
+    endpointUrl: string | null;
+  },
+): boolean {
+  const handoff = opts.rebuildProviderReconfigure;
+  if (!handoff) return false;
+  if (
+    opts.authoritativeResumeConfig !== true ||
+    opts.resume !== true ||
+    opts.recreateSandbox !== true ||
+    opts.onboardLockAlreadyHeld !== true ||
+    !target.sandboxName ||
+    !target.provider ||
+    !target.model ||
+    !target.credentialEnv
+  ) {
+    throw new Error(
+      "Prepared provider reconfiguration requires an authoritative locked rebuild resume.",
+    );
+  }
+  return validateRebuildProviderReconfigureHandoff(handoff, {
+    sandboxName: target.sandboxName,
+    provider: target.provider,
+    model: target.model,
+    credentialEnv: target.credentialEnv,
+    endpointUrl: target.endpointUrl,
+  });
+}
+
+/** Derive the provider-phase authority from one validated rebuild handoff. */
+export function rebuildProviderFlowOptions(
+  opts: OnboardOptions,
+  target: Parameters<typeof validateRebuildHandoff>[1] & {
+    session?: { sessionId: string } | null;
+    preferredInferenceApi?: string | null;
+  },
+): {
+  authoritativeResumeConfig: boolean;
+  forceInferenceSetup: boolean;
+  providerRecoveryReceipt: ProviderRecoveryReceipt | null;
+  providerRecoveryReceiptLedger: ReturnType<typeof createProviderRecoveryReceiptLedger>;
+} {
+  const authoritativeResumeConfig = opts.authoritativeResumeConfig === true;
+  const providerRecoveryReceiptLedger = createProviderRecoveryReceiptLedger();
+  let providerRecoveryReceipt: ProviderRecoveryReceipt | null = null;
+  if (authoritativeResumeConfig) {
+    const gateway = resolveAuthoritativeOnboardGatewayBinding(opts);
+    if (
+      opts.resume !== true ||
+      opts.recreateSandbox !== true ||
+      opts.onboardLockAlreadyHeld !== true ||
+      !gateway ||
+      !target.sandboxName ||
+      !target.provider ||
+      !target.model
+    ) {
+      throw new Error(
+        "Authoritative provider recovery requires a preflighted locked rebuild resume.",
+      );
+    }
+    const sessionId = target.session?.sessionId ?? null;
+    if (opts.providerRecoveryReceipt && sessionId) {
+      providerRecoveryReceipt = providerRecoveryReceiptLedger.activate(
+        opts.providerRecoveryReceipt,
+        {
+          target: {
+            sandboxName: target.sandboxName,
+            gatewayName: gateway.name,
+            provider: target.provider,
+            model: target.model,
+            route: {
+              provider: target.provider,
+              model: target.model,
+              endpointUrl: target.endpointUrl ?? null,
+              endpointSource: opts.endpointSource ?? null,
+              preferredInferenceApi: target.preferredInferenceApi ?? "",
+              source: "registry",
+            },
+          },
+          sessionId,
+          nowMs: Date.now(),
+        },
+      );
+    }
+  }
+  return {
+    authoritativeResumeConfig,
+    forceInferenceSetup: validateRebuildHandoff(opts, target),
+    providerRecoveryReceipt,
+    providerRecoveryReceiptLedger,
+  };
+}
+
+export type AuthoritativeRebuildTargetDeps = {
+  resolveBaselinePolicy(sandboxName: string): unknown | null;
+  bindGatewayAuthority(): void;
+  runFatalRuntimePreflight(): unknown | Promise<unknown>;
+  ensureOpenshell(): unknown;
+  assertGatewayReadiness(): unknown | Promise<unknown>;
+  inferenceRouteState(provider: string, model: string): InferenceRouteState;
+  captureForwardList(): string | null;
+  checkPort(port: number): Promise<PortProbeResult>;
+  env?: NodeJS.ProcessEnv;
+};
+
+/** Run target-bound readiness and installer checks under an exact process-local gateway scope. */
+export async function preflightAuthoritativeRebuildTarget(
+  target: AuthoritativeRebuildTarget,
+  deps: AuthoritativeRebuildTargetDeps,
+): Promise<void> {
+  const env = deps.env ?? process.env;
+  const previousGateway = env.OPENSHELL_GATEWAY;
+  const fail = (message: string): never => {
+    throw new Error(message);
+  };
+  env.OPENSHELL_GATEWAY = target.targetGatewayName;
+  try {
+    if (!deps.resolveBaselinePolicy(target.sandboxName)) {
+      fail(`Could not read the baseline policy for sandbox '${target.sandboxName}'.`);
+    }
+    deps.bindGatewayAuthority();
+    await deps.runFatalRuntimePreflight();
+    deps.ensureOpenshell();
+    await deps.assertGatewayReadiness();
+    // Prepared-backup recovery can run after the installer has replaced a
+    // legacy gateway. That fresh gateway has no inference route to validate
+    // yet; authoritative onboarding configures and verifies the pinned route
+    // before recreating the sandbox. A gateway that cannot answer at all leaves
+    // the route unknown, which onboarding resolves the same way. Only a gateway
+    // that answers with a different route contradicts the rebuild target.
+    if (
+      target.deferInferenceRouteUntilOnboard !== true &&
+      deps.inferenceRouteState(target.provider, target.model) === "mismatched"
+    ) {
+      fail(
+        `OpenShell inference route does not match provider '${target.provider}' and model '${target.model}'.`,
+      );
+    }
+    if (target.controlUiPort === null) return;
+    assertDashboardPortNotReserved(target.controlUiPort, fail);
+    const owner = findDashboardForwardOwner(
+      deps.captureForwardList(),
+      String(target.controlUiPort),
+    );
+    if (owner && owner !== target.sandboxName) {
+      fail(`Dashboard port ${target.controlUiPort} belongs to sandbox '${owner}'.`);
+    }
+    if (owner) return;
+    const portCheck = await deps.checkPort(target.controlUiPort);
+    if (!portCheck.ok) {
+      const blocker = portCheck.process
+        ? `${portCheck.process}${portCheck.pid ? ` (PID ${portCheck.pid})` : ""}`
+        : portCheck.reason;
+      fail(`Dashboard port ${target.controlUiPort} is occupied by ${blocker}.`);
+    }
+  } finally {
+    if (previousGateway === undefined) delete env.OPENSHELL_GATEWAY;
+    else env.OPENSHELL_GATEWAY = previousGateway;
+  }
+}

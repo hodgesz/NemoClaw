@@ -3,6 +3,8 @@
 
 import fs from "node:fs";
 
+import { sandboxConfigSyncArgs } from "./config-sync";
+
 export interface OpenclawSetupDeps {
   step(n: number, total: number, msg: string): void;
   agentProductName(): string;
@@ -19,6 +21,7 @@ export function createOpenclawSetup(deps: OpenclawSetupDeps) {
     sandboxName: string,
     model: string,
     provider: string,
+    revalidatePolicyRequirements?: (operation: string) => void,
   ): Promise<void> {
     deps.step(7, 8, `Setting up ${deps.agentProductName()} inside sandbox`);
 
@@ -32,7 +35,7 @@ export function createOpenclawSetup(deps: OpenclawSetupDeps) {
       const scriptFile = deps.writeSandboxConfigSyncFile(script);
       try {
         const scriptContent = fs.readFileSync(scriptFile, "utf-8");
-        deps.run(deps.openshellArgv(["sandbox", "connect", sandboxName]), {
+        deps.run(deps.openshellArgv(sandboxConfigSyncArgs(sandboxName)), {
           stdio: ["pipe", "ignore", "inherit"],
           input: scriptContent,
         });
@@ -41,6 +44,7 @@ export function createOpenclawSetup(deps: OpenclawSetupDeps) {
       }
     }
 
+    revalidatePolicyRequirements?.(`publish OpenClaw setup for sandbox '${sandboxName}'`);
     console.log(`  ✓ ${deps.agentProductName()} gateway launched inside sandbox`);
   };
 }

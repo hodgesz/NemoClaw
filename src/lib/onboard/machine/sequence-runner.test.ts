@@ -3,77 +3,29 @@
 
 import { describe, expect, it } from "vitest";
 
-import {
-  createSession,
-  filterSafeUpdates,
-  normalizeSession,
-  sanitizeFailure,
-  type Session,
-  type SessionUpdates,
-} from "../../state/onboard-session";
 import { advanceTo, branchTo, completeOnboardMachine, retryTo } from "./result";
 import { OnboardRuntime, type OnboardRuntimeDeps } from "./runtime";
 import {
   buildOnboardSequenceHandlers,
   DuplicateOnboardSequencePhaseError,
-  runOnboardSequenceWithRunner,
   type OnboardSequencePhase,
+  runOnboardSequenceWithRunner,
 } from "./sequence-runner";
+import {
+  type Session,
+  type SessionUpdates,
+  cloneSession,
+  createSession,
+  createTestRuntime,
+} from "../../../../test/helpers/onboard-machine-runtime-fixture";
+
+function createRuntime(initialSession: Session = createSession()) {
+  return createTestRuntime(initialSession, { now: () => "2026-05-29T00:00:00.000Z" });
+}
 
 interface SequenceContext {
   attempt: number;
   log: string[];
-}
-
-function cloneSession(session: Session): Session {
-  return normalizeSession(JSON.parse(JSON.stringify(session))) ?? session;
-}
-
-function createRuntime(initialSession: Session = createSession()) {
-  let session = cloneSession(initialSession);
-  const updateSession = (mutator: (value: Session) => Session | void): Session => {
-    session = cloneSession(mutator(cloneSession(session)) ?? session);
-    return cloneSession(session);
-  };
-  const deps: OnboardRuntimeDeps = {
-    loadSession: () => cloneSession(session),
-    createSession,
-    saveSession: (next) => {
-      session = cloneSession(next);
-      return cloneSession(session);
-    },
-    updateSession,
-    markStepStarted: () => cloneSession(session),
-    markStepComplete: (_stepName, updates: SessionUpdates = {}) =>
-      updateSession((current) => {
-        Object.assign(current, filterSafeUpdates(updates));
-        return current;
-      }),
-    markStepCompleteRecordOnly: (_stepName, updates: SessionUpdates = {}) =>
-      updateSession((current) => {
-        Object.assign(current, filterSafeUpdates(updates));
-        return current;
-      }),
-    markStepSkipped: () => cloneSession(session),
-    markStepFailed: (stepName, message) =>
-      updateSession((current) => {
-        current.status = "failed";
-        current.failure = sanitizeFailure({ step: stepName, message, recordedAt: "now" });
-        return current;
-      }),
-    markStepFailedRecordOnly: () => cloneSession(session),
-    completeSession: (updates: SessionUpdates = {}) =>
-      updateSession((current) => {
-        Object.assign(current, filterSafeUpdates(updates));
-        current.status = "complete";
-        current.resumable = false;
-        return current;
-      }),
-    filterSafeUpdates,
-    emitEvent: () => undefined,
-    now: () => "2026-05-29T00:00:00.000Z",
-  };
-  return new OnboardRuntime(deps);
 }
 
 function phase(
@@ -85,6 +37,7 @@ function phase(
 
 describe("onboard sequence runner", () => {
   it("runs sequence phases through the strict FSM runner", async () => {
+    const wrappedStates: string[] = [];
     const phases: OnboardSequencePhase<SequenceContext>[] = [
       phase("init", (context) => ({
         context: { ...context, log: [...context.log, "init"] },
@@ -142,6 +95,12 @@ describe("onboard sequence runner", () => {
       context: { attempt: 0, log: [] },
       runtime: createRuntime(),
       phases,
+      phaseProgress: {
+        wrap: (candidate) => {
+          wrappedStates.push(candidate.state);
+          return candidate;
+        },
+      },
     });
 
     expect(result.session).toMatchObject({
@@ -164,6 +123,7 @@ describe("onboard sequence runner", () => {
         "post_verify",
       ],
     });
+    expect(wrappedStates).toEqual(phases.map((candidate) => candidate.state));
   });
 
   it("passes custom sequence ownership through to the runner", async () => {

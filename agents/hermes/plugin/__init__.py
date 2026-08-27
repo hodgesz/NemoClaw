@@ -7,6 +7,10 @@ Provides sandbox status tools, skill hot-reload, managed-tool broker patches,
 and quiet runtime grounding when Hermes runs inside an OpenShell sandbox
 managed by NemoClaw.
 
+Layout: channel-specific runtime overrides live in sibling modules loaded by
+register() only when that channel is configured, so a sandbox without the
+channel carries none of its behavior. Today that is googlechat_adapter.py.
+
 Skill hot-reload: Hermes caches its skill slash-command registry in a
 module-global dict on first scan. New skills dropped on disk are invisible
 until the cache is cleared. This plugin provides a nemoclaw_reload_skills
@@ -22,9 +26,11 @@ chat transcript.
 """
 
 import atexit
+import importlib.util
 import inspect
 import ipaddress
 import json
+import logging
 import os
 import re
 import subprocess
@@ -96,6 +102,7 @@ _MESSAGING_PLATFORMS = (
     "qqbot",
     "yuanbao",
     "webhook",
+    "google_chat",
 )
 _RAW_MESSAGING_TOOL_RE = re.compile(
     r"^\s*send_message\s*:\s*(?P<body>.+?)\s*$",
@@ -322,7 +329,14 @@ def _install_broker_url_safety_patch():
     if browser_tool is not None and hasattr(browser_tool, "_is_safe_url"):
         setattr(browser_tool, "_is_safe_url", _broker_safe_url)
         if hasattr(browser_tool, "_allow_private_urls_resolved"):
-            setattr(browser_tool, "_allow_private_urls_resolved", False)
+            config = _load_hermes_config() or {}
+            security = config.get("security", {}) if isinstance(config, dict) else {}
+            allow_private_urls = (
+                security.get("allow_private_urls") is True
+                if isinstance(security, dict)
+                else False
+            )
+            setattr(browser_tool, "_allow_private_urls_resolved", allow_private_urls)
         patched = True
 
     return patched
@@ -1032,6 +1046,30 @@ def _load_hermes_config():
     return None
 
 
+def _hermes_api_port():
+    """Read the per-sandbox port the OpenAI-compatible API is exposed on.
+
+    NemoClaw allocates this port per sandbox so two Hermes sandboxes can serve
+    inference on one host. The plugin normally inherits the allocated value
+    from the managed supervisor. The root-separated topology also publishes a
+    root-owned marker for processes that do not inherit that environment.
+    """
+    raw = os.environ.get("NEMOCLAW_HERMES_API_PORT", "").strip()
+    if not raw:
+        try:
+            with open("/run/nemoclaw/hermes-api-port") as f:
+                raw = f.read().strip()
+        except OSError:
+            return 8642
+    if re.fullmatch(r"[0-9]+", raw) is None:
+        return 8642
+    try:
+        port = int(raw)
+    except ValueError:
+        return 8642
+    return port if 8642 <= port <= 8652 else 8642
+
+
 def _get_sandbox_info():
     """Gather sandbox status information."""
     hermes_cfg = _load_hermes_config()
@@ -1052,10 +1090,11 @@ def _get_sandbox_info():
         provider = nemoclaw_cfg.get("provider", provider)
 
     # Check gateway health
+    api_port = _hermes_api_port()
     gateway_ok = False
     try:
         result = subprocess.run(
-            ["curl", "-sf", "http://localhost:8642/health"],
+            ["curl", "-sf", f"http://localhost:{api_port}/health"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -1072,7 +1111,7 @@ def _get_sandbox_info():
         "provider": provider,
         "base_url": base_url,
         "gateway": "running" if gateway_ok else "stopped",
-        "port": 8642,
+        "port": api_port,
     }
 
 
@@ -1386,25 +1425,60 @@ def _handle_reload_skills(tool_input=None, context=None, **_kwargs):
     return "\n".join(lines)
 
 
+# Google Chat: the channel owns the override. Source lives in
+# src/lib/messaging/channels/googlechat/runtime/hermes-adapter.py; the Hermes
+# image copies it in beside this file. Loaded only when the channel is
+# configured, so other sandboxes never replace the bundled platform entry.
+_GOOGLE_CHAT_SUBSCRIPTION_ENV = "GOOGLE_CHAT_SUBSCRIPTION_NAME"
+_GOOGLE_CHAT_MODULE = "googlechat_adapter.py"
+
+
+def _install_googlechat_adapter(ctx):
+    """Install the Google Chat override when that channel is configured.
+
+    The module is loaded by path: Hermes imports this plugin as a directory
+    module under a synthetic name, so a relative import has no package context.
+    Load failure must not abort plugin registration, but it has to be visible —
+    without the override the bundled gRPC adapter hangs under the REST-only
+    egress policy and the channel goes quiet with no other clue.
+    """
+    if not _get_env_value(_GOOGLE_CHAT_SUBSCRIPTION_ENV):
+        return False
+    path = os.path.join(os.path.dirname(__file__), _GOOGLE_CHAT_MODULE)
+    try:
+        spec = importlib.util.spec_from_file_location("nemoclaw_hermes_googlechat", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.install(ctx)
+    except Exception:
+        logging.getLogger("gateway.platforms.google_chat").exception(
+            "[GoogleChat][NemoClaw] loading %s failed", _GOOGLE_CHAT_MODULE,
+        )
+        return False
+    return True
+
+
 def register(ctx):
     """Register NemoClaw tools and hooks with Hermes."""
     _install_nous_tool_broker_patch()
     _install_messaging_response_patch()
+    _install_googlechat_adapter(ctx)
 
     # Register status tool
     ctx.register_tool(
         name="nemoclaw_status",
         toolset="nemoclaw",
+        # Pass the bare function object; Hermes wraps it in the
+        # {"type":"function","function":{...}} envelope at request-build time.
+        # Pre-wrapping here double-wraps the tool, which strict providers
+        # (Gemini) reject with HTTP 400 (#7067).
         schema={
-            "type": "function",
-            "function": {
-                "name": "nemoclaw_status",
-                "description": (
-                    "Show NemoClaw sandbox status: agent type, gateway health, "
-                    "model, provider, and inference endpoint."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
+            "name": "nemoclaw_status",
+            "description": (
+                "Show NemoClaw sandbox status: agent type, gateway health, "
+                "model, provider, and inference endpoint."
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
         handler=_handle_status,
         description="NemoClaw sandbox status",
@@ -1415,12 +1489,9 @@ def register(ctx):
         name="nemoclaw_info",
         toolset="nemoclaw",
         schema={
-            "type": "function",
-            "function": {
-                "name": "nemoclaw_info",
-                "description": "Get NemoClaw sandbox info as structured JSON.",
-                "parameters": {"type": "object", "properties": {}},
-            },
+            "name": "nemoclaw_info",
+            "description": "Get NemoClaw sandbox info as structured JSON.",
+            "parameters": {"type": "object", "properties": {}},
         },
         handler=_handle_info,
         description="NemoClaw sandbox info (JSON)",
@@ -1430,28 +1501,25 @@ def register(ctx):
         name="transcribe_audio",
         toolset="audio",
         schema={
-            "type": "function",
-            "function": {
-                "name": "transcribe_audio",
-                "description": (
-                    "Transcribe an audio file that already exists in the Hermes "
-                    "sandbox. In NemoClaw broker mode this uses the managed "
-                    "OpenAI-audio gateway instead of direct OpenAI credentials."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "file_path": {
-                            "type": "string",
-                            "description": "Path to an audio file inside the Hermes sandbox.",
-                        },
-                        "model": {
-                            "type": "string",
-                            "description": "Optional transcription model override.",
-                        },
+            "name": "transcribe_audio",
+            "description": (
+                "Transcribe an audio file that already exists in the Hermes "
+                "sandbox. In NemoClaw broker mode this uses the managed "
+                "OpenAI-audio gateway instead of direct OpenAI credentials."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to an audio file inside the Hermes sandbox.",
                     },
-                    "required": ["file_path"],
+                    "model": {
+                        "type": "string",
+                        "description": "Optional transcription model override.",
+                    },
                 },
+                "required": ["file_path"],
             },
         },
         handler=_handle_transcribe_audio,
@@ -1463,16 +1531,13 @@ def register(ctx):
         name="nemoclaw_reload_skills",
         toolset="nemoclaw",
         schema={
-            "type": "function",
-            "function": {
-                "name": "nemoclaw_reload_skills",
-                "description": (
-                    "Reload and re-discover skills from the skill directories. "
-                    "Call this after new skills have been installed to make them "
-                    "available as slash commands without restarting the gateway."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
+            "name": "nemoclaw_reload_skills",
+            "description": (
+                "Reload and re-discover skills from the skill directories. "
+                "Call this after new skills have been installed to make them "
+                "available as slash commands without restarting the gateway."
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
         handler=_handle_reload_skills,
         description="Reload skills from disk without gateway restart",

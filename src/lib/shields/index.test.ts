@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { execFileSync as nodeExecFileSync } from "node:child_process";
 import fs from "node:fs";
-import path from "node:path";
 import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { testTimeoutOptions } from "../../../test/helpers/timeouts";
 
 // The shields module uses CJS require("./runner") etc., which vitest resolves
 // relative to src/lib/. We mock the absolute paths that vitest will resolve.
@@ -19,7 +21,7 @@ vi.mock("../runner", () => ({
 }));
 
 vi.mock("../policy", () => ({
-  buildPolicyGetCommand: vi.fn((name) => ["openshell", "policy", "get", "--full", name]),
+  buildPolicyGetCommand: vi.fn((name) => ["openshell", "policy", "get", "--base", name]),
   buildPolicySetCommand: vi.fn((file, name) => [
     "openshell",
     "policy",
@@ -34,18 +36,39 @@ vi.mock("../policy", () => ({
   resolvePermissivePolicyPath: vi.fn(() => "/mock/permissive.yaml"),
 }));
 
-vi.mock("../sandbox/config", () => ({
+vi.mock("../sandbox/agent-config", () => ({
+  resolveAgentStateLockContract: vi.fn(() => ({
+    stateLockPlan: {
+      version: 1,
+      readOnlyRoots: ["skills"],
+      confidentialRoots: [],
+      readOnlyPrefixes: [],
+      confidentialPrefixes: [],
+      writableSubpaths: [],
+    },
+    stateLockPlanInImage: true,
+  })),
   resolveAgentConfig: vi.fn(() => ({
     agentName: "openclaw",
     configPath: "/sandbox/.openclaw/openclaw.json",
     configDir: "/sandbox/.openclaw",
     format: "json",
     configFile: "openclaw.json",
+    stateLockPlan: {
+      version: 1,
+      readOnlyRoots: ["skills"],
+      confidentialRoots: [],
+      readOnlyPrefixes: [],
+      confidentialPrefixes: [],
+      writableSubpaths: [],
+    },
+    stateLockPlanInImage: true,
   })),
 }));
 
 vi.mock("../adapters/docker/exec", () => ({
   dockerExecFileSync: vi.fn((_argv: string[]) => ""),
+  dockerSpawnSync: vi.fn(() => ({ status: 1, stdout: "", stderr: "" })),
 }));
 
 vi.mock("./audit", () => ({
@@ -53,7 +76,13 @@ vi.mock("./audit", () => ({
 }));
 
 vi.mock("child_process", () => ({
-  fork: vi.fn(() => ({ pid: 12345, disconnect: vi.fn(), unref: vi.fn() })),
+  fork: vi.fn(() => ({
+    pid: 12345,
+    disconnect: vi.fn(),
+    unref: vi.fn(),
+    send: vi.fn(() => true),
+    kill: vi.fn(() => true),
+  })),
   execFileSync: vi.fn(),
   spawnSync: vi.fn(() => ({
     status: 0,
@@ -63,7 +92,7 @@ vi.mock("child_process", () => ({
 }));
 
 vi.mock("node:child_process", () => ({
-  execFileSync: vi.fn(() => ""),
+  execFileSync: vi.fn(),
   spawnSync: vi.fn(() => ({
     status: 0,
     stdout: "",
@@ -74,11 +103,84 @@ vi.mock("node:child_process", () => ({
 
 let tmpDir: string;
 
+type NodeExecFileSyncMock = ReturnType<typeof vi.fn>;
+
+function defaultNodeExecFileSync(file: string, argv?: readonly string[]): string {
+  const args = Array.isArray(argv) ? argv : [];
+  return file === "ps" && args.includes("lstart=") ? "Mon Jan 01 00:00:00 2026" : "";
+}
+
+function setNodeExecFileSyncMock(
+  implementation: (file: string, argv?: readonly string[]) => string = defaultNodeExecFileSync,
+): void {
+  (nodeExecFileSync as unknown as NodeExecFileSyncMock).mockImplementation(implementation);
+}
+
+function withDefaultNodeExecFileSync(
+  file: string,
+  argv: readonly string[] | undefined,
+  fallback: () => string,
+): string {
+  return defaultNodeExecFileSync(file, argv) || fallback();
+}
+
+function throwErrno(message: string, code: string): never {
+  const error = new Error(message) as NodeJS.ErrnoException;
+  error.code = code;
+  throw error;
+}
+function throwRegistryPermissionDenied(): never {
+  throw Object.assign(new Error("registry permission denied"), { code: "EACCES" });
+}
+
+function readFileWithUnreadableRegistry(
+  originalReadFileSync: typeof fs.readFileSync,
+  file: fs.PathOrFileDescriptor,
+  options?: unknown,
+): unknown {
+  const readers = new Map<boolean, () => unknown>([
+    [true, throwRegistryPermissionDenied],
+    [false, () => originalReadFileSync(file, options as never)],
+  ]);
+  return readers.get(String(file).endsWith(`${path.sep}sandboxes.json`))!();
+}
+
+function throwProcessNotRunning(): never {
+  throw Object.assign(new Error("not running"), { code: "ESRCH" });
+}
+
+function reportProcessRunning(): true {
+  return true;
+}
+
+function routeProcessKill(pid: number, signal?: string | number): true {
+  const processActions = new Map<string, () => true>([["2147483647:0", throwProcessNotRunning]]);
+  return (processActions.get(`${pid}:${signal}`) ?? reportProcessRunning)();
+}
+
+function readRuntimePolicyBeforeCleanup(
+  cleanupDir: string,
+  readFile: typeof fs.readFileSync,
+): string | null {
+  switch (
+    path.basename(cleanupDir).startsWith("nemoclaw-permissive-runtime-") &&
+    fs.existsSync(cleanupDir)
+  ) {
+    case false:
+      return null;
+    case true: {
+      const policyFile = fs.readdirSync(cleanupDir).find((name) => name.endsWith(".yaml"));
+      return policyFile ? readFile(path.join(cleanupDir, policyFile), "utf-8") : null;
+    }
+  }
+}
+
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "shields-test-"));
   vi.stubEnv("HOME", tmpDir);
   vi.resetModules();
   vi.clearAllMocks();
+  setNodeExecFileSyncMock();
 });
 
 afterEach(() => {
@@ -273,9 +375,9 @@ describe("shields — unit logic", () => {
         },
       ];
 
-      for (const entry of entries) {
+      entries.forEach((entry) => {
         fs.appendFileSync(auditPath, JSON.stringify(entry) + "\n");
-      }
+      });
 
       const lines = fs.readFileSync(auditPath, "utf-8").trim().split("\n");
       expect(lines).toHaveLength(2);
@@ -286,26 +388,38 @@ describe("shields — unit logic", () => {
 
   // NOTE: Integration tests that call the real shieldsDown/shieldsUp are not
   // feasible here because shields.ts uses CJS require() which doesn't resolve
-  // through vitest's ESM mock system. The full call chain is exercised by the
-  // E2E test (test/e2e/test-shields-config.sh) against a live sandbox.
+  // through vitest's ESM mock system. The full call chain is exercised by
+  // `test/e2e/live/shields-config.test.ts` against a live sandbox.
 
   // -------------------------------------------------------------------
   // NC-2227-02: Three-state shields model
   // -------------------------------------------------------------------
   describe("NC-2227-02: three-state shields model", () => {
-    it("deriveShieldsMode encodes the fresh, locked, unlocked, and legacy-state cases", async () => {
-      const distModulePath = path.join(process.cwd(), "dist", "lib", "shields", "index.js");
-      const { deriveShieldsMode } = await import(distModulePath);
+    // The first source import instruments the full shields dependency graph.
+    // Loaded coverage shards can spend well beyond the unit-test default here.
+    it(
+      "deriveShieldsMode encodes the fresh, locked, unlocked, and legacy-state cases",
+      testTimeoutOptions(30_000),
+      async () => {
+        const sourceModulePath = path.join(process.cwd(), "src", "lib", "shields", "index.ts");
+        const { deriveShieldsMode } = await import(sourceModulePath);
 
-      expect(deriveShieldsMode({}, false)).toBe("mutable_default");
-      expect(deriveShieldsMode({ shieldsDown: true }, true)).toBe("temporarily_unlocked");
-      expect(deriveShieldsMode({ shieldsDown: false }, true)).toBe("locked");
-      expect(deriveShieldsMode({}, true)).toBe("mutable_default");
-    });
+        expect(deriveShieldsMode({}, false)).toBe("mutable_default");
+        expect(deriveShieldsMode({ shieldsDown: true }, true)).toBe("temporarily_unlocked");
+        expect(
+          deriveShieldsMode(
+            { shieldsDown: true, policyRecoveryConfigLocked: true },
+            true,
+          ),
+        ).toBe("locked_recovery");
+        expect(deriveShieldsMode({ shieldsDown: false }, true)).toBe("locked");
+        expect(deriveShieldsMode({}, true)).toBe("mutable_default");
+      },
+    );
 
     it("getShieldsPosture exposes canonical status wording for callers", async () => {
-      const distModulePath = path.join(process.cwd(), "dist", "lib", "shields", "index.js");
-      const { getShieldsPosture } = await import(distModulePath);
+      const sourceModulePath = path.join(process.cwd(), "src", "lib", "shields", "index.ts");
+      const { getShieldsPosture } = await import(sourceModulePath);
       const stateDir = path.join(tmpDir, ".nemoclaw", "state");
       fs.mkdirSync(stateDir, { recursive: true });
 
@@ -351,9 +465,11 @@ describe("shields — unit logic", () => {
   });
 
   describe("NC-3112: status self-heals stale expired auto-restore markers", () => {
+    const readyPolicyRecovery = () => ({ status: "ready" as const });
+
     async function loadShieldsModule() {
-      const distModulePath = path.join(process.cwd(), "dist", "lib", "shields", "index.js");
-      return import(distModulePath);
+      const sourceModulePath = path.join(process.cwd(), "src", "lib", "shields", "index.ts");
+      return import(sourceModulePath);
     }
 
     function stateDir(): string {
@@ -378,7 +494,7 @@ describe("shields — unit logic", () => {
       );
     }
 
-    it("shieldsStatus attempts inline recovery for expired marker when timer PID is dead", async () => {
+    it("shieldsStatus attempts inline recovery for an expired timer marker", async () => {
       const sandboxName = "openclaw";
       const configPath = "/sandbox/.openclaw/openclaw.json";
       const hashPath = "/sandbox/.openclaw/.config-hash";
@@ -414,41 +530,178 @@ describe("shields — unit logic", () => {
         });
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const dockerExecFileSync = (await import("node:child_process")).execFileSync as ReturnType<
-        typeof vi.fn
-      >;
-      dockerExecFileSync.mockImplementation((_file: string, argv?: readonly string[]) => {
-        const cmd = Array.isArray(argv) ? argv.join(" ") : "";
-        if (cmd.includes(` stat -c %a %U:%G ${hashPath}`)) {
-          return "444 root:root";
-        }
-        if (cmd.includes(` stat -c %a %U:%G ${configPath}`)) {
-          return "444 root:root";
-        }
-        if (cmd.includes(` lsattr -d ${hashPath}`)) {
-          return `----i---------e----- ${hashPath}`;
-        }
-        if (cmd.includes(" stat -c %a %U:%G /sandbox/.openclaw")) {
-          return "755 root:root";
-        }
-        if (cmd.includes(` lsattr -d ${configPath}`)) {
-          return `----i---------e----- ${configPath}`;
-        }
-        return "";
-      });
+      setNodeExecFileSyncMock((_file: string, argv?: readonly string[]) =>
+        withDefaultNodeExecFileSync(_file, argv, () => {
+          const cmd = Array.isArray(argv) ? argv.join(" ") : "";
+          if (cmd.includes(` stat -c %a %U:%G ${hashPath}`)) {
+            return "444 root:root";
+          }
+          if (cmd.includes(` stat -c %a %U:%G ${configPath}`)) {
+            return "444 root:root";
+          }
+          if (cmd.includes(` lsattr -d ${hashPath}`)) {
+            return `----i---------e----- ${hashPath}`;
+          }
+          if (cmd.includes(" stat -c %a %U:%G /sandbox/.openclaw")) {
+            return "755 root:root";
+          }
+          if (cmd.includes(` lsattr -d ${configPath}`)) {
+            return `----i---------e----- ${configPath}`;
+          }
+          return "";
+        }),
+      );
 
       const { shieldsStatus } = await loadShieldsModule();
 
-      shieldsStatus(sandboxName);
+      shieldsStatus(sandboxName, true, { inspectPolicyRecovery: readyPolicyRecovery });
 
-      expect(processKillSpy).toHaveBeenCalledWith(4242, 0);
+      expect(processKillSpy).not.toHaveBeenCalled();
       expect(errorSpy).toHaveBeenCalledWith(
-        "  Warning: auto-restore timer marker is expired and the timer process is not the recorded shields timer; attempting inline restore.",
+        "  Warning: auto-restore timer authority is expired, invalid, or no longer live; attempting inline restore.",
       );
       expect(logSpy).toHaveBeenCalledWith("  Shields: DOWN (temporarily unlocked)");
     });
 
-    it("shieldsStatus warns and stays DOWN when inline recovery fails", async () => {
+    it("deadline composition removes an unproven MCP add from the restrictive policy", async () => {
+      const snapshot =
+        "version: 1\nnetwork_policies:\n  restrictive_baseline: {}\n  mcp_bridge_beta: {}\n";
+      const { composeDeadlineManagedMcpPolicies } = await import("./mcp-policy-transition");
+      const composition = composeDeadlineManagedMcpPolicies(snapshot, [], ["mcp_bridge_beta"]);
+
+      expect(composition.yaml).toContain("restrictive_baseline");
+      expect(composition.yaml).not.toContain("mcp_bridge_beta");
+    });
+
+    it("deadline restore refuses policy mutation when authority cannot be read (#9833)", async () => {
+      const sandboxName = "openclaw";
+      const processToken = "b".repeat(32);
+      const snapshotPath = path.join(stateDir(), "policy-snapshot-unreadable-registry.yaml");
+      fs.mkdirSync(stateDir(), { recursive: true });
+      fs.writeFileSync(
+        snapshotPath,
+        "version: 1\nnetwork_policies:\n  restrictive_baseline: {}\n  mcp_bridge_alpha: {}\n",
+      );
+      writeState(sandboxName, {
+        shieldsDown: true,
+        shieldsPolicySnapshotPath: snapshotPath,
+        shieldsManagedMcpPolicyKeys: ["mcp_bridge_alpha"],
+      });
+      writeMarker(sandboxName, {
+        pid: 2_147_483_647,
+        sandboxName,
+        snapshotPath,
+        restoreAt: new Date(Date.now() - 1_000).toISOString(),
+        processToken,
+      });
+      const originalReadFileSync = fs.readFileSync.bind(fs);
+      vi.spyOn(fs, "readFileSync").mockImplementation((file, options) => {
+        return readFileWithUnreadableRegistry(originalReadFileSync, file, options) as never;
+      });
+      vi.spyOn(process, "kill").mockImplementation(routeProcessKill);
+      const originalRmSync = fs.rmSync.bind(fs);
+      let appliedPolicy = "";
+      vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+        const cleanupDir = String(target);
+        appliedPolicy =
+          readRuntimePolicyBeforeCleanup(cleanupDir, originalReadFileSync) ?? appliedPolicy;
+        originalRmSync(target, options);
+      });
+      const { applyShieldsPolicySnapshot } = await loadShieldsModule();
+      const { run } = await import("../runner");
+
+      expect(() =>
+        applyShieldsPolicySnapshot(sandboxName, snapshotPath, {
+          transitionProcessToken: processToken,
+          deadlineAuthoritative: true,
+          expiredTimerRecovery: true,
+        }),
+      ).toThrow(/policy authority/i);
+
+      expect(run).not.toHaveBeenCalled();
+      expect(appliedPolicy).toBe("");
+    });
+
+    it("auto-restore refuses before policy staging when authority is unavailable (#9833)", async () => {
+      const sandboxName = "openclaw";
+      const processToken = "d".repeat(32);
+      const snapshotPath = path.join(stateDir(), "policy-snapshot-no-managed-mcp.yaml");
+      fs.mkdirSync(stateDir(), { recursive: true });
+      fs.writeFileSync(snapshotPath, "version: 1\nnetwork_policies:\n  restrictive_baseline: {}\n");
+      writeState(sandboxName, {
+        shieldsDown: true,
+        shieldsPolicySnapshotPath: snapshotPath,
+        shieldsManagedMcpPolicyKeys: [],
+      });
+      writeMarker(sandboxName, {
+        pid: 2_147_483_647,
+        sandboxName,
+        snapshotPath,
+        restoreAt: new Date(Date.now() - 1_000).toISOString(),
+        processToken,
+      });
+      vi.spyOn(process, "kill").mockImplementation(routeProcessKill);
+      const { applyShieldsPolicySnapshot } = await loadShieldsModule();
+      const { run } = await import("../runner");
+      const createTempDirectory = vi.spyOn(fs, "mkdtempSync").mockImplementation(() => {
+        throw Object.assign(new Error("ENOSPC: simulated temporary storage full"), {
+          code: "ENOSPC",
+        });
+      });
+
+      expect(() =>
+        applyShieldsPolicySnapshot(sandboxName, snapshotPath, {
+          transitionProcessToken: processToken,
+          deadlineAuthoritative: true,
+          expiredTimerRecovery: true,
+        }),
+      ).toThrow(/policy authority is unavailable/i);
+
+      expect(createTempDirectory).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    });
+
+    it("reuses the snapshot without staging when the snapshot and current policy have no managed MCP entries (#7952)", async () => {
+      const snapshotPath = "/state/policy-snapshot-no-managed-mcp.yaml";
+      const snapshotYaml = "version: 1\nnetwork_policies:\n  restrictive_baseline: {}\n";
+      const writeTempPolicy = vi.fn(() => {
+        throw new Error("policy staging is unavailable");
+      });
+      const { buildDeadlineRuntimeManagedMcpPolicy } = await import("./permissive-runtime");
+
+      const result = buildDeadlineRuntimeManagedMcpPolicy(snapshotPath, {
+        managedMcpPolicies: [],
+        snapshotManagedPolicyKeys: [],
+        readBasePolicy: () => snapshotYaml,
+        writeTempPolicy,
+      });
+
+      expect(result).toEqual({ path: snapshotPath, omissions: [] });
+      expect(writeTempPolicy).not.toHaveBeenCalled();
+    });
+
+    it("deadline restore reuses an unchanged snapshot without temporary storage when no managed MCP entries exist (#7952)", async () => {
+      const snapshotPath = path.join(stateDir(), "policy-snapshot-no-managed-mcp.yaml");
+      fs.mkdirSync(stateDir(), { recursive: true });
+      fs.writeFileSync(snapshotPath, "version: 1\nnetwork_policies:\n  restrictive_baseline: {}\n");
+      const createTempDirectory = vi.spyOn(fs, "mkdtempSync").mockImplementation(() => {
+        throw Object.assign(new Error("ENOSPC: simulated temporary storage full"), {
+          code: "ENOSPC",
+        });
+      });
+      const { buildDeadlineRuntimeManagedMcpPolicy } = await import("./permissive-runtime");
+
+      const result = buildDeadlineRuntimeManagedMcpPolicy(snapshotPath, {
+        managedMcpPolicies: [],
+        snapshotManagedPolicyKeys: [],
+        readBasePolicy: () => fs.readFileSync(snapshotPath, "utf-8"),
+      });
+
+      expect(result).toEqual({ path: snapshotPath, omissions: [] });
+      expect(createTempDirectory).not.toHaveBeenCalled();
+    });
+
+    it("shieldsStatus warns and stays DOWN when the restrictive snapshot is missing", async () => {
       const sandboxName = "openclaw";
       const missingSnapshotPath = path.join(stateDir(), "missing-snapshot.yaml");
       writeState(sandboxName, {
@@ -480,15 +733,52 @@ describe("shields — unit logic", () => {
 
       const { shieldsStatus } = await loadShieldsModule();
 
-      shieldsStatus(sandboxName);
+      shieldsStatus(sandboxName, true, { inspectPolicyRecovery: readyPolicyRecovery });
 
       expect(logSpy).toHaveBeenCalledWith("  Shields: DOWN (temporarily unlocked)");
       expect(errorSpy).toHaveBeenCalledWith(
-        "  Recovery warning: inline auto-restore failed; shields remain DOWN.",
+        "  Recovery warning: DOWN state has no usable timer authority or restrictive policy snapshot.",
       );
-      expect(errorSpy).toHaveBeenCalledWith(
-        `  Recovery warning: run \`nemoclaw ${sandboxName} shields up\` manually.`,
+      expect(fs.existsSync(path.join(stateDir(), `shields-timer-${sandboxName}.json`))).toBe(true);
+    });
+
+    it("runs portable-command validation under the expired-timer deadline gate before recovery (#9738)", async () => {
+      const sandboxName = "openclaw";
+      const processToken = "c".repeat(32);
+      const missingSnapshotPath = path.join(stateDir(), "missing-current-snapshot.yaml");
+      writeState(sandboxName, {
+        shieldsDown: true,
+        shieldsDownAt: new Date(Date.now() - 60_000).toISOString(),
+        shieldsDownTimeout: 300,
+        shieldsDownReason: "testing",
+        shieldsDownPolicy: "permissive",
+        shieldsPolicySnapshotPath: missingSnapshotPath,
+        updatedAt: new Date().toISOString(),
+      });
+      writeMarker(sandboxName, {
+        pid: 2_147_483_647,
+        sandboxName,
+        snapshotPath: missingSnapshotPath,
+        restoreAt: new Date(Date.now() - 30_000).toISOString(),
+        processToken,
+      });
+      vi.spyOn(process, "kill").mockImplementation(routeProcessKill);
+      vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const { shieldsStatus } = await loadShieldsModule();
+      const { getMcpLifecycleLockPath } = await import("../state/mcp-lifecycle-lock");
+      const lockPath = getMcpLifecycleLockPath(sandboxName, stateDir());
+      const assertCommandAvailable = vi.fn(() => {
+        expect(fs.existsSync(lockPath)).toBe(true);
+        expect(fs.existsSync(`${lockPath}.deadline`)).toBe(true);
+      });
+
+      expect(() => shieldsStatus(sandboxName, true, { assertCommandAvailable })).toThrow(
+        "Inline auto-restore exhausted 7 attempts",
       );
+      expect(assertCommandAvailable).toHaveBeenCalledOnce();
+      expect(fs.existsSync(`${lockPath}.containment`)).toBe(true);
       expect(fs.existsSync(path.join(stateDir(), `shields-timer-${sandboxName}.json`))).toBe(true);
     });
 
@@ -535,34 +825,33 @@ describe("shields — unit logic", () => {
 
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const dockerExecFileSync = (await import("node:child_process")).execFileSync as ReturnType<
-        typeof vi.fn
-      >;
-      dockerExecFileSync.mockImplementation((_file: string, argv?: readonly string[]) => {
-        const cmd = Array.isArray(argv) ? argv.join(" ") : "";
-        if (cmd.includes(" stat -c %a %U:%G /sandbox/.openclaw/.config-hash")) {
-          return "444 root:root";
-        }
-        if (cmd.includes(" stat -c %a %U:%G /sandbox/.openclaw/openclaw.json")) {
-          return "444 root:root";
-        }
-        if (cmd.includes(" lsattr -d /sandbox/.openclaw/.config-hash")) {
-          return "----i---------e----- /sandbox/.openclaw/.config-hash";
-        }
-        if (cmd.includes(" stat -c %a %U:%G /sandbox/.openclaw")) {
-          return "755 root:root";
-        }
-        if (cmd.includes(" lsattr -d /sandbox/.openclaw/openclaw.json")) {
-          return "----i---------e----- /sandbox/.openclaw/openclaw.json";
-        }
-        return "";
-      });
+      setNodeExecFileSyncMock((_file: string, argv?: readonly string[]) =>
+        withDefaultNodeExecFileSync(_file, argv, () => {
+          const cmd = Array.isArray(argv) ? argv.join(" ") : "";
+          if (cmd.includes(" stat -c %a %U:%G /sandbox/.openclaw/.config-hash")) {
+            return "444 root:root";
+          }
+          if (cmd.includes(" stat -c %a %U:%G /sandbox/.openclaw/openclaw.json")) {
+            return "444 root:root";
+          }
+          if (cmd.includes(" lsattr -d /sandbox/.openclaw/.config-hash")) {
+            return "----i---------e----- /sandbox/.openclaw/.config-hash";
+          }
+          if (cmd.includes(" stat -c %a %U:%G /sandbox/.openclaw")) {
+            return "755 root:root";
+          }
+          if (cmd.includes(" lsattr -d /sandbox/.openclaw/openclaw.json")) {
+            return "----i---------e----- /sandbox/.openclaw/openclaw.json";
+          }
+          return "";
+        }),
+      );
 
       const { shieldsStatus } = await loadShieldsModule();
-      shieldsStatus(sandboxName);
+      shieldsStatus(sandboxName, true, { inspectPolicyRecovery: readyPolicyRecovery });
 
       expect(errorSpy).toHaveBeenCalledWith(
-        "  Warning: auto-restore timer marker is expired and the timer process is not the recorded shields timer; attempting inline restore.",
+        "  Warning: auto-restore timer authority is expired, invalid, or no longer live; attempting inline restore.",
       );
       expect(logSpy).toHaveBeenCalledWith("  Shields: DOWN (temporarily unlocked)");
     });
@@ -610,6 +899,9 @@ describe("shields — unit logic", () => {
       const { shieldsStatus } = await loadShieldsModule();
       expect(() => shieldsStatus(sandboxName)).toThrow("exit 1");
       expect(errorSpy).toHaveBeenCalledWith("  Shields: ERROR (state file is corrupt)");
+      expect(errorSpy).toHaveBeenCalledWith(
+        "  Recovery warning: restore trusted state for openclaw before retrying.",
+      );
       expect(exitSpy).toHaveBeenCalledWith(1);
     });
   });
@@ -619,8 +911,8 @@ describe("shields — unit logic", () => {
   // -------------------------------------------------------------------
   describe("shieldsStatus surfaces drift returned by the verifier", () => {
     async function loadShieldsModule() {
-      const distModulePath = path.join(process.cwd(), "dist", "lib", "shields", "index.js");
-      return import(distModulePath);
+      const sourceModulePath = path.join(process.cwd(), "src", "lib", "shields", "index.ts");
+      return import(sourceModulePath);
     }
 
     function stateDir(): string {
@@ -673,10 +965,12 @@ describe("shields — unit logic", () => {
       expect(() =>
         shieldsStatus(sandboxName, true, {
           verifyLockState: () => ({ ok: false, issues: driftIssues }),
+          verifyStateLockPlan: () => [],
           resolveConfig: () => ({
             agentName: "openclaw",
             configPath: "/sandbox/.openclaw/openclaw.json",
             configDir: "/sandbox/.openclaw",
+            stateLockPlanInImage: true,
           }),
         }),
       ).toThrow("exit 2");
@@ -685,9 +979,9 @@ describe("shields — unit logic", () => {
         "  Shields: UP (DRIFTED — declared locked but sandbox filesystem differs)",
       );
       expect(errorSpy).toHaveBeenCalledWith("  Drift:");
-      for (const issue of driftIssues) {
+      driftIssues.forEach((issue) => {
         expect(errorSpy).toHaveBeenCalledWith(`    - ${issue}`);
-      }
+      });
       expect(errorSpy).toHaveBeenCalledWith(
         `  Recovery: nemoclaw ${sandboxName} shields up   # re-lock and re-verify`,
       );
@@ -703,6 +997,7 @@ describe("shields — unit logic", () => {
       const { shieldsStatus } = await loadShieldsModule();
       shieldsStatus(sandboxName, true, {
         verifyLockState: () => ({ ok: true, issues: [] }),
+        verifyStateLockPlan: () => [],
         resolveConfig: () => ({
           agentName: "openclaw",
           configPath: "/sandbox/.openclaw/openclaw.json",
@@ -742,6 +1037,7 @@ describe("shields — unit logic", () => {
 
       const { shieldsStatus } = await loadShieldsModule();
       shieldsStatus(sandboxName, true, {
+        verifyStateLockPlan: () => [],
         verifyLockState: (
           _name: string,
           _target: unknown,
@@ -779,6 +1075,7 @@ describe("shields — unit logic", () => {
       expect(() =>
         shieldsStatus(sandboxName, true, {
           verifyLockState: () => ({ ok: true, issues: [] }),
+          verifyStateLockPlan: () => [],
           resolveConfig: () => ({
             agentName: "openclaw",
             configPath: "/sandbox/.openclaw/openclaw.json",
@@ -814,6 +1111,7 @@ describe("shields — unit logic", () => {
       expect(() =>
         shieldsStatus(sandboxName, true, {
           verifyLockState: () => ({ ok: false, issues: driftIssues }),
+          verifyStateLockPlan: () => [],
           resolveConfig: () => ({
             agentName: "openclaw",
             configPath: "/sandbox/.openclaw/openclaw.json",
@@ -844,6 +1142,7 @@ describe("shields — unit logic", () => {
       expect(() =>
         shieldsStatus(sandboxName, true, {
           verifyLockState: () => ({ ok: false, issues: driftIssues }),
+          verifyStateLockPlan: () => [],
           resolveConfig: () => ({
             agentName: "openclaw",
             configPath: "/sandbox/.openclaw/openclaw.json",
@@ -874,6 +1173,7 @@ describe("shields — unit logic", () => {
       expect(() =>
         shieldsStatus(sandboxName, true, {
           verifyLockState: () => ({ ok: true, issues: [] }),
+          verifyStateLockPlan: () => [],
           resolveConfig: () => {
             throw new Error("agent config not found");
           },
@@ -892,8 +1192,8 @@ describe("shields — unit logic", () => {
 // -------------------------------------------------------------------
 describe("NC-2227-05: shields timer marker behavior", () => {
   it("readTimerMarker rejects invalid marker pid values", async () => {
-    const distModulePath = path.join(process.cwd(), "dist", "lib", "shields", "timer-control.js");
-    const { readTimerMarker } = await import(distModulePath);
+    const sourceModulePath = path.join(process.cwd(), "src", "lib", "shields", "timer-control.ts");
+    const { readTimerMarker } = await import(sourceModulePath);
     const stateDir = path.join(tmpDir, ".nemoclaw", "state");
     fs.mkdirSync(stateDir, { recursive: true });
     const markerPath = path.join(stateDir, "shields-timer-openclaw.json");
@@ -921,9 +1221,9 @@ describe("NC-2227-05: shields timer marker behavior", () => {
     expect(readTimerMarker("openclaw")).toBeNull();
   });
 
-  it("killTimer terminates verified live timer process and clears marker", async () => {
-    const distModulePath = path.join(process.cwd(), "dist", "lib", "shields", "timer-control.js");
-    const { killTimer } = await import(distModulePath);
+  it("killTimer cooperatively revokes a verified live timer without signaling it", async () => {
+    const sourceModulePath = path.join(process.cwd(), "src", "lib", "shields", "timer-control.ts");
+    const { killTimer } = await import(sourceModulePath);
     const stateDir = path.join(tmpDir, ".nemoclaw", "state");
     fs.mkdirSync(stateDir, { recursive: true });
     fs.writeFileSync(
@@ -964,20 +1264,21 @@ describe("NC-2227-05: shields timer marker behavior", () => {
     const result = killTimer("openclaw");
 
     expect(result).toEqual({
+      authorityRevoked: true,
       markerFound: true,
       markerPid: 7331,
       wasAlive: true,
-      terminated: true,
+      terminated: false,
       warnings: [],
     });
     expect(processKillSpy).toHaveBeenCalledWith(7331, 0);
-    expect(processKillSpy).toHaveBeenCalledWith(7331, "SIGTERM");
+    expect(processKillSpy).toHaveBeenCalledTimes(1);
     expect(fs.existsSync(path.join(stateDir, "shields-timer-openclaw.json"))).toBe(false);
   });
 
   it("killTimer does not signal a live PID when marker identity mismatches and still clears marker", async () => {
-    const distModulePath = path.join(process.cwd(), "dist", "lib", "shields", "timer-control.js");
-    const { killTimer } = await import(distModulePath);
+    const sourceModulePath = path.join(process.cwd(), "src", "lib", "shields", "timer-control.ts");
+    const { killTimer } = await import(sourceModulePath);
     const stateDir = path.join(tmpDir, ".nemoclaw", "state");
     fs.mkdirSync(stateDir, { recursive: true });
     fs.writeFileSync(
@@ -1027,8 +1328,8 @@ describe("NC-2227-05: shields timer marker behavior", () => {
   });
 
   it("killTimer clears stale marker even when PID is not alive", async () => {
-    const distModulePath = path.join(process.cwd(), "dist", "lib", "shields", "timer-control.js");
-    const { killTimer } = await import(distModulePath);
+    const sourceModulePath = path.join(process.cwd(), "src", "lib", "shields", "timer-control.ts");
+    const { killTimer } = await import(sourceModulePath);
     const stateDir = path.join(tmpDir, ".nemoclaw", "state");
     fs.mkdirSync(stateDir, { recursive: true });
     const markerPath = path.join(stateDir, "shields-timer-openclaw.json");
@@ -1055,6 +1356,7 @@ describe("NC-2227-05: shields timer marker behavior", () => {
 
     const result = killTimer("openclaw");
     expect(result).toEqual({
+      authorityRevoked: true,
       markerFound: true,
       markerPid: 7331,
       wasAlive: false,
@@ -1065,13 +1367,120 @@ describe("NC-2227-05: shields timer marker behavior", () => {
     expect(fs.existsSync(markerPath)).toBe(false);
   });
 
-  it("isShieldsDown fails closed when shields state is corrupt", async () => {
-    const distModulePath = path.join(process.cwd(), "dist", "lib", "shields", "index.js");
-    const { isShieldsDown } = await import(distModulePath);
+  it("killTimer reports active authority when the marker cannot be cleared", async () => {
+    const sourceModulePath = path.join(process.cwd(), "src", "lib", "shields", "timer-control.ts");
+    const { killTimer } = await import(sourceModulePath);
     const stateDir = path.join(tmpDir, ".nemoclaw", "state");
     fs.mkdirSync(stateDir, { recursive: true });
-    fs.writeFileSync(path.join(stateDir, "shields-openclaw.json"), "{broken-json");
+    const markerPath = path.join(stateDir, "shields-timer-openclaw.json");
+    fs.writeFileSync(
+      markerPath,
+      JSON.stringify({
+        pid: 7331,
+        sandboxName: "openclaw",
+        snapshotPath: "/tmp/snap.yaml",
+        restoreAt: new Date(Date.now() + 60_000).toISOString(),
+      }),
+    );
+
+    const processKillSpy = vi
+      .spyOn(process, "kill")
+      .mockImplementation((pid: number, signal?: string | number) =>
+        pid === 7331 && signal === 0 ? throwErrno("gone", "ESRCH") : true,
+      );
+    const originalUnlinkSync = fs.unlinkSync.bind(fs);
+    vi.spyOn(fs, "unlinkSync").mockImplementation((filePath: fs.PathLike) =>
+      String(filePath) === markerPath
+        ? throwErrno("permission denied", "EACCES")
+        : originalUnlinkSync(filePath),
+    );
+
+    const result = killTimer("openclaw");
+
+    expect(result.authorityRevoked).toBe(false);
+    expect(result.warnings).toEqual([
+      expect.stringContaining("Failed to remove shields timer marker"),
+    ]);
+    expect(processKillSpy).toHaveBeenCalledWith(7331, 0);
+    expect(fs.existsSync(markerPath)).toBe(true);
+  });
+
+  it("isShieldsDown and shieldsDown fail closed when shields state is corrupt", async () => {
+    const sourceModulePath = path.join(process.cwd(), "src", "lib", "shields", "index.ts");
+    const { isShieldsDown, shieldsDown } = await import(sourceModulePath);
+    const stateDir = path.join(tmpDir, ".nemoclaw", "state");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const statePath = path.join(stateDir, "shields-openclaw.json");
+    const corruptState = "{broken-json";
+    fs.writeFileSync(statePath, corruptState);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     expect(isShieldsDown("openclaw")).toBe(false);
+    expect(() => shieldsDown("openclaw", { throwOnError: true })).toThrow(
+      "Shields state is corrupt for openclaw",
+    );
+    expect(errorSpy).toHaveBeenCalledWith(
+      "  Recovery: inspect the reported state error and restore trusted state for openclaw before retrying.",
+    );
+    expect(fs.readFileSync(statePath, "utf8")).toBe(corruptState);
+  });
+
+  it("shieldsUp preserves recovery authority when shields state is corrupt", async () => {
+    const sourceModulePath = path.join(process.cwd(), "src", "lib", "shields", "index.ts");
+    const [{ shieldsUp }, runner, agentConfig, audit] = await Promise.all([
+      import(sourceModulePath),
+      import("../runner"),
+      import("../sandbox/agent-config"),
+      import("./audit"),
+    ]);
+    const stateDir = path.join(tmpDir, ".nemoclaw", "state");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const statePath = path.join(stateDir, "shields-openclaw.json");
+    const processToken = "0".repeat(32);
+    const markerPath = path.join(stateDir, "shields-timer-openclaw.json");
+    const transitionPath = path.join(stateDir, `shields-transition-openclaw-${processToken}.json`);
+    const corruptState = Buffer.from([0xff, 0xfe, 0x7b, 0x22, 0x62, 0x61, 0x64]);
+    const marker = Buffer.from(
+      JSON.stringify({
+        pid: 7331,
+        sandboxName: "openclaw",
+        snapshotPath: "/tmp/policy-snapshot.yaml",
+        restoreAt: new Date(Date.now() + 60_000).toISOString(),
+        processToken,
+      }),
+    );
+    const transition = Buffer.from(
+      JSON.stringify({
+        version: 1,
+        phase: "active",
+        ownerPid: 7331,
+        ownerStartIdentity: "timer-owner",
+        processToken,
+        sandboxName: "openclaw",
+        snapshotPath: "/tmp/policy-snapshot.yaml",
+      }),
+    );
+    fs.writeFileSync(statePath, corruptState, { mode: 0o600 });
+    fs.writeFileSync(markerPath, marker, { mode: 0o600 });
+    fs.writeFileSync(transitionPath, transition, { mode: 0o600 });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    expect(() => shieldsUp("openclaw", { throwOnError: true })).toThrow(
+      "Cannot raise shields while persisted shields state is corrupt for openclaw",
+    );
+
+    expect(errorSpy).toHaveBeenCalledWith("  Shields state is corrupt; refusing to raise shields.");
+    expect(errorSpy).toHaveBeenCalledWith(
+      "  Recovery: inspect the reported state error and restore trusted state for openclaw before retrying.",
+    );
+    expect(logSpy).not.toHaveBeenCalledWith("  Lockdown active for openclaw");
+    expect(fs.readFileSync(statePath)).toEqual(corruptState);
+    expect(fs.readFileSync(markerPath)).toEqual(marker);
+    expect(fs.readFileSync(transitionPath)).toEqual(transition);
+    expect(vi.mocked(agentConfig.resolveAgentConfig)).not.toHaveBeenCalled();
+    expect(vi.mocked(runner.run)).not.toHaveBeenCalled();
+    expect(vi.mocked(runner.runCapture)).not.toHaveBeenCalled();
+    expect(vi.mocked(audit.appendAuditEntry)).not.toHaveBeenCalled();
   });
 });

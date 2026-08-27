@@ -6,7 +6,7 @@ import { bestEffortForwardStopForSandbox } from "./forward-cleanup";
 import {
   buildDetachedForwardStartSpawn,
   buildForwardStartProgressLogger,
-  runDetachedForwardStartWithPortReleaseRetries,
+  runDetachedForwardStartWithRetries,
 } from "./forward-start";
 
 type CommandResult = { status: number | null };
@@ -24,24 +24,33 @@ export function ensureAgentFixedForward(
   sandboxName: string,
   port: number,
   label: string,
+  revalidatePolicyAuthority?: (operation: string) => void,
 ): boolean {
   const forwardTarget = String(port);
   const stopForwardForSandbox = (portToStop: string | number) =>
     bestEffortForwardStopForSandbox(
       deps.runOpenshell,
-      (args, opts) => (deps.runCaptureOpenshell(args, opts) ?? "") as string,
+      (args, opts) => deps.runCaptureOpenshell(args, opts),
       portToStop,
       sandboxName,
+      () =>
+        revalidatePolicyAuthority?.(
+          `stop ${label} forward ${String(portToStop)} for sandbox '${sandboxName}'`,
+        ),
     );
 
   stopForwardForSandbox(port);
-  const { ok, diagnostic } = runDetachedForwardStartWithPortReleaseRetries(
-    buildDetachedForwardStartSpawn(
-      deps.openshellArgv(["forward", "start", "--background", forwardTarget, sandboxName]),
-    ),
-    () =>
-      (deps.runCaptureOpenshell(["forward", "list"], { timeout: OPENSHELL_PROBE_TIMEOUT_MS }) ??
-        "") as string,
+  const startForward = buildDetachedForwardStartSpawn(
+    deps.openshellArgv(["forward", "start", "--background", forwardTarget, sandboxName]),
+  );
+  const { ok, diagnostic } = runDetachedForwardStartWithRetries(
+    (stdio) => {
+      revalidatePolicyAuthority?.(
+        `start ${label} forward ${String(port)} for sandbox '${sandboxName}'`,
+      );
+      return startForward(stdio);
+    },
+    () => deps.runCaptureOpenshell(["forward", "list"], { timeout: OPENSHELL_PROBE_TIMEOUT_MS }),
     { port, sandboxName },
     () => {
       deps.sleep(1);

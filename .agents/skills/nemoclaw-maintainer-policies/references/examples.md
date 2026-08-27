@@ -200,6 +200,41 @@ Dry run:
 }
 ```
 
+### N1X Linux Install Failure
+
+Evidence:
+
+- The title identifies an N1x Linux Laptop and an OpenShell install failure.
+- Ubuntu and ARM64 appear only in the environment and are not independently routing-relevant.
+- The report contrasts the N1X failure with successful driver detection on DGX Spark.
+
+Dry run:
+
+```json
+{
+  "item_number": 8095,
+  "item_kind": "issue",
+  "issue_type_to_set": "Bug",
+  "labels_to_add": ["area: install", "platform: n1x"],
+  "labels_to_remove": [],
+  "labels_to_create": [],
+  "labels_to_delete": [],
+  "issue_fields_to_set": {},
+  "project_fields_to_set": {
+    "Status": "Backlog"
+  },
+  "recommended_action": "triage",
+  "confidence": "high",
+  "rationale": {
+    "issue_type_to_set": "The report describes broken install behavior.",
+    "area: install": "The failure occurs during OpenShell installation.",
+    "platform: n1x": "The report identifies N1X as the affected platform and contrasts its behavior with DGX Spark."
+  },
+  "questions_for_author": [],
+  "human_review_required": false
+}
+```
+
 ### Feature Request Needing Design
 
 Evidence:
@@ -469,8 +504,11 @@ Dry run:
 Anti-examples:
 
 - Do not treat `v0.0.8` as a readiness claim.
-- Do not change the version label just because the day ended.
-- Do not delete an old version label while an open PR still depends on it.
+- Do not move stragglers before the semver tag and workflow-managed `latest` are verified.
+- Do not leave an open straggler on the released label after authorized post-tag housekeeping succeeds.
+- Do not keep a released label after open stragglers move forward.
+- Do not rename or reuse a released label for a future version.
+- Do not bulk-edit daily version labels outside the named release automation or another explicit authorization context.
 
 ## Agent-Owned Label Examples
 

@@ -3,12 +3,12 @@
 
 import { describe, expect, it } from "vitest";
 
-// Import from compiled dist/ for correct coverage attribution.
+// Import source directly so tests cannot pass against a stale build.
 import {
   parseLiveSandboxEntries,
   parseLiveSandboxNames,
   parseReadySandboxNames,
-} from "../../dist/lib/runtime-recovery";
+} from "./runtime-recovery";
 
 describe("runtime recovery helpers", () => {
   it("parses name + live PHASE pairs regardless of column layout (#5714)", () => {
@@ -39,12 +39,16 @@ describe("runtime recovery helpers", () => {
           "alpha   2026-06-25 09:40:49  Failed",
           "beta    2026-06-25 09:41:00  CrashLoopBackOff",
           "gamma   2026-06-25 09:42:00  Creating",
+          "delta   2026-06-25 09:43:00  Evicted",
+          "epsilon 2026-06-25 09:44:00  Deleting",
         ].join("\n"),
       ),
     ).toEqual([
       { name: "alpha", phase: "Failed" },
       { name: "beta", phase: "CrashLoopBackOff" },
       { name: "gamma", phase: "Creating" },
+      { name: "delta", phase: "Evicted" },
+      { name: "epsilon", phase: "Deleting" },
     ]);
   });
 

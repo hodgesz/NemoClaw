@@ -28,21 +28,57 @@ An authorization context can be:
 - A release workflow running under a named release automation.
 - An authorized agent-owned workflow operating only in the `agt: *` label namespace.
 
-Canonical labels, Issue Type, Project fields, public comments, release labels, closes, merges, and non-agent label deletion require an authorization context that explicitly allows that operation. Security-sensitive, destructive, release, merge, and public-comment writes require stricter authorization than ordinary triage labels.
+Each write requires authorization for that operation.
+This includes labels, Issue Type, Project fields, comments, release labels, closes, merges, and label deletion.
+Security, destructive, release, merge, and comment writes require stricter authorization than triage labels.
 
 ## Contributor PR Eligibility
 
-Contributor-owned PRs must satisfy the DCO declaration and GitHub commit verification before they are opened for review.
-This is a contributor self-serve requirement, not a maintainer repair step.
+Contributor-owned PRs must pass DCO and commit-verification checks before review.
+The contributor must correct a failure.
 
-- The PR description must include a valid `Signed-off-by:` declaration for the contributor.
+- The PR description must include the contributor's `Signed-off-by:` declaration.
 - Every commit must appear as `Verified` in GitHub.
 - Contributor agents must check both requirements before running `gh pr create`.
-- If the PR body would miss the DCO declaration or any commit is missing GitHub verification, the agent must stop and tell the contributor how to fix the issue instead of opening the PR.
-- If force-push is not allowed and a published branch already contains an unverified commit, the contributor must open a fresh branch and fresh PR with a clean compliant commit history.
+- If either check fails, the agent must stop and tell the contributor how to correct it.
+- If force-push is not allowed, the contributor must create a branch and PR with verified commits.
 
-Maintainers should reject PRs that contain unverified commits or lack the DCO declaration.
-Do not merge, approve, or repair those PRs on behalf of the contributor.
+Maintainers must reject a PR with an unverified commit or no DCO declaration.
+Do not merge, approve, or repair it for the contributor.
+
+## Superseded PR Attribution
+
+A supersession declaration records a relationship between PRs.
+It does not prove that one PR covers the other, satisfies contributor requirements, or ranks above another candidate.
+
+When a replacement PR carries material code, tests, or documentation from another contributor's PR:
+
+- Confirm that the source PR already contains that contributor's `Signed-off-by:` declaration.
+  Never add or copy a DCO declaration on another contributor's behalf.
+- Use the exact author name and email from the source commit.
+  Never guess or substitute an attribution identity.
+
+If the source commit has no usable author identity, leave the winner unset and ask the contributor to provide machine-readable attribution.
+If the source PR has no contributor DCO declaration, leave the winner unset and ask the contributor to add it.
+A maintainer must not supply either declaration on the contributor's behalf.
+
+After both checks pass:
+
+- Add `Supersedes #<number>` to the replacement PR body and identify the transferred contribution.
+- Preserve the source contributor as the Git author when cherry-picking their commit.
+- When the replacement combines or reconstructs their work, add a
+  `Co-authored-by: Name <email>` commit trailer for each contributor whose work remains.
+  Use the verified source-commit identity.
+- Keep the replacement author's own DCO declaration in the replacement PR body.
+- Before recommending merge or closure, verify the replacement PR body and commit metadata,
+  and confirm that every replacement commit appears as `Verified` in GitHub.
+
+An independent implementation based only on the issue, a reproduction, or public discussion does not require co-authorship.
+Still link the related PRs when recommending closure so the decision remains discoverable.
+A comment on the superseded PR does not replace attribution in the merged PR history.
+
+This policy does not authorize a merge, close, comment, or other write.
+Each operation still requires its own authorization.
 
 ## Issue Classification
 

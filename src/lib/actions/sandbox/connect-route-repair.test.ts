@@ -4,6 +4,8 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SandboxEntry } from "../../state/registry";
 
+import { captureOpenshell } from "../../adapters/openshell/runtime";
+
 vi.mock("../../adapters/openshell/runtime", () => ({
   captureOpenshell: vi.fn(() => ({ status: 0, output: "" })),
   getOpenshellBinary: vi.fn(() => "openshell"),
@@ -36,9 +38,11 @@ vi.mock("./gateway-state", () => ({
 }));
 
 import {
+  type ManagedInferenceRouteResetDeps,
+
+  probeSandboxInferenceRoute,
   repairSandboxInferenceRouteWithDeps,
   resetManagedInferenceRouteWithDeps,
-  type ManagedInferenceRouteResetDeps,
   type SandboxInferenceRouteProbe,
   type SandboxInferenceRouteRepairDeps,
 } from "./connect";
@@ -52,14 +56,6 @@ const healthy = (detail = "OK 200"): SandboxInferenceRouteProbe => ({
 const broken = (detail = "BROKEN 503"): SandboxInferenceRouteProbe => ({
   healthy: false,
   broken: true,
-  detail,
-});
-
-const inconclusive = (
-  detail = "openshell sandbox exec exited with status 7",
-): SandboxInferenceRouteProbe => ({
-  healthy: false,
-  broken: false,
   detail,
 });
 
@@ -113,35 +109,34 @@ function makeRepairDeps(
 }
 
 describe("sandbox connect route repair unit flow", () => {
-  it("skips work when route repair is disabled", () => {
-    const { calls, deps } = makeRepairDeps([], {
+  it("still probes and fails closed when route repair is disabled (#8502)", () => {
+    const { calls, deps } = makeRepairDeps([broken()], {
       isRepairDisabled: () => true,
     });
 
     const result = repairSandboxInferenceRouteWithDeps("demo", sandbox(), {}, deps);
 
     expect(result).toEqual({
-      healthy: true,
+      healthy: false,
       repairAttempted: false,
-      detail: "route repair disabled",
+      detail: "route repair disabled; BROKEN 503",
     });
-    expect(calls.probeOptions).toEqual([]);
+    expect(calls.probeOptions).toEqual([undefined]);
+    expect(calls.legacyRepairs).toEqual([]);
   });
 
-  it("does not repair healthy or inconclusive initial probes", () => {
-    for (const firstProbe of [healthy(), inconclusive()]) {
-      const { calls, deps } = makeRepairDeps([firstProbe]);
+  it("does not repair a healthy initial probe", () => {
+    const { calls, deps } = makeRepairDeps([healthy()]);
 
-      const result = repairSandboxInferenceRouteWithDeps("demo", sandbox(), {}, deps);
+    const result = repairSandboxInferenceRouteWithDeps("demo", sandbox(), {}, deps);
 
-      expect(result).toEqual({
-        healthy: true,
-        repairAttempted: false,
-        detail: firstProbe.detail,
-      });
-      expect(calls.legacyRepairs).toEqual([]);
-      expect(calls.reapplications).toEqual([]);
-    }
+    expect(result).toEqual({
+      healthy: true,
+      repairAttempted: false,
+      detail: "OK 200",
+    });
+    expect(calls.legacyRepairs).toEqual([]);
+    expect(calls.reapplications).toEqual([]);
   });
 
   it("repairs legacy kubernetes routes through the DNS proxy path", () => {
@@ -161,6 +156,10 @@ describe("sandbox connect route repair unit flow", () => {
     });
     expect(calls.legacyRepairs).toEqual([{ sandboxName: "legacy-box", quiet: false }]);
     expect(calls.reapplications).toEqual([]);
+    expect(calls.probeOptions).toEqual([undefined, { attempts: 3, delayMs: 2000 }]);
+    expect(calls.logs).toContain(
+      "  inference.local is unavailable inside 'legacy-box'. Repairing sandbox DNS proxy...",
+    );
     expect(calls.logs).toContain("  inference.local route repaired.");
   });
 
@@ -225,6 +224,13 @@ describe("sandbox connect route repair unit flow", () => {
     expect(calls.monkeypatches).toEqual(["vm-box"]);
     expect(calls.reapplications).toEqual([]);
     expect(calls.legacyRepairs).toEqual([]);
+    expect(calls.probeOptions).toEqual([undefined, { attempts: 3, delayMs: 2000 }]);
+    expect(calls.logs).toContain(
+      "  inference.local is unavailable inside 'vm-box'. Applying OpenShell VM DNS monkeypatch...",
+    );
+    expect(calls.logs).not.toContain(
+      "  inference.local is unavailable inside 'vm-box'. Reapplying OpenShell inference route...",
+    );
   });
 
   it("falls back to inference reapply when the VM monkeypatch leaves the route broken", () => {
@@ -298,7 +304,7 @@ function makeResetDeps(
       calls.probeOptions.push(options);
       return queue.shift() ?? broken("missing mocked reset probe");
     }),
-    printUnrecoverableInferenceRoute: vi.fn((sandboxName, _sb, detail) => {
+    printUnrecoverableInferenceRoute: vi.fn((sandboxName, _route, detail) => {
       calls.unrecoverable.push({ sandboxName, detail });
     }),
     log: (message) => calls.logs.push(message),
@@ -387,5 +393,37 @@ describe("managed inference route reset unit flow", () => {
     expect(result).toBe(false);
     expect(calls.errors).toContain("  Error: failed to reset the OpenShell inference route.");
     expect(calls.unrecoverable).toEqual([{ sandboxName: "demo", detail: "BROKEN 503 still down" }]);
+  });
+});
+
+
+describe("connect inference route retries", () => {
+  it("returns the third healthy probe result after two unhealthy probe results (#9218)", () => {
+    vi.mocked(captureOpenshell)
+      .mockReturnValueOnce({ status: 0, output: "BROKEN 503", stderr: "" })
+      .mockReturnValueOnce({ status: 0, output: "BROKEN 503", stderr: "" })
+      .mockReturnValueOnce({ status: 0, output: "OK 200", stderr: "" });
+
+    const result = probeSandboxInferenceRoute(
+      "alpha",
+      { name: "hermes" },
+      { attempts: 3, delayMs: 2_000 },
+    );
+
+    expect(result).toMatchObject({ healthy: true, broken: false, httpStatus: 200 });
+    expect(captureOpenshell).toHaveBeenCalledTimes(3);
+  });
+
+  it("returns the final unhealthy probe result after exhausting attempts (#9218)", () => {
+    vi.mocked(captureOpenshell).mockReturnValue({ status: 0, output: "BROKEN 503", stderr: "" });
+
+    const result = probeSandboxInferenceRoute(
+      "alpha",
+      { name: "hermes" },
+      { attempts: 2, delayMs: 500 },
+    );
+
+    expect(result).toMatchObject({ healthy: false, broken: true, httpStatus: 503 });
+    expect(captureOpenshell).toHaveBeenCalledTimes(2);
   });
 });

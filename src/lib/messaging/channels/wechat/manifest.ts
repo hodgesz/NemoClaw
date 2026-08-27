@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { ChannelManifest } from "../../manifest";
+import { WECHAT_OPENCLAW_ACCOUNT_FILE_CONTRACT } from "./contract.ts";
 
 export const wechatManifest = {
   schemaVersion: 1,
@@ -83,6 +84,16 @@ export const wechatManifest = {
       },
     },
     {
+      id: "wechat-openclaw-channel",
+      kind: "json-fragment",
+      agent: "openclaw",
+      target: "openclaw.json",
+      fragment: {
+        path: "channels.openclaw-weixin",
+        value: { enabled: true },
+      },
+    },
+    {
       id: "wechat-hermes-env",
       kind: "env-lines",
       agent: "hermes",
@@ -133,33 +144,22 @@ export const wechatManifest = {
       manager: "openclaw-plugin",
       spec: "npm:@tencent-weixin/openclaw-weixin@2.4.3",
       pin: true,
+      integrity:
+        "sha512-dPQbidUNWigC6V10vGW4i+GLH09x+6zUhafZRjuxkJ9GDu8o62WBsnUTojp4KqUH756hz+t2v9khiCRSi0dBDw==",
+      tarballUrl:
+        "https://registry.npmjs.org/@tencent-weixin/openclaw-weixin/-/openclaw-weixin-2.4.3.tgz",
+      runtimeLock: {
+        cachePath: "/usr/local/share/nemoclaw/wechat-npm-cache",
+        installCacheEnvKey: "NEMOCLAW_WECHAT_NPM_INSTALL_CACHE",
+        lockFile: "/usr/local/lib/nemoclaw/wechat-runtime/package-lock.json",
+        projectsRoot: "/sandbox/.openclaw/npm/projects",
+        verifierPath: "/usr/local/lib/nemoclaw/verify-wechat-runtime-lock.mts",
+        offline: true,
+        legacyPeerDeps: true,
+      },
       required: true,
     },
   ],
-  state: {
-    persist: {
-      wechatConfig: ["accountId", "baseUrl", "userId"],
-      allowedIds: ["allowedIds"],
-    },
-    rebuildHydration: [
-      {
-        statePath: "wechatConfig.accountId",
-        env: "WECHAT_ACCOUNT_ID",
-      },
-      {
-        statePath: "wechatConfig.baseUrl",
-        env: "WECHAT_BASE_URL",
-      },
-      {
-        statePath: "wechatConfig.userId",
-        env: "WECHAT_USER_ID",
-      },
-      {
-        statePath: "allowedIds.wechat",
-        env: "WECHAT_ALLOWED_IDS",
-      },
-    ],
-  },
   hooks: [
     {
       id: "wechat-host-qr",
@@ -204,9 +204,9 @@ export const wechatManifest = {
       ],
     },
     {
-      id: "wechat-seed-openclaw-account",
+      id: WECHAT_OPENCLAW_ACCOUNT_FILE_CONTRACT.planHookId,
       phase: "post-agent-install",
-      handler: "wechat.seedOpenClawAccount",
+      handler: WECHAT_OPENCLAW_ACCOUNT_FILE_CONTRACT.handlerId,
       agents: ["openclaw"],
       inputs: [
         "wechatConfig.accountId",
@@ -221,9 +221,9 @@ export const wechatManifest = {
           required: true,
         },
         {
-          id: "openclawWeixinAccountFile",
-          kind: "build-file",
-          required: true,
+          id: WECHAT_OPENCLAW_ACCOUNT_FILE_CONTRACT.outputId,
+          kind: WECHAT_OPENCLAW_ACCOUNT_FILE_CONTRACT.kind,
+          required: WECHAT_OPENCLAW_ACCOUNT_FILE_CONTRACT.required,
         },
         {
           id: "openclawConfigPatch",

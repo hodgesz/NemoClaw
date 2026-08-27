@@ -171,6 +171,69 @@ describe("applyRecreatePolicyCarryForward (#4621)", () => {
     expect(note).not.toHaveBeenCalled();
   });
 
+  it("keeps the matching recreate journal selection instead of stale source presets", () => {
+    vi.spyOn(registry, "getSandbox").mockReturnValue({
+      name: "sb",
+      policies: ["github", "mcp-bridge-fake"],
+      policyPresetsFinalized: true,
+    } as ReturnType<typeof registry.getSandbox>);
+    vi.spyOn(onboardSession, "loadSession").mockReturnValue({
+      policyPresets: ["github"],
+      checkpoint: { sandboxRecreate: { sandboxName: "sb" } },
+    } as never);
+    const updateSession = vi
+      .spyOn(onboardSession, "updateSession")
+      .mockReturnValue(undefined as never);
+    const note = vi.fn();
+
+    applyRecreatePolicyCarryForward("sb", true, note);
+
+    expect(readSeededPresets(updateSession)).toEqual(["github"]);
+    expect(note).not.toHaveBeenCalled();
+  });
+
+  it("uses an explicit rebuild selection instead of stale source presets", () => {
+    vi.spyOn(registry, "getSandbox").mockReturnValue({
+      name: "sb",
+      policies: ["github", "mcp-bridge-fake"],
+      policyPresetsFinalized: true,
+    } as ReturnType<typeof registry.getSandbox>);
+    vi.spyOn(onboardSession, "loadSession").mockReturnValue(null);
+    const updateSession = vi
+      .spyOn(onboardSession, "updateSession")
+      .mockReturnValue(undefined as never);
+    const note = vi.fn();
+    process.env.NEMOCLAW_POLICY_PRESETS = "pypi";
+
+    try {
+      applyRecreatePolicyCarryForward("sb", true, note, ["github"]);
+    } finally {
+      delete process.env.NEMOCLAW_POLICY_PRESETS;
+    }
+
+    expect(readSeededPresets(updateSession)).toEqual(["github"]);
+    expect(note).not.toHaveBeenCalled();
+  });
+
+  it("does not carry a different sandbox journal selection across targets", () => {
+    vi.spyOn(registry, "getSandbox").mockReturnValue({
+      name: "sb",
+      policies: ["github"],
+      policyPresetsFinalized: true,
+    } as ReturnType<typeof registry.getSandbox>);
+    vi.spyOn(onboardSession, "loadSession").mockReturnValue({
+      policyPresets: ["npm"],
+      checkpoint: { sandboxRecreate: { sandboxName: "other" } },
+    } as never);
+    const updateSession = vi
+      .spyOn(onboardSession, "updateSession")
+      .mockReturnValue(undefined as never);
+
+    applyRecreatePolicyCarryForward("sb", true, vi.fn());
+
+    expect(readSeededPresets(updateSession)).toEqual(["github"]);
+  });
+
   it("prints the override note when an env override clears the selection", () => {
     vi.spyOn(registry, "getSandbox").mockReturnValue({
       name: "sb",
@@ -217,5 +280,36 @@ describe("persistFinalizedPolicyPresets (#4621)", () => {
       policies: ["github"],
       policyPresetsFinalized: true,
     });
+  });
+
+  // #5967 was a registry-persistence regression: an enabled messaging channel's
+  // preset reached the live gateway but was dropped from the registry `policies`
+  // write, so `policy-list` (which reads registry.policies) rendered `○`. Using
+  // the REAL built-in preset catalog proves Discord and Slack are recognized as
+  // built-ins and are written back to the registry, not filtered out.
+  it("persists enabled messaging channel presets (Discord, Slack) to the registry (#5967)", () => {
+    // Model the registry as observable state and read it back through the same
+    // boundary policy-list uses (registry.getSandbox().policies) rather than
+    // inspecting updateSandbox's call shape.
+    const entry = { name: "sb", policies: ["npm"] } as Partial<registry.SandboxEntry> & {
+      policies: string[];
+      policyPresetsFinalized?: boolean;
+    };
+    vi.spyOn(registry, "getCustomPolicies").mockReturnValue([]);
+    vi.spyOn(registry, "getSandbox").mockImplementation((name) =>
+      name === "sb" ? (entry as registry.SandboxEntry) : null,
+    );
+    vi.spyOn(registry, "updateSandbox").mockImplementation((_name, fields) => {
+      Object.assign(entry, fields);
+      return true;
+    });
+
+    persistFinalizedPolicyPresets("sb", ["npm", "pypi", "discord", "slack"]);
+
+    const stored = registry.getSandbox("sb");
+    expect(stored?.policyPresetsFinalized).toBe(true);
+    // Discord and Slack survive the built-in filter and are stored where
+    // policy-list reads them — the #5967 registry-persistence guarantee.
+    expect([...(stored?.policies ?? [])].sort()).toEqual(["discord", "npm", "pypi", "slack"]);
   });
 });

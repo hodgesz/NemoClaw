@@ -38,8 +38,11 @@ describe("MessagingHookRegistry", () => {
       "common.tokenPaste",
       "common.configPrompt",
       "discord.openclawBridgeHealth",
+      "googlechat.tunnelAudienceGate",
+      "googlechat.tokenPaste",
       "slack.socketModeGatewayConflict",
       "slack.socketModeGatewayStatus",
+      "slack.statusHealth",
       "slack.openclawBridgeHealth",
       "slack.validateCredentials",
       "teams.hostForwardPortConflict",
@@ -47,10 +50,12 @@ describe("MessagingHookRegistry", () => {
       "telegram.allowlistAliases",
       "telegram.openclawBridgeHealth",
       "telegram.gatewayConflictStatus",
+      "telegram.statusHealth",
       "telegram.getMeReachability",
       "wechat.ilinkLogin",
       "wechat.seedOpenClawAccount",
       "wechat.healthCheck",
+      "whatsapp.statusHealth",
     ]);
   });
 

@@ -5,13 +5,26 @@
 // Windows-host Ollama actions invoked from WSL via PowerShell interop.
 // Detection lives in onboard.ts; this module owns the action side.
 
-const { spawn, spawnSync } = require("child_process");
+const { spawn } = require("child_process");
+const { dockerCapture } = require("../../adapters/docker/command");
 const { run, runCapture } = require("../../runner");
-const { OLLAMA_HOST_DOCKER_INTERNAL, setResolvedOllamaHost } = require("../local");
+const {
+  getWindowsHostOllamaDockerReachabilityArgs,
+  isValidOllamaTagsResponseBody,
+  OLLAMA_HOST_DOCKER_INTERNAL,
+  setResolvedOllamaHost,
+} = require("../local");
 const { OLLAMA_PORT } = require("../../core/ports");
 
+// Avoid starting a subprocess for each fixed readiness delay.
+// The supported Windows-host Ollama path runs through WSL PowerShell interop.
+// Native Windows activation remains gated by #8178.
+const sleepBuffer = new SharedArrayBuffer(4);
+const sleepArray = new Int32Array(sleepBuffer);
+
 function sleep(seconds: number): void {
-  spawnSync("sleep", [String(seconds)]);
+  if (seconds <= 0) return;
+  Atomics.wait(sleepArray, 0, 0, seconds * 1000);
 }
 
 function psSingleQuote(value: string): string {
@@ -111,19 +124,10 @@ function awaitWindowsOllamaReady(): boolean {
   console.log("  Waiting for Ollama to respond on host.docker.internal...");
   for (let attempt = 0; attempt < 15; attempt++) {
     sleep(2);
-    const probe = runCapture(
-      [
-        "curl",
-        "-sf",
-        "--connect-timeout",
-        "2",
-        "--max-time",
-        "5",
-        `http://host.docker.internal:${OLLAMA_PORT}/api/tags`,
-      ],
-      { ignoreError: true },
-    );
-    if (probe) {
+    const probe = dockerCapture(getWindowsHostOllamaDockerReachabilityArgs(), {
+      ignoreError: true,
+    });
+    if (isValidOllamaTagsResponseBody(probe)) {
       setResolvedOllamaHost(OLLAMA_HOST_DOCKER_INTERNAL);
       return true;
     }
@@ -220,15 +224,14 @@ function printWindowsOllamaTimeoutDiagnostics(): void {
   console.error(
     '    powershell.exe -Command "Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyContinue"',
   );
-  console.error(
-    `    curl -sS --connect-timeout 2 --max-time 5 http://host.docker.internal:${OLLAMA_PORT}/api/tags`,
-  );
+  console.error(`    docker ${getWindowsHostOllamaDockerReachabilityArgs().join(" ")}`);
 }
 
 module.exports = {
   installOllamaOnWindowsHost,
   awaitWindowsOllamaReady,
   setupWindowsOllamaWith0000Binding,
+  sleep,
   switchToWindowsOllamaHost,
   printWindowsOllamaTimeoutDiagnostics,
 };

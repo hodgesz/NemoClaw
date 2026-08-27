@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { withLocalNoProxy } from "./proxy/local-no-proxy";
+
 /**
  * Subprocess environment allowlist.
  *
@@ -40,13 +42,33 @@ const TLS = [
 
 const TOOLCHAIN = ["DOCKER_HOST", "KUBECONFIG", "SSH_AUTH_SOCK", "RUST_LOG", "RUST_BACKTRACE"];
 
-const ALLOWED_ENV_NAMES = new Set([...SYSTEM, ...TEMP, ...LOCALE, ...PROXY, ...TLS, ...TOOLCHAIN]);
+export const SUBPROCESS_ENV_ALLOWED_NAMES: readonly string[] = Object.freeze([
+  ...SYSTEM,
+  ...TEMP,
+  ...LOCALE,
+  ...PROXY,
+  ...TLS,
+  ...TOOLCHAIN,
+]);
+const ALLOWED_ENV_NAMES = new Set(SUBPROCESS_ENV_ALLOWED_NAMES);
 
 // ── Allowed prefixes ───────────────────────────────────────────
 
-const ALLOWED_ENV_PREFIXES = ["LC_", "XDG_", "OPENSHELL_", "GRPC_"];
+export const SUBPROCESS_ENV_ALLOWED_PREFIXES: readonly string[] = Object.freeze([
+  "LC_",
+  "XDG_",
+  "OPENSHELL_",
+  "GRPC_",
+]);
 
 // ── Public API ─────────────────────────────────────────────────
+
+export function isSubprocessEnvNameAllowed(name: string): boolean {
+  return (
+    ALLOWED_ENV_NAMES.has(name) ||
+    SUBPROCESS_ENV_ALLOWED_PREFIXES.some((prefix) => name.startsWith(prefix))
+  );
+}
 
 /**
  * When any HTTP proxy is forwarded, augment NO_PROXY so the host proxy is
@@ -70,39 +92,13 @@ const ALLOWED_ENV_PREFIXES = ["LC_", "XDG_", "OPENSHELL_", "GRPC_"];
  * consults the caller's NO_PROXY for sandbox-create env decisions, this
  * augmentation can be dropped.
  */
-export function withLocalNoProxy(env: Record<string, string>): void {
-  const hasProxy = env.HTTP_PROXY || env.HTTPS_PROXY || env.http_proxy || env.https_proxy;
-  if (!hasProxy) return;
-  for (const key of ["NO_PROXY", "no_proxy"] as const) {
-    const current = env[key] ?? "";
-    const parts = current
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    let changed = false;
-    for (const host of [
-      "localhost",
-      "127.0.0.1",
-      "host.docker.internal",
-      "host.containers.internal",
-      "::1",
-      "0.0.0.0",
-      "inference.local",
-    ]) {
-      if (!parts.includes(host)) {
-        parts.push(host);
-        changed = true;
-      }
-    }
-    if (changed) env[key] = parts.join(",");
-  }
-}
+export { withLocalNoProxy };
 
 export function buildSubprocessEnv(extra?: Record<string, string>): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value === undefined) continue;
-    if (ALLOWED_ENV_NAMES.has(key) || ALLOWED_ENV_PREFIXES.some((p) => key.startsWith(p))) {
+    if (isSubprocessEnvNameAllowed(key)) {
       env[key] = value;
     }
   }
@@ -110,5 +106,36 @@ export function buildSubprocessEnv(extra?: Record<string, string>): Record<strin
     Object.assign(env, extra);
   }
   withLocalNoProxy(env);
+  return env;
+}
+
+// Names a Node.js child process needs to start and to resolve its own state
+// directory consistently with the parent CLI process, independent of what
+// work the child actually does.
+const ADAPTER_RUNTIME_NAMES = ["HOME", "PATH", "NODE_ENV"];
+
+/**
+ * Purpose-built allowlist for a long-lived, detached, credential-bearing
+ * local adapter process (for example the HTTPS Pin Runtime adapter): only
+ * the Node runtime variables above, plus the variables Node itself reads to
+ * validate the adapter's own outbound HTTPS connections to the real
+ * upstream provider. Unlike `buildSubprocessEnv`, this intentionally omits
+ * `TOOLCHAIN` (`DOCKER_HOST`, `KUBECONFIG`, `SSH_AUTH_SOCK`, ...) and
+ * `PROXY`: a credential-bearing adapter with no need for those capabilities
+ * should not inherit them just because an ordinary CLI subprocess might.
+ */
+export function buildMinimalCredentialAdapterEnv(
+  extra?: Record<string, string>,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined) continue;
+    if (ADAPTER_RUNTIME_NAMES.includes(key) || TLS.includes(key)) {
+      env[key] = value;
+    }
+  }
+  if (extra) {
+    Object.assign(env, extra);
+  }
   return env;
 }

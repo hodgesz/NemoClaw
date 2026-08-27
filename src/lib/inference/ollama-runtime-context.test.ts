@@ -3,16 +3,39 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { OLLAMA_PORT } from "../core/ports";
 import {
   applyOllamaRuntimeContextWindow,
+  getOllamaContextWindowFloorForAgent,
   MIN_AUTODETECTED_OLLAMA_CONTEXT_WINDOW,
+  MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+  type OllamaRuntimeRunCaptureFn,
+  parseOllamaNativeContextLength,
   parseOllamaRuntimeContextLength,
+  probeOllamaModelNativeContextLength,
   probeOllamaRuntimeModelStatus,
   resetOllamaRuntimeContextWindowAutoState,
   resolveOllamaRuntimeContextWindow,
-} from "../../../dist/lib/inference/ollama-runtime-context";
+} from "./ollama-runtime-context";
 
 const getOllamaHost = () => "127.0.0.1";
+
+const makeOllamaCapture =
+  (psBody: string, showBody: string): OllamaRuntimeRunCaptureFn =>
+  (command) =>
+    command.some((arg) => String(arg).includes("/api/show")) ? showBody : psBody;
+
+type OllamaRuntimeContextFailure = Extract<
+  ReturnType<typeof applyOllamaRuntimeContextWindow>,
+  { ok: false }
+>;
+
+function expectOllamaRuntimeContextFailure(
+  result: ReturnType<typeof applyOllamaRuntimeContextWindow>,
+): OllamaRuntimeContextFailure {
+  expect(result.ok).toBe(false);
+  return result as OllamaRuntimeContextFailure;
+}
 
 describe("Ollama runtime context helpers", () => {
   afterEach(() => {
@@ -43,13 +66,16 @@ describe("Ollama runtime context helpers", () => {
     ).toBeNull();
   });
 
-  it("warns and ignores malformed or non-positive Ollama /api/ps context lengths", () => {
-    for (const value of ["bogus", "1.5", 0, -1]) {
+  it.each(["bogus", "1.5", 0, -1])(
+    "warns and ignores malformed Ollama /api/ps context length %#",
+    (value) => {
       const parsed = parseOllamaRuntimeContextLength(value);
       expect(parsed.contextLength).toBeUndefined();
       expect(parsed.warning).toContain("non-positive or malformed context_length");
-    }
+    },
+  );
 
+  it("reports malformed Ollama runtime model context lengths", () => {
     const status = probeOllamaRuntimeModelStatus("qwen3.6:35b", getOllamaHost, () =>
       JSON.stringify({ models: [{ name: "qwen3.6:35b", context_length: "bogus" }] }),
     );
@@ -119,6 +145,331 @@ describe("Ollama runtime context helpers", () => {
     applyOllamaRuntimeContextWindow("llama3.2:3b", getOllamaHost, options);
     expect(env.NEMOCLAW_CONTEXT_WINDOW).toBe(String(MIN_AUTODETECTED_OLLAMA_CONTEXT_WINDOW));
     expect(messages.some((m) => m.includes("Raising Ollama runtime context window"))).toBe(true);
+  });
+
+  it("keeps the OpenClaw Ollama floor at 16384 and requires 64000 for Hermes", () => {
+    expect(getOllamaContextWindowFloorForAgent(null)).toBe(MIN_AUTODETECTED_OLLAMA_CONTEXT_WINDOW);
+    expect(getOllamaContextWindowFloorForAgent("openclaw")).toBe(
+      MIN_AUTODETECTED_OLLAMA_CONTEXT_WINDOW,
+    );
+    expect(getOllamaContextWindowFloorForAgent("hermes")).toBe(MIN_HERMES_OLLAMA_CONTEXT_WINDOW);
+
+    const env: NodeJS.ProcessEnv = {};
+    const messages: string[] = [];
+    const result = applyOllamaRuntimeContextWindow("llama3.2:1b", getOllamaHost, {
+      env,
+      contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+      logger: {
+        log: (message: string) => messages.push(message),
+        warn: (message: string) => messages.push(message),
+      },
+      runCaptureImpl: () =>
+        JSON.stringify({
+          models: [{ name: "llama3.2:1b", context_length: 16_384, processor: "100% GPU" }],
+        }),
+    });
+
+    const failure = expectOllamaRuntimeContextFailure(result);
+    expect(failure.message).toContain("context_length=16384");
+    expect(failure.message).toContain("'llama3.2:1b'");
+    expect(failure.message).toContain("required 64000-token window");
+    expect(failure.message).toContain("OLLAMA_CONTEXT_LENGTH=64000");
+    expect(env.NEMOCLAW_CONTEXT_WINDOW).toBeUndefined();
+    expect(messages.some((m) => m.includes("Raising Ollama runtime context window"))).toBe(false);
+  });
+
+  it("does not let an explicit prompt budget hide a below-floor Hermes daemon", () => {
+    const env: NodeJS.ProcessEnv = { NEMOCLAW_CONTEXT_WINDOW: "64000" };
+    const result = applyOllamaRuntimeContextWindow("llama3.2:1b", getOllamaHost, {
+      env,
+      contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+      logger: { log: () => {}, warn: () => {} },
+      runCaptureImpl: () =>
+        JSON.stringify({
+          models: [{ name: "llama3.2:1b", context_length: 16_384 }],
+        }),
+    });
+
+    const failure = expectOllamaRuntimeContextFailure(result);
+    expect(failure.message).toContain("context_length=16384");
+    expect(failure.message).toContain("OLLAMA_CONTEXT_LENGTH=64000");
+    expect(env.NEMOCLAW_CONTEXT_WINDOW).toBe("64000");
+  });
+
+  it.each([
+    ["no runtime response", ""],
+    ["an unloaded model", JSON.stringify({ models: [] })],
+    [
+      "a missing context length",
+      JSON.stringify({ models: [{ name: "llama3.2:1b", processor: "100% GPU" }] }),
+    ],
+    [
+      "a malformed context length",
+      JSON.stringify({ models: [{ name: "llama3.2:1b", context_length: "bogus" }] }),
+    ],
+  ])("fails closed for Hermes with %s", (_caseName, output) => {
+    const env: NodeJS.ProcessEnv = {};
+    const result = applyOllamaRuntimeContextWindow("llama3.2:1b", getOllamaHost, {
+      env,
+      contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+      logger: { log: () => {}, warn: () => {} },
+      runCaptureImpl: () => output,
+    });
+
+    const failure = expectOllamaRuntimeContextFailure(result);
+    expect(failure.message).toContain("did not report a valid runtime context_length");
+    expect(failure.message).toContain("OLLAMA_CONTEXT_LENGTH=64000");
+    expect(env.NEMOCLAW_CONTEXT_WINDOW).toBeUndefined();
+  });
+
+  it("fails closed against Windows-host Ollama when runtime context is missing (#6760)", () => {
+    const env: NodeJS.ProcessEnv = {};
+    let probeCommand: readonly string[] = [];
+    const result = applyOllamaRuntimeContextWindow("llama3.2:1b", () => "host.docker.internal", {
+      env,
+      contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+      logger: { log: () => {}, warn: () => {} },
+      runCaptureImpl: (command) => {
+        probeCommand = command;
+        return JSON.stringify({ models: [{ name: "llama3.2:1b" }] });
+      },
+    });
+
+    expect(probeCommand).toContain(`http://host.docker.internal:${OLLAMA_PORT}/api/ps`);
+    const failure = expectOllamaRuntimeContextFailure(result);
+    expect(failure.message).toContain("did not report a valid runtime context_length");
+    expect(failure.message).toContain("OLLAMA_CONTEXT_LENGTH=64000");
+    expect(env.NEMOCLAW_CONTEXT_WINDOW).toBeUndefined();
+  });
+
+  it.each([64_000, 131_072])("accepts a Hermes daemon reporting context_length=%i", (context) => {
+    const env: NodeJS.ProcessEnv = {};
+    const result = applyOllamaRuntimeContextWindow("llama3.2:1b", getOllamaHost, {
+      env,
+      contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+      logger: { log: () => {}, warn: () => {} },
+      runCaptureImpl: () =>
+        JSON.stringify({ models: [{ name: "llama3.2:1b", context_length: context }] }),
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(env.NEMOCLAW_CONTEXT_WINDOW).toBe(String(context));
+  });
+
+  it("requires the daemon to satisfy an explicit Hermes context above the agent floor", () => {
+    const env: NodeJS.ProcessEnv = { NEMOCLAW_CONTEXT_WINDOW: "131072" };
+    const result = applyOllamaRuntimeContextWindow("llama3.2:1b", getOllamaHost, {
+      env,
+      contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+      logger: { log: () => {}, warn: () => {} },
+      runCaptureImpl: () =>
+        JSON.stringify({ models: [{ name: "llama3.2:1b", context_length: 64_000 }] }),
+    });
+
+    const failure = expectOllamaRuntimeContextFailure(result);
+    expect(failure.message).toContain("required 131072-token window");
+    expect(failure.message).toContain("OLLAMA_CONTEXT_LENGTH=131072");
+    expect(env.NEMOCLAW_CONTEXT_WINDOW).toBe("131072");
+  });
+
+  const THROW_SHOW_BODY = "__throw__";
+  const showCapture = (showBody: string): OllamaRuntimeRunCaptureFn =>
+    makeOllamaCapture(
+      JSON.stringify({ models: [{ name: "qwen2.5:0.5b", context_length: 32_768 }] }),
+      showBody,
+    );
+  const throwingShowCapture: OllamaRuntimeRunCaptureFn = (command) =>
+    command.some((arg) => String(arg).includes("/api/show"))
+      ? (() => {
+          throw new Error("curl exploded");
+        })()
+      : JSON.stringify({ models: [{ name: "qwen2.5:0.5b", context_length: 32_768 }] });
+
+  it.each([
+    {
+      caseName: "native below the requirement advises a larger model (#9458)",
+      showBody: JSON.stringify({
+        model_info: { "general.architecture": "qwen2", "qwen2.context_length": 32_768 },
+      }),
+      contains: "Select a model whose native context is at least 64000",
+      notContains: "OLLAMA_CONTEXT_LENGTH=64000",
+    },
+    {
+      caseName: "native exactly equal keeps the daemon remediation",
+      showBody: JSON.stringify({
+        model_info: { "general.architecture": "qwen2", "qwen2.context_length": 64_000 },
+      }),
+      contains: "OLLAMA_CONTEXT_LENGTH=64000",
+      notContains: "Select a model",
+    },
+    {
+      caseName: "native above the requirement keeps the daemon remediation",
+      showBody: JSON.stringify({
+        model_info: { "general.architecture": "qwen2", "qwen2.context_length": 131_072 },
+      }),
+      contains: "OLLAMA_CONTEXT_LENGTH=64000",
+      notContains: "Select a model",
+    },
+    {
+      caseName: "an empty /api/show response keeps the daemon remediation",
+      showBody: "",
+      contains: "OLLAMA_CONTEXT_LENGTH=64000",
+      notContains: "Select a model",
+    },
+    {
+      caseName: "a malformed /api/show response keeps the daemon remediation",
+      showBody: "not json",
+      contains: "OLLAMA_CONTEXT_LENGTH=64000",
+      notContains: "Select a model",
+    },
+    {
+      caseName: "a response without model_info keeps the daemon remediation",
+      showBody: JSON.stringify({ capabilities: ["tools"] }),
+      contains: "OLLAMA_CONTEXT_LENGTH=64000",
+      notContains: "Select a model",
+    },
+    {
+      caseName: "a throwing /api/show capture keeps the daemon remediation",
+      showBody: THROW_SHOW_BODY,
+      contains: "OLLAMA_CONTEXT_LENGTH=64000",
+      notContains: "Select a model",
+    },
+  ])("$caseName", ({ showBody, contains, notContains }) => {
+    const env: NodeJS.ProcessEnv = {};
+    const result = applyOllamaRuntimeContextWindow("qwen2.5:0.5b", getOllamaHost, {
+      env,
+      contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+      logger: { log: () => {}, warn: () => {} },
+      runCaptureImpl: showBody === THROW_SHOW_BODY ? throwingShowCapture : showCapture(showBody),
+    });
+
+    const failure = expectOllamaRuntimeContextFailure(result);
+    expect(failure.message).toContain("context_length=32768");
+    expect(failure.message).toContain("required 64000-token window");
+    expect(failure.message).toContain(contains);
+    expect(failure.message).not.toContain(notContains);
+    expect(env.NEMOCLAW_CONTEXT_WINDOW).toBeUndefined();
+  });
+
+  it("advises a larger model when the native cap sits above the auto-detect ceiling", () => {
+    const result = applyOllamaRuntimeContextWindow("qwen2.5:0.5b", getOllamaHost, {
+      env: {},
+      contextWindowFloor: 8_388_608,
+      logger: { log: () => {}, warn: () => {} },
+      runCaptureImpl: makeOllamaCapture(
+        JSON.stringify({ models: [{ name: "qwen2.5:0.5b", context_length: 4096 }] }),
+        JSON.stringify({
+          model_info: { "general.architecture": "qwen2", "qwen2.context_length": 6_291_456 },
+        }),
+      ),
+    });
+
+    const failure = expectOllamaRuntimeContextFailure(result);
+    expect(failure.message).toContain("native context is 6291456 tokens");
+    expect(failure.message).toContain("Select a model whose native context is at least 8388608");
+    expect(failure.message).not.toContain("OLLAMA_CONTEXT_LENGTH=8388608");
+  });
+
+  it("parses the native context length for the declared model architecture (#9458)", () => {
+    expect(
+      parseOllamaNativeContextLength({
+        model_info: { "general.architecture": "qwen2", "qwen2.context_length": 32_768 },
+      }),
+    ).toBe(32_768);
+    expect(
+      parseOllamaNativeContextLength({
+        model_info: { "general.architecture": " llama ", "llama.context_length": "131072" },
+      }),
+    ).toBe(131_072);
+    expect(
+      parseOllamaNativeContextLength({
+        model_info: { "general.architecture": "qwen2", "qwen2.context_length": 6_291_456 },
+      }),
+    ).toBe(6_291_456);
+  });
+
+  it("rejects native context metadata without an exact architecture match (#9458)", () => {
+    expect(parseOllamaNativeContextLength({ model_info: {} })).toBeNull();
+    expect(parseOllamaNativeContextLength({})).toBeNull();
+    expect(parseOllamaNativeContextLength(null)).toBeNull();
+    expect(
+      parseOllamaNativeContextLength({
+        model_info: { "qwen2.context_length": "bogus" },
+      }),
+    ).toBeNull();
+    expect(
+      parseOllamaNativeContextLength({
+        model_info: { "qwen2.context_length": 10_000_000 },
+      }),
+    ).toBeNull();
+    expect(
+      parseOllamaNativeContextLength({
+        model_info: { "llama.context_length": 131_072, "qwen2.context_length": 32_768 },
+      }),
+    ).toBeNull();
+    expect(
+      parseOllamaNativeContextLength({
+        model_info: {
+          "general.architecture": "qwen2",
+          "llama.context_length": 131_072,
+        },
+      }),
+    ).toBeNull();
+    expect(
+      parseOllamaNativeContextLength({
+        model_info: {
+          "general.architecture": "qwen2",
+          "qwen2.context_length": "bogus",
+          "llama.context_length": 131_072,
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("probes /api/show with a POST naming the selected model", () => {
+    const commands: Array<readonly string[]> = [];
+    const nativeContextLength = probeOllamaModelNativeContextLength(
+      "qwen2.5:0.5b",
+      () => "host.docker.internal",
+      (command) => {
+        commands.push(command);
+        return JSON.stringify({
+          model_info: { "general.architecture": "qwen2", "qwen2.context_length": 32_768 },
+        });
+      },
+    );
+
+    expect(nativeContextLength).toBe(32_768);
+    expect(probeOllamaModelNativeContextLength("qwen2.5:0.5b", getOllamaHost, () => "")).toBeNull();
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toContain(`http://host.docker.internal:${OLLAMA_PORT}/api/show`);
+    expect(commands[0]).toContain("POST");
+    expect(commands[0]).toContain(JSON.stringify({ model: "qwen2.5:0.5b" }));
+  });
+
+  it("clears only stale auto-detected state when strict Hermes validation fails", () => {
+    const env: NodeJS.ProcessEnv = {};
+    const logger = { log: () => {}, warn: () => {} };
+
+    expect(
+      applyOllamaRuntimeContextWindow("llama3.2:1b", getOllamaHost, {
+        env,
+        logger,
+        runCaptureImpl: () =>
+          JSON.stringify({ models: [{ name: "llama3.2:1b", context_length: 32_768 }] }),
+      }),
+    ).toEqual({ ok: true });
+    expect(env.NEMOCLAW_CONTEXT_WINDOW).toBe("32768");
+
+    const result = applyOllamaRuntimeContextWindow("llama3.2:1b", getOllamaHost, {
+      env,
+      contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+      logger,
+      runCaptureImpl: () => JSON.stringify({ models: [] }),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(env.NEMOCLAW_CONTEXT_WINDOW).toBeUndefined();
   });
 
   it("preserves a daemon-reported context window above the agent floor", () => {

@@ -2,23 +2,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { getCredential } from "../credentials/store";
-import type { WebSearchConfig } from "../inference/web-search";
+import { type WebSearchConfig, webSearchProviderForConfig } from "../inference/web-search";
 import {
   listMessagingCredentialMetadata,
   listMessagingPolicyPresetMetadata,
 } from "../messaging/channels";
+import { requiredObservabilityPolicyPresets } from "./observability-policy-presets";
 
-const { LOCAL_INFERENCE_PROVIDERS } = require("./providers") as {
-  LOCAL_INFERENCE_PROVIDERS: string[];
+const { LOCAL_INFERENCE_POLICY_PROVIDERS } = require("./providers") as {
+  LOCAL_INFERENCE_POLICY_PROVIDERS: string[];
 };
 
 import { isOpenclawAgent, requiredOpenclawOtelPolicyPresets } from "./openclaw-otel-policy-presets";
+
+export { webSearchProviderForConfig };
+export type { WebSearchConfig };
 
 export interface SuggestedPolicyPresetOptions {
   enabledChannels?: string[] | null;
   webSearchConfig?: WebSearchConfig | null;
   provider?: string | null;
   agent?: string | null;
+  observabilityEnabled?: boolean | null;
   isNonInteractive?: () => boolean;
   env?: NodeJS.ProcessEnv;
 }
@@ -28,18 +33,20 @@ export function getSuggestedPolicyPresets({
   webSearchConfig = null,
   provider = null,
   agent = null,
+  observabilityEnabled = false,
   isNonInteractive,
   env = process.env,
 }: SuggestedPolicyPresetOptions = {}): string[] {
   const suggestions = ["pypi", "npm"];
 
-  if (provider && LOCAL_INFERENCE_PROVIDERS.includes(provider)) {
+  if (provider && LOCAL_INFERENCE_POLICY_PROVIDERS.includes(provider)) {
     suggestions.push("local-inference");
   }
   if (isOpenclawAgent(agent)) {
     suggestions.push("openclaw-pricing");
     suggestions.push(...requiredOpenclawOtelPolicyPresets(agent, env));
   }
+  suggestions.push(...requiredObservabilityPolicyPresets(agent, observabilityEnabled));
   const usesExplicitMessagingSelection = Array.isArray(enabledChannels);
   const nonInteractive = isNonInteractive?.() ?? process.env.NEMOCLAW_NON_INTERACTIVE === "1";
 
@@ -78,7 +85,7 @@ export function getSuggestedPolicyPresets({
     );
   }
 
-  if (webSearchConfig) suggestions.push("brave");
+  if (webSearchConfig) suggestions.push(webSearchProviderForConfig(webSearchConfig));
 
   return suggestions;
 }

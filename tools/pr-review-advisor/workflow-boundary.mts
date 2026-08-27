@@ -6,266 +6,274 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const DEFAULT_WORKFLOW_PATH = join(REPO_ROOT, ".github", "workflows", "pr-review-advisor.yaml");
+import { ADVISOR_INTERESTS, ADVISOR_SPECIALISTS } from "./specialists.mts";
 
-type WorkflowRecord = Record<string, unknown>;
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const DEFAULT_WORKFLOW = join(ROOT, ".github", "workflows", "pr-review-advisor.yaml");
+const DEFAULT_LOCK = join(ROOT, "package-lock.json");
+const DEFAULT_POLICY = join(ROOT, "tools", "pr-review-advisor", "openshell-policy.yaml");
+const ACTION_PIN = /^[^@\s]+\/[^@\s]+@[0-9a-f]{40}(?:\s*#.*)?$/u;
+const SANDBOX_NAME = /^(?!.*--)[a-z]([a-z0-9-]*[a-z0-9])?$/u;
+const INTERESTS = new Set(ADVISOR_INTERESTS);
+const SPECIALIST_MATRIX_EXPRESSION =
+  "${{ fromJSON(needs.discover-specialists.outputs.matrix) }}";
+const BASE_REF_EXPRESSION =
+  "${{ github.event_name == 'pull_request_target' && 'target/base' || (github.event_name == 'workflow_dispatch' && inputs.target_repo != '' && inputs.target_pr != '' && 'target/base' || inputs.base_ref) }}";
+const HEAD_REF_EXPRESSION =
+  "${{ github.event_name == 'pull_request_target' && 'HEAD' || (github.event_name == 'workflow_dispatch' && inputs.target_repo != '' && inputs.target_pr != '' && 'HEAD' || inputs.head_ref) }}";
+const SPECIALIST_PERMISSIONS = { actions: "read" };
 
-type WorkflowStep = WorkflowRecord & {
-  name?: string;
-  run?: string;
-  uses?: string;
-  with?: WorkflowRecord;
-};
+type Value = Record<string, any>;
 
-function asRecord(value: unknown): WorkflowRecord {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as WorkflowRecord)
-    : {};
+function object(value: unknown): Value {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Value) : {};
 }
 
-function asSteps(value: unknown): WorkflowStep[] {
-  return Array.isArray(value)
-    ? (value.filter((entry) => asRecord(entry) === entry) as WorkflowStep[])
-    : [];
+function jobSteps(job: Value): Value[] {
+  return Array.isArray(job.steps) ? job.steps.map(object) : [];
 }
 
-function stringValue(value: unknown): string {
-  return typeof value === "string" ? value : "";
+function namedStep(job: Value, name: string): Value | undefined {
+  return jobSteps(job).find((item) => item.name === name);
 }
 
-function booleanValue(value: unknown): boolean | undefined {
-  return typeof value === "boolean" ? value : undefined;
-}
-
-function namedStep(steps: readonly WorkflowStep[], name: string): WorkflowStep | undefined {
-  return steps.find((step) => step.name === name);
-}
-
-function usesPinnedAction(uses: string): boolean {
-  return /^[^@\s]+\/[^@\s]+@[0-9a-f]{40}(?:\s*#.*)?$/.test(uses);
-}
-
-function requireStep(
+function requireWith(
   errors: string[],
-  steps: readonly WorkflowStep[],
+  item: Value | undefined,
+  key: string,
+  expected: unknown,
+): void {
+  if (!item) {
+    errors.push("missing workflow step");
+    return;
+  }
+  if (object(item.with)[key] !== expected)
+    errors.push("step '" + item.name + "' expected with." + key + "=" + String(expected));
+}
+
+function checkPermissions(
+  errors: string[],
   name: string,
-): WorkflowStep | undefined {
-  const step = namedStep(steps, name);
-  if (!step) errors.push(`missing workflow step: ${name}`);
-  return step;
-}
-
-function requireStepWith(
-  errors: string[],
-  step: WorkflowStep | undefined,
-  key: string,
-  expected: string | boolean,
+  job: Value,
+  expected: Record<string, string>,
 ): void {
-  if (!step) return;
-  const actual = asRecord(step.with)[key];
-  if (actual !== expected) {
-    errors.push(`step '${step.name ?? "<unnamed>"}' expected with.${key}=${String(expected)}`);
+  const actual = object(job.permissions);
+  for (const [key, value] of Object.entries(expected)) {
+    if (actual[key] !== value) errors.push(name + " job permissions." + key + " must be " + value);
+  }
+  for (const key of Object.keys(actual)) {
+    if (!Object.hasOwn(expected, key)) {
+      const expectation = key === "pull-requests" ? " must be read" : " is not allowed";
+      errors.push(name + " job permissions." + key + expectation);
+    }
   }
 }
 
-function requireRunContains(
-  errors: string[],
-  step: WorkflowStep | undefined,
-  expected: string,
-): void {
-  if (!step) return;
-  const run = stringValue(step.run);
-  if (!run.includes(expected)) {
-    errors.push(`step '${step.name ?? "<unnamed>"}' run script must include ${expected}`);
+function checkActionPins(errors: string[], name: string, job: Value): void {
+  for (const item of jobSteps(job)) {
+    if (item.uses && !ACTION_PIN.test(item.uses))
+      errors.push(
+        name + " step '" + (item.name ?? item.uses) + "' must pin action uses to a full commit SHA",
+      );
   }
 }
 
-function requireRunOrders(
-  errors: string[],
-  step: WorkflowStep | undefined,
-  before: string,
-  after: string,
-): void {
-  if (!step) return;
-  const run = stringValue(step.run);
-  const beforeIndex = run.indexOf(before);
-  const afterIndex = run.indexOf(after);
-  if (beforeIndex < 0 || afterIndex < 0 || beforeIndex > afterIndex) {
-    errors.push(
-      `step '${step.name ?? "<unnamed>"}' run script must check ${before} before ${after}`,
-    );
+function checkLock(errors: string[], path: string): void {
+  try {
+    const packages = object(object(JSON.parse(readFileSync(path, "utf8"))).packages);
+    const pins = [
+      ["@earendil-works/pi-coding-agent", "0.80.6"],
+      ["typebox", "1.1.38"],
+      ["undici", "8.10.0"],
+      ["yaml", "2.8.3"],
+      ["vitest", "4.1.9"],
+    ];
+    for (const [name, version] of pins) {
+      if (object(packages["node_modules/" + name]).version !== version)
+        errors.push("advisor package lock must pin " + name + "@" + version);
+    }
+  } catch {
+    errors.push("failed to read or parse advisor package lock: " + path);
   }
 }
 
-function requireJobEnvValue(
-  errors: string[],
-  job: WorkflowRecord,
-  key: string,
-  expected: string,
-): void {
-  const actual = asRecord(job.env)[key];
-  if (actual !== expected) {
-    errors.push(`review job env.${key} must be ${expected}`);
+function checkPolicy(errors: string[], path: string): void {
+  try {
+    const policy = object(YAML.parse(readFileSync(path, "utf8")));
+    const filesystem = object(policy.filesystem_policy);
+    if (filesystem.include_workdir !== false)
+      errors.push("advisor OpenShell policy must not include the default workdir");
+    const writable = Array.isArray(filesystem.read_write) ? filesystem.read_write : [];
+    if (writable.some((item) => !["/dev", "/sandbox/pr-review-advisor-runtime"].includes(item)))
+      errors.push("advisor OpenShell policy must confine writable paths");
+    if (Object.keys(object(policy.network_policies)).length !== 0)
+      errors.push("advisor OpenShell policy must not allow direct network egress");
+  } catch {
+    errors.push("failed to read or parse advisor OpenShell policy: " + path);
   }
 }
 
-function advisorMatrixEntries(errors: string[], reviewJob: WorkflowRecord): WorkflowRecord[] {
-  const advisor = asRecord(asRecord(reviewJob.strategy).matrix).advisor;
-  if (Array.isArray(advisor)) {
-    const entries = advisor.filter((entry) => asRecord(entry) === entry) as WorkflowRecord[];
-    if (entries.length < 2) errors.push("advisor matrix must include at least two lanes");
-    return entries;
-  }
-  errors.push("advisor matrix must declare strategy.matrix.advisor entries");
-  return [];
-}
-
-function requireUniqueAdvisorMatrixField(
-  errors: string[],
-  entries: readonly WorkflowRecord[],
-  field: string,
-): void {
-  const seen = new Set<string>();
-  for (const [index, entry] of entries.entries()) {
-    const value = stringValue(entry[field]).trim();
-    if (!value) {
-      errors.push(`advisor matrix entry ${index + 1} missing ${field}`);
+function checkSandboxNames(errors: string[], jobs: Array<[string, Value]>): void {
+  const names: string[] = [];
+  for (const [label, job] of jobs) {
+    const rows = object(object(job.strategy).matrix).advisor;
+    const resolvedRows =
+      rows === SPECIALIST_MATRIX_EXPRESSION
+        ? ADVISOR_SPECIALISTS.map(({ sandboxName }) => ({ sandbox_name: sandboxName }))
+        : rows;
+    if (!Array.isArray(resolvedRows) || resolvedRows.length === 0) {
+      errors.push(label + " matrix must declare a non-empty advisor array");
       continue;
     }
-    if (seen.has(value)) errors.push(`advisor matrix field ${field} must be unique: ${value}`);
-    seen.add(value);
+    resolvedRows.map(object).forEach((row, index) => {
+      const name = typeof row.sandbox_name === "string" ? row.sandbox_name : "";
+      names.push(name);
+      if (name.length > 19 || !SANDBOX_NAME.test(name))
+        errors.push(
+          label +
+            " matrix entry " +
+            (index + 1) +
+            " sandbox_name must satisfy the OpenShell sandbox-name contract (max 19 characters)",
+        );
+    });
   }
+  if (new Set(names).size !== names.length)
+    errors.push("specialist sandbox_name values must be unique");
 }
 
 export function validatePrReviewAdvisorWorkflowBoundary(
-  workflowPath = DEFAULT_WORKFLOW_PATH,
+  workflowPath = DEFAULT_WORKFLOW,
+  packageLockPath = DEFAULT_LOCK,
+  policyPath = DEFAULT_POLICY,
 ): string[] {
   const errors: string[] = [];
-  let workflow: WorkflowRecord;
+  let workflow: Value;
   try {
-    workflow = asRecord(YAML.parse(readFileSync(workflowPath, "utf-8")));
+    workflow = object(YAML.parse(readFileSync(workflowPath, "utf8")));
   } catch {
-    errors.push(`failed to read or parse workflow: ${workflowPath}`);
-    return errors;
+    return ["failed to read or parse workflow: " + workflowPath];
   }
-
-  const triggers = asRecord(workflow.on ?? workflow[true as unknown as string]);
-  if (!Object.hasOwn(triggers, "pull_request")) {
-    errors.push("workflow must run on pull_request, not only trusted-target events");
+  checkLock(errors, packageLockPath);
+  checkPolicy(errors, policyPath);
+  const triggers = object(workflow.on ?? workflow.true);
+  if (!("pull_request_target" in triggers) || "pull_request" in triggers)
+    errors.push("workflow must use pull_request_target without pull_request");
+  if (Object.keys(object(workflow.permissions)).length !== 0)
+    errors.push(
+      "workflow-level permissions must be empty so each job declares its privilege domain",
+    );
+  const jobs = object(workflow.jobs);
+  const discovery = object(jobs["discover-specialists"]);
+  const specialists = object(jobs["review-specialists"]);
+  const publish = object(jobs.publish);
+  checkPermissions(errors, "discover-specialists", discovery, {
+    contents: "read",
+    issues: "read",
+    "pull-requests": "read",
+  });
+  checkPermissions(errors, "review-specialists", specialists, SPECIALIST_PERMISSIONS);
+  checkPermissions(errors, "publish", publish, { contents: "read", "pull-requests": "write" });
+  if (jobs.review !== undefined) errors.push("workflow must not declare a synthesis job");
+  for (const [name, job] of Object.entries(jobs)) {
+    if (name !== "publish" && object(object(job).permissions)["pull-requests"] === "write")
+      errors.push("publish must be the only job with pull-requests: write");
   }
-  if (Object.hasOwn(triggers, "pull_request_target")) {
-    errors.push("workflow must not run untrusted PR code under pull_request_target");
-  }
-
-  const reviewJob = asRecord(asRecord(workflow.jobs).review);
-  const advisorEntries = advisorMatrixEntries(errors, reviewJob);
-  for (const field of ["model", "artifact_dir", "artifact_name", "comment_marker"]) {
-    requireUniqueAdvisorMatrixField(errors, advisorEntries, field);
-  }
-  requireJobEnvValue(errors, reviewJob, "PR_REVIEW_ADVISOR_MODEL", "${{ matrix.advisor.model }}");
-  requireJobEnvValue(
-    errors,
-    reviewJob,
-    "PR_REVIEW_ADVISOR_ARTIFACT_DIR",
-    "${{ matrix.advisor.artifact_dir }}",
+  if (JSON.stringify(publish).includes("PR_REVIEW_ADVISOR_API_KEY"))
+    errors.push("publish job must not receive the advisor model credential");
+  if (JSON.stringify(publish).includes("ADVISOR_WORKDIR"))
+    errors.push("publish job must not receive the untrusted analysis worktree");
+  const contextCollection = namedStep(discovery, "Collect GitHub review context");
+  if (object(contextCollection?.env).GH_TOKEN !== "${{ github.token }}")
+    errors.push("shared context collection must receive github.token as GH_TOKEN");
+  const specialistTokenWiring = JSON.stringify(specialists);
+  const specialistEnvironments = [specialists, ...jobSteps(specialists)].map((item) =>
+    object(item.env),
   );
-  requireJobEnvValue(
+  if (
+    specialistEnvironments.some(
+      (env) => env.GH_TOKEN !== undefined || env.GITHUB_TOKEN !== undefined,
+    ) ||
+    /\$\{\{[^}]*\b(?:github\.token|secrets\.GITHUB_TOKEN)\b[^}]*\}\}/u.test(
+      specialistTokenWiring,
+    )
+  )
+    errors.push("specialist jobs must not wire a GitHub token into steps");
+  const contextUpload = namedStep(discovery, "Upload GitHub review context");
+  const contextDownload = namedStep(specialists, "Download GitHub review context");
+  if (!String(contextUpload?.uses ?? "").startsWith("actions/upload-artifact@"))
+    errors.push("shared context upload must use actions/upload-artifact");
+  if (!String(contextDownload?.uses ?? "").startsWith("actions/download-artifact@"))
+    errors.push("shared context download must use actions/download-artifact");
+  requireWith(errors, contextUpload, "path", "artifacts/pr-review-advisor-context/github-context.json");
+  requireWith(
     errors,
-    reviewJob,
-    "PR_REVIEW_ADVISOR_COMMENT_MARKER",
-    "${{ matrix.advisor.comment_marker }}",
+    contextDownload,
+    "path",
+    "${{ runner.temp }}/shared-pr-review-advisor-context",
   );
-  requireJobEnvValue(
+  requireWith(errors, contextUpload, "if-no-files-found", "error");
+  requireWith(errors, contextUpload, "retention-days", 1);
+  requireWith(
     errors,
-    reviewJob,
-    "PR_REVIEW_ADVISOR_COMMENT_TITLE",
-    "${{ matrix.advisor.comment_title }}",
+    contextUpload,
+    "name",
+    "pr-review-advisor-context-${{ github.run_id }}-${{ github.run_attempt }}",
   );
-  requireJobEnvValue(
+  requireWith(
     errors,
-    reviewJob,
-    "PR_REVIEW_ADVISOR_COMMENT_LABEL",
-    "${{ matrix.advisor.comment_label }}",
+    contextDownload,
+    "name",
+    "pr-review-advisor-context-${{ github.run_id }}-${{ github.run_attempt }}",
   );
-
-  const steps = asSteps(reviewJob.steps);
-  if (steps.length === 0) errors.push("review job must declare steps");
-
-  for (const step of steps) {
-    if (step.uses && !usesPinnedAction(step.uses)) {
-      errors.push(`step '${step.name ?? step.uses}' must pin action uses to a full commit SHA`);
-    }
-  }
-
-  const trustedCheckout = requireStep(errors, steps, "Checkout trusted advisor code (main)");
-  requireStepWith(errors, trustedCheckout, "repository", "NVIDIA/NemoClaw");
-  requireStepWith(errors, trustedCheckout, "ref", "main");
-  requireStepWith(errors, trustedCheckout, "path", "advisor");
-  requireStepWith(errors, trustedCheckout, "persist-credentials", false);
-
-  const prCheckout = requireStep(errors, steps, "Checkout PR workspace (read-only data)");
-  requireStepWith(errors, prCheckout, "path", "pr-workdir");
-  requireStepWith(errors, prCheckout, "persist-credentials", false);
-  const prRef = stringValue(asRecord(prCheckout?.with).ref).trim();
-  if (prRef !== "${{ github.event.pull_request.head.sha }}") {
-    errors.push("PR checkout must use the pull request head SHA as inert analysis data");
-  }
-
-  const dispatchCheckout = requireStep(
+  checkSandboxNames(errors, [["specialist", specialists]]);
+  const rows = object(object(specialists.strategy).matrix).advisor;
+  if (rows !== SPECIALIST_MATRIX_EXPRESSION)
+    errors.push("specialist matrix must use the discovered specialist prompts");
+  const specialistNeeds = Array.isArray(specialists.needs)
+    ? specialists.needs
+    : [specialists.needs];
+  if (!specialistNeeds.includes("discover-specialists"))
+    errors.push("specialist matrix must depend on prompt discovery");
+  if (specialists["continue-on-error"] !== undefined)
+    errors.push("specialist failures must block publication");
+  if (publish.needs !== "review-specialists")
+    errors.push("publisher must depend on the specialist matrix");
+  if (object(specialists.env).PR_REVIEW_ADVISOR_INTEREST !== "${{ matrix.advisor.interest }}")
+    errors.push(
+      "specialist job env.PR_REVIEW_ADVISOR_INTEREST must be ${{ matrix.advisor.interest }}",
+    );
+  const prepareInputs = namedStep(specialists, "Prepare advisor sandbox inputs");
+  const prepareEnvironment = object(prepareInputs?.env);
+  if (prepareEnvironment.BASE_REF !== BASE_REF_EXPRESSION)
+    errors.push("Prepare advisor sandbox inputs must receive the selected base ref");
+  if (prepareEnvironment.HEAD_REF !== HEAD_REF_EXPRESSION)
+    errors.push("Prepare advisor sandbox inputs must receive the selected head ref");
+  if (
+    prepareEnvironment.PR_REVIEW_ADVISOR_GITHUB_CONTEXT_PATH !==
+    "${{ runner.temp }}/shared-pr-review-advisor-context/github-context.json"
+  )
+    errors.push("Prepare advisor sandbox inputs must receive the downloaded GitHub context");
+  const specialistUpload = namedStep(specialists, "Upload specialist review");
+  if (!String(specialistUpload?.uses ?? "").startsWith("actions/upload-artifact@"))
+    errors.push("specialist review step must use actions/upload-artifact");
+  requireWith(errors, specialistUpload, "if-no-files-found", "error");
+  requireWith(
     errors,
-    steps,
-    "Checkout dispatch workspace (read-only data)",
+    specialistUpload,
+    "path",
+    "artifacts/${{ matrix.advisor.artifact_dir }}/",
   );
-  requireStepWith(errors, dispatchCheckout, "path", "pr-workdir");
-  requireStepWith(errors, dispatchCheckout, "persist-credentials", false);
-
-  const install = requireStep(errors, steps, "Install Pi SDK");
-  requireRunContains(errors, install, "--ignore-scripts");
-  requireRunContains(errors, install, "$ADVISOR_DIR/node_modules");
-
-  const analyze = requireStep(errors, steps, "Run PR review advisor");
-  requireRunContains(errors, analyze, 'cd "$ADVISOR_WORKDIR"');
-  requireRunContains(errors, analyze, "$ADVISOR_DIR/tools/pr-review-advisor/analyze.mts");
-  requireRunContains(errors, analyze, "$ADVISOR_DIR/tools/pr-review-advisor/schema.json");
-  requireRunContains(errors, analyze, "$PR_REVIEW_ADVISOR_MODEL");
-  requireRunContains(errors, analyze, "PR_REVIEW_ADVISOR_SUPPORTED=0");
-  requireRunContains(errors, analyze, "PR_REVIEW_ADVISOR_RUN_ANALYSIS=0");
-  requireRunContains(errors, analyze, "PR_REVIEW_ADVISOR_UNAVAILABLE_REASON");
-  requireRunContains(errors, analyze, "trusted main checkout does not yet support");
-  if (analyze) {
-    const analyzeEnv = asRecord(analyze.env);
-    if (
-      stringValue(analyzeEnv.PR_REVIEW_ADVISOR_API_KEY).trim() !==
-      "${{ secrets.PR_REVIEW_ADVISOR_API_KEY }}"
-    ) {
-      errors.push(
-        "Run PR review advisor must receive PR_REVIEW_ADVISOR_API_KEY only from secrets.PR_REVIEW_ADVISOR_API_KEY",
-      );
-    }
-    if (Object.hasOwn(analyzeEnv, "OPENAI_API_KEY")) {
-      errors.push("Run PR review advisor must not receive OPENAI_API_KEY");
-    }
-  }
-
-  const comment = requireStep(errors, steps, "Post PR review advisor comment");
-  requireRunContains(errors, comment, "$ADVISOR_DIR/tools/pr-review-advisor/comment.mts");
-  requireRunContains(errors, comment, "PR_REVIEW_ADVISOR_SUPPORTED");
-  requireRunOrders(
+  requireWith(
     errors,
-    comment,
-    'if [ "${PR_REVIEW_ADVISOR_SUPPORTED:-1}" = "0" ]',
-    "$ADVISOR_DIR/tools/pr-review-advisor/comment.mts",
+    namedStep(publish, "Checkout trusted comment publisher (workflow revision)"),
+    "ref",
+    "${{ github.workflow_sha }}",
   );
-  requireRunContains(errors, comment, '--marker "$PR_REVIEW_ADVISOR_COMMENT_MARKER"');
-  requireRunContains(errors, comment, '--title "$PR_REVIEW_ADVISOR_COMMENT_TITLE"');
-  requireRunContains(errors, comment, '--label "$PR_REVIEW_ADVISOR_COMMENT_LABEL"');
-
-  const permissions = asRecord(workflow.permissions);
-  if (permissions.contents !== "read") errors.push("workflow permissions.contents must be read");
-  if (booleanValue(reviewJob["continue-on-error"]) === true) {
-    errors.push("review job must not be globally continue-on-error");
-  }
-
+  const publishCommand = String(namedStep(publish, "Post PR review advisor link")?.run ?? "");
+  if (!publishCommand.includes("tools/pr-review-advisor/completion-comment.mts"))
+    errors.push("publisher must post the workflow-run advisory link");
+  checkActionPins(errors, "discover-specialists", discovery);
+  checkActionPins(errors, "review-specialists", specialists);
+  checkActionPins(errors, "publish", publish);
   return errors;
 }

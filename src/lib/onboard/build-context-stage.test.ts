@@ -6,9 +6,10 @@ import os from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-
-import { CUSTOM_BUILD_CONTEXT_WARN_BYTES } from "../../../dist/lib/onboard/custom-build-context";
-import { stageCreateSandboxBuildContext } from "../../../dist/lib/onboard/build-context-stage";
+import { createAgentSandbox as createManagedAgentSandbox } from "../agent/base-image";
+import { SandboxBaseImageResolutionError } from "../sandbox-base-image";
+import { stageCreateSandboxBuildContext } from "./build-context-stage";
+import { CUSTOM_BUILD_CONTEXT_WARN_BYTES } from "./custom-build-context";
 
 const tmpDirs: string[] = [];
 
@@ -20,6 +21,21 @@ function makeTmpDir(prefix: string): string {
 
 function throwingExit(code?: number): never {
   throw new Error(`exit ${code ?? 0}`);
+}
+
+function writeFixtureFile(root: string, relativePath: string, contents: string): void {
+  const target = path.join(root, relativePath);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, contents);
+}
+
+function readStagedBytes(root: string): string {
+  return fs
+    .readdirSync(root, { encoding: "utf8", recursive: true })
+    .map((relativePath) => path.join(root, relativePath))
+    .filter((entryPath) => fs.statSync(entryPath).isFile())
+    .map((entryPath) => fs.readFileSync(entryPath, "utf8"))
+    .join("\n");
 }
 
 describe("stageCreateSandboxBuildContext", () => {
@@ -54,10 +70,164 @@ describe("stageCreateSandboxBuildContext", () => {
       `  Docker build context: ${buildContextDir}`,
     ]);
     expect(fs.readFileSync(result.stagedDockerfile, "utf-8")).toBe("FROM scratch\n");
+    expect(result.origin).toBe("custom");
     expect(fs.existsSync(path.join(result.buildCtx, "extra.txt"))).toBe(true);
     expect(fs.existsSync(path.join(result.buildCtx, ".ssh"))).toBe(false);
     expect(result.cleanupBuildCtx()).toBe(true);
     expect(fs.existsSync(result.buildCtx)).toBe(false);
+  });
+
+  it("stages the managed agent build context when --from targets the agent's own Dockerfile (#7205)", () => {
+    const repoRoot = makeTmpDir("nemoclaw-repo-root-");
+    const agentDir = path.join(repoRoot, "agents", "hermes");
+    fs.mkdirSync(agentDir, { recursive: true });
+    const agentDockerfile = path.join(agentDir, "Dockerfile");
+    fs.writeFileSync(agentDockerfile, "FROM scratch\nCOPY agents/hermes/plugin/ /opt/plugin/\n");
+    const agentBuild = {
+      buildCtx: makeTmpDir("nemoclaw-agent-staged-"),
+      stagedDockerfile: path.join(makeTmpDir("nemoclaw-agent-staged-df-"), "agent.Dockerfile"),
+    };
+    const createAgentSandbox = vi.fn(() => agentBuild);
+    const agent = { name: "hermes", displayName: "Hermes", dockerfilePath: agentDockerfile } as any;
+    const logs: string[] = [];
+
+    const result = stageCreateSandboxBuildContext({
+      root: repoRoot,
+      fromDockerfile: agentDockerfile,
+      agent,
+      createAgentSandbox,
+      log: (message) => logs.push(message),
+      exit: throwingExit,
+    });
+
+    expect(createAgentSandbox).toHaveBeenCalledWith(agent);
+    expect(result.buildCtx).toBe(agentBuild.buildCtx);
+    expect(result.origin).toBe("generated");
+    expect(logs).toEqual([
+      `  Using trusted Hermes Dockerfile: ${agentDockerfile}`,
+      "  Staging the repository root as the managed Hermes build context.",
+    ]);
+  });
+
+  it("filters checkout credentials from the staged managed repository-root context (#7205)", () => {
+    const repoRoot = makeTmpDir("nemoclaw-managed-context-security-");
+    const requiredFiles = [
+      ["agents/hermes/plugin/entry.py", "required-plugin-bytes"],
+      ["src/lib/tool-disclosure.ts", "required-tool-disclosure-bytes"],
+      ["scripts/lib/reviewed-npm-archive.mts", "required-script-bytes"],
+      ["scripts/lib/bundled-npm-package.mts", "required-package-helper-bytes"],
+      ["scripts/lib/seed-reviewed-npm-cache.mts", "required-cache-seed-bytes"],
+      ["nemoclaw-blueprint/blueprint.yaml", "required-blueprint-bytes"],
+    ] as const;
+    const credentialFiles = [
+      [".env.local", "forbidden-env-canary"],
+      [".ssh/id_ed25519", "forbidden-ssh-canary"],
+      [".aws/credentials", "forbidden-aws-canary"],
+      [".npmrc", "forbidden-npm-canary"],
+      ["secrets/token.txt", "forbidden-secrets-canary"],
+      ["certs/client.pem", "forbidden-pem-canary"],
+      ["keys/client.key", "forbidden-key-canary"],
+    ] as const;
+    const agentDockerfile = path.join(repoRoot, "agents", "hermes", "Dockerfile");
+    writeFixtureFile(
+      repoRoot,
+      "agents/hermes/Dockerfile",
+      "FROM scratch\nCOPY agents/hermes/plugin/ /opt/plugin/\nCOPY src/ /src/\nCOPY scripts/ /scripts/\nCOPY nemoclaw-blueprint/ /blueprint/\n",
+    );
+    [...requiredFiles, ...credentialFiles].forEach(([relativePath, contents]) => {
+      writeFixtureFile(repoRoot, relativePath, contents);
+    });
+    writeFixtureFile(repoRoot, "ignored-by-repo-rule.txt", "forbidden-dockerignore-canary");
+    writeFixtureFile(
+      repoRoot,
+      ".dockerignore",
+      [
+        "ignored-by-repo-rule.txt",
+        "!.env.local",
+        "!.ssh/id_ed25519",
+        "!.aws/credentials",
+        "!.npmrc",
+        "!secrets/token.txt",
+        "!certs/client.pem",
+        "!keys/client.key",
+      ].join("\n"),
+    );
+
+    const result = stageCreateSandboxBuildContext({
+      root: repoRoot,
+      fromDockerfile: agentDockerfile,
+      agent: {
+        name: "hermes",
+        displayName: "Hermes",
+        dockerfileBasePath: null,
+        dockerfilePath: agentDockerfile,
+      } as any,
+      createAgentSandbox: (agent) => createManagedAgentSandbox(agent, { rootDir: repoRoot }),
+      log: vi.fn(),
+      exit: throwingExit,
+    });
+    tmpDirs.push(result.buildCtx);
+
+    const stagedBytes = readStagedBytes(result.buildCtx);
+    expect(requiredFiles.every(([relativePath, contents]) =>
+        Object.is(fs.readFileSync(path.join(result.buildCtx, relativePath), "utf8"), contents))).toBe(true);
+    credentialFiles.forEach(([relativePath, contents]) => {
+      expect(fs.existsSync(path.join(result.buildCtx, relativePath))).toBe(false);
+      expect(stagedBytes).not.toContain(contents);
+    });
+    expect(stagedBytes).not.toContain("forbidden-dockerignore-canary");
+  });
+
+  it("stages the managed agent build context when --from reaches the agent Dockerfile through a symlink", () => {
+    const repoRoot = makeTmpDir("nemoclaw-repo-symlink-");
+    const agentDir = path.join(repoRoot, "agents", "hermes");
+    fs.mkdirSync(agentDir, { recursive: true });
+    const agentDockerfile = path.join(agentDir, "Dockerfile");
+    fs.writeFileSync(agentDockerfile, "FROM scratch\n");
+    const linkDir = makeTmpDir("nemoclaw-linked-checkout-");
+    const linkedDockerfile = path.join(linkDir, "Dockerfile");
+    fs.symlinkSync(agentDockerfile, linkedDockerfile);
+    const agentBuild = {
+      buildCtx: makeTmpDir("nemoclaw-agent-staged-link-"),
+      stagedDockerfile: path.join(makeTmpDir("nemoclaw-agent-staged-link-df-"), "agent.Dockerfile"),
+    };
+    const createAgentSandbox = vi.fn(() => agentBuild);
+    const agent = { name: "hermes", displayName: "Hermes", dockerfilePath: agentDockerfile } as any;
+
+    const result = stageCreateSandboxBuildContext({
+      root: repoRoot,
+      fromDockerfile: linkedDockerfile,
+      agent,
+      createAgentSandbox,
+      log: vi.fn(),
+      exit: throwingExit,
+    });
+
+    expect(createAgentSandbox).toHaveBeenCalledWith(agent);
+    expect(result.buildCtx).toBe(agentBuild.buildCtx);
+  });
+
+  it("keeps the parent-directory contract for a standalone Dockerfile when an agent is selected", () => {
+    const buildContextDir = makeTmpDir("nemoclaw-standalone-context-");
+    const standaloneDockerfile = path.join(buildContextDir, "Dockerfile");
+    fs.writeFileSync(standaloneDockerfile, "FROM scratch\n");
+    const otherDockerfile = path.join(makeTmpDir("nemoclaw-agent-home-"), "Dockerfile");
+    fs.writeFileSync(otherDockerfile, "FROM scratch\n");
+    const createAgentSandbox = vi.fn();
+
+    const result = stageCreateSandboxBuildContext({
+      root: "/unused",
+      fromDockerfile: standaloneDockerfile,
+      agent: { name: "hermes", displayName: "Hermes", dockerfilePath: otherDockerfile } as any,
+      createAgentSandbox,
+      log: vi.fn(),
+      exit: throwingExit,
+    });
+    tmpDirs.push(result.buildCtx);
+
+    expect(createAgentSandbox).not.toHaveBeenCalled();
+    expect(result.origin).toBe("custom");
+    expect(fs.existsSync(result.stagedDockerfile)).toBe(true);
   });
 
   it("exits when the custom Dockerfile path is missing", () => {
@@ -178,14 +348,83 @@ describe("stageCreateSandboxBuildContext", () => {
     expect(fs.existsSync(stagedBuildCtx)).toBe(false);
   });
 
+  it("converts a SandboxBaseImageResolutionError from createAgentSandbox to a clean exit (#8102)", () => {
+    const errors: string[] = [];
+    const resolutionError = new SandboxBaseImageResolutionError(
+      "Hermes Agent sandbox base image override 'ghcr.io/nvidia/nemoclaw/hermes-sandbox-base@sha256:deadbeef' could not be resolved to an immutable trusted digest or failed required compatibility checks.",
+    );
+
+    expect(() =>
+      stageCreateSandboxBuildContext({
+        root: "/repo",
+        fromDockerfile: null,
+        agent: { name: "hermes", displayName: "Hermes Agent" } as any,
+        createAgentSandbox: () => {
+          throw resolutionError;
+        },
+        error: (msg) => errors.push(msg),
+        exit: throwingExit,
+      }),
+    ).toThrow("exit 1");
+
+    expect(errors).toEqual([`  ${resolutionError.message}`]);
+  });
+
+  it("converts a SandboxBaseImageResolutionError from the --from=<agent Dockerfile> path to a clean exit (#8102)", () => {
+    const agentDockerfilePath = path.join(makeTmpDir("nemoclaw-8102-from-"), "agent.Dockerfile");
+    fs.writeFileSync(agentDockerfilePath, "FROM scratch\n");
+    const errors: string[] = [];
+    const resolutionError = new SandboxBaseImageResolutionError(
+      "Hermes Agent sandbox base image override 'ghcr.io/nvidia/nemoclaw/hermes-sandbox-base@sha256:deadbeef' is outside the trusted repository 'ghcr.io/nvidia/nemoclaw/hermes-sandbox-base'.",
+    );
+
+    expect(() =>
+      stageCreateSandboxBuildContext({
+        root: "/repo",
+        fromDockerfile: agentDockerfilePath,
+        agent: {
+          name: "hermes",
+          displayName: "Hermes Agent",
+          dockerfilePath: agentDockerfilePath,
+        } as any,
+        createAgentSandbox: () => {
+          throw resolutionError;
+        },
+        log: vi.fn(),
+        error: (msg) => errors.push(msg),
+        exit: throwingExit,
+      }),
+    ).toThrow("exit 1");
+
+    expect(errors).toEqual([`  ${resolutionError.message}`]);
+    fs.rmSync(agentDockerfilePath, { force: true });
+  });
+
+  it("re-throws non-SandboxBaseImageResolutionError from createAgentSandbox (#8102)", () => {
+    const unexpected = new Error("unexpected internal failure");
+
+    expect(() =>
+      stageCreateSandboxBuildContext({
+        root: "/repo",
+        fromDockerfile: null,
+        agent: { name: "hermes", displayName: "Hermes Agent" } as any,
+        createAgentSandbox: () => {
+          throw unexpected;
+        },
+        error: vi.fn(),
+        exit: throwingExit,
+      }),
+    ).toThrow("unexpected internal failure");
+  });
+
   it("delegates to agent or default build-context staging when no custom Dockerfile is supplied", () => {
     const agentBuild = {
       buildCtx: makeTmpDir("nemoclaw-agent-build-"),
-      stagedDockerfile: path.join(os.tmpdir(), "agent.Dockerfile"),
+      stagedDockerfile: path.join(makeTmpDir("nemoclaw-agent-build-df-"), "agent.Dockerfile"),
     };
     const defaultBuild = {
       buildCtx: makeTmpDir("nemoclaw-default-build-"),
-      stagedDockerfile: path.join(os.tmpdir(), "default.Dockerfile"),
+      stagedDockerfile: path.join(makeTmpDir("nemoclaw-default-build-df-"), "default.Dockerfile"),
     };
     const createAgentSandbox = vi.fn(() => agentBuild);
     const stageDefaultSandboxBuildContext = vi.fn(() => defaultBuild);
@@ -199,6 +438,7 @@ describe("stageCreateSandboxBuildContext", () => {
     });
 
     expect(agentResult.buildCtx).toBe(agentBuild.buildCtx);
+    expect(agentResult.origin).toBe("generated");
     expect(createAgentSandbox).toHaveBeenCalledWith({ name: "hermes" });
     expect(stageDefaultSandboxBuildContext).not.toHaveBeenCalled();
 
@@ -211,6 +451,7 @@ describe("stageCreateSandboxBuildContext", () => {
     });
 
     expect(defaultResult.buildCtx).toBe(defaultBuild.buildCtx);
+    expect(defaultResult.origin).toBe("generated");
     expect(stageDefaultSandboxBuildContext).toHaveBeenCalledWith("/repo");
   });
 });

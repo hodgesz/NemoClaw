@@ -33,9 +33,9 @@
 //         (method name, params, error envelopes, unexpected payloads,
 //         `--keep-transcript` mapping, `--agent` mismatch refusal) —
 //         see `paths.test.ts`, `gateway-rpc.test.ts`, `reset.test.ts`,
-//         and `delete.test.ts`. The host-side E2E
-//         (`test/e2e/test-sessions-agents-cli.sh`, TC-SESS-03/04) proves
-//         the wrapper routes and that the gateway envelope round-trips.
+//         and `delete.test.ts`. The host-side E2E in
+//         `test/e2e/live/sessions-agents-cli.test.ts` proves the wrapper
+//         routes and that the gateway envelope round-trips.
 //         Adding stale-lock or corrupt-store seeding here would force
 //         NemoClaw to write into `/sandbox/.openclaw/sessions/` from the
 //         host, which the sandbox isolation guards specifically forbid.
@@ -60,6 +60,12 @@
 //     comment exists to keep the NemoClaw/OpenClaw responsibility split
 //     explicit while the contract is still informal.
 
+import { assertHermesPortableCommandUnavailable } from "../../../onboard/experimental/portable-agent-lifecycle";
+import {
+  deferSandboxLifecycleExit,
+  runWithDeferredSandboxLifecycleExit,
+} from "../../../core/process-exit";
+import { withMcpLifecycleLock } from "../../../state/mcp-lifecycle-lock-acquisition";
 import { ensureLiveSandboxOrExit } from "../gateway-state";
 import { callOpenclawGateway } from "./gateway-rpc";
 import {
@@ -97,6 +103,18 @@ export async function resetSandboxSession(
   sandboxName: string,
   opts: SessionsResetOptions,
 ): Promise<SessionsResetResult> {
+  return runWithDeferredSandboxLifecycleExit(() =>
+    withMcpLifecycleLock(sandboxName, () => {
+      assertHermesPortableCommandUnavailable(sandboxName, "sandbox:sessions:reset");
+      return resetSandboxSessionUnlocked(sandboxName, opts);
+    }),
+  );
+}
+
+async function resetSandboxSessionUnlocked(
+  sandboxName: string,
+  opts: SessionsResetOptions,
+): Promise<SessionsResetResult> {
   const reason: SessionsResetReason = opts.reason === "new" ? "new" : "reset";
   const requestedAgent = opts.agent ? validateAgentId(opts.agent) : null;
   const rawKey = validateSessionKey(opts.key);
@@ -109,30 +127,34 @@ export async function resetSandboxSession(
     console.error(
       `  Drop --agent or pass a key under that agent (e.g. agent:${requestedAgent}:...).`,
     );
-    process.exit(1);
+    deferSandboxLifecycleExit(1);
   }
 
   const resolvedAgent = keyAgent ?? requestedAgent ?? DEFAULT_AGENT_ID;
   const canonicalKey = buildCanonicalSessionKey(resolvedAgent, rawKey);
 
-  await ensureLiveSandboxOrExit(sandboxName, { allowNonReadyPhase: true });
+  await ensureLiveSandboxOrExit(sandboxName, {
+    allowNonReadyPhase: true,
+    exit: deferSandboxLifecycleExit,
+  });
 
   const { payload, rawOutput } = callOpenclawGateway<SessionsResetPayload>({
     sandboxName,
     method: "sessions.reset",
     params: { key: canonicalKey, reason },
+    exit: deferSandboxLifecycleExit,
   });
 
   if (payload.ok === false || payload.error) {
     const code = payload.error?.code ?? "unknown";
     const message = payload.error?.message ?? "no message";
     console.error(`  Gateway refused sessions.reset for '${canonicalKey}': [${code}] ${message}`);
-    process.exit(1);
+    deferSandboxLifecycleExit(1);
   }
   if (payload.ok !== true || typeof payload.key !== "string") {
     console.error("  Gateway returned an unexpected sessions.reset payload.");
     console.error(`  ${rawOutput.trim()}`);
-    process.exit(1);
+    deferSandboxLifecycleExit(1);
   }
 
   if (opts.json) {

@@ -2,12 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
-import path from "node:path";
 
-// Import from compiled dist/ for correct coverage attribution.
-async function loadVerifier(): Promise<typeof import("../../../dist/lib/shields/verify-lock")> {
-  const distModulePath = path.join(process.cwd(), "dist", "lib", "shields", "verify-lock.js");
-  return import(distModulePath);
+async function loadVerifier(): Promise<typeof import("./verify-lock")> {
+  return import("./verify-lock");
 }
 
 const target = {
@@ -62,6 +59,171 @@ describe("verifyShieldsLockState", () => {
         "/sandbox/.openclaw/.config-hash owner=sandbox:sandbox (expected root:root)",
         "dir mode=2770 (expected 755)",
         "dir owner=sandbox:sandbox (expected root:root)",
+      ]),
+    );
+  });
+
+  it("requires the sticky root-owned sandbox parent for a locked Hermes tree", async () => {
+    const { verifyShieldsLockState } = await loadVerifier();
+    const hermesTarget = {
+      agentName: "hermes",
+      configPath: "/sandbox/.hermes/config.yaml",
+      configDir: "/sandbox/.hermes",
+      sensitiveFiles: ["/sandbox/.hermes/.env", "/sandbox/.hermes/.config-hash"],
+    };
+    const clean = makeExec({
+      "/sandbox/.hermes/config.yaml": "444 root:root",
+      "/sandbox/.hermes/.env": "444 root:root",
+      "/sandbox/.hermes/.config-hash": "444 root:root",
+      // Root-owned in the sandbox group with set-id/sticky: Hermes keeps
+      // writing top-level runtime state while the sticky bit stops the sandbox
+      // identity unlinking the sealed root-owned files (#7865).
+      "/sandbox/.hermes": "3770 root:sandbox",
+      "/sandbox": "1775 root:sandbox",
+    });
+
+    expect(
+      verifyShieldsLockState("hermes", hermesTarget, {
+        exec: clean,
+        verifyParentProtection: true,
+      }),
+    ).toEqual({ ok: true, issues: [] });
+
+    const replaceableParent = makeExec({
+      "/sandbox/.hermes/config.yaml": "444 root:root",
+      "/sandbox/.hermes/.env": "444 root:root",
+      "/sandbox/.hermes/.config-hash": "444 root:root",
+      "/sandbox/.hermes": "3770 root:sandbox",
+      "/sandbox": "755 sandbox:sandbox",
+    });
+    const drifted = verifyShieldsLockState("hermes", hermesTarget, {
+      exec: replaceableParent,
+      verifyParentProtection: true,
+    });
+    expect(drifted.ok).toBe(false);
+    expect(drifted.issues).toEqual(
+      expect.arrayContaining([
+        "parent dir mode=755 (expected 1775)",
+        "parent dir owner=sandbox:sandbox (expected root:sandbox)",
+      ]),
+    );
+  });
+
+  it("reports the previous root-owned Hermes config root as drift (#7865)", async () => {
+    const { verifyShieldsLockState } = await loadVerifier();
+    const hermesTarget = {
+      agentName: "hermes",
+      configPath: "/sandbox/.hermes/config.yaml",
+      configDir: "/sandbox/.hermes",
+      sensitiveFiles: ["/sandbox/.hermes/.env", "/sandbox/.hermes/.config-hash"],
+    };
+    // A Hermes root left at the old 755 root:root cannot run a gateway at all,
+    // so it must surface as drift for the caller's re-lock to repair rather
+    // than passing as a healthy lock.
+    const legacyLocked = makeExec({
+      "/sandbox/.hermes/config.yaml": "444 root:root",
+      "/sandbox/.hermes/.env": "444 root:root",
+      "/sandbox/.hermes/.config-hash": "444 root:root",
+      "/sandbox/.hermes": "755 root:root",
+      "/sandbox": "1775 root:sandbox",
+    });
+
+    const result = verifyShieldsLockState("hermes", hermesTarget, {
+      exec: legacyLocked,
+      verifyParentProtection: true,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.issues).toEqual(
+      expect.arrayContaining([
+        "dir mode=755 (expected 3770)",
+        "dir owner=root:root (expected root:sandbox)",
+      ]),
+    );
+  });
+
+  it("keeps the OpenClaw locked config root at 755 root:root", async () => {
+    const { verifyShieldsLockState } = await loadVerifier();
+    const openClawTarget = {
+      agentName: "openclaw",
+      configPath: "/sandbox/.openclaw/openclaw.json",
+      configDir: "/sandbox/.openclaw",
+      sensitiveFiles: ["/sandbox/.openclaw/.config-hash"],
+    };
+    const exec = makeExec({
+      "/sandbox/.openclaw/openclaw.json": "444 root:root",
+      "/sandbox/.openclaw/.config-hash": "444 root:root",
+      "/sandbox/.openclaw": "755 root:root",
+    });
+
+    expect(verifyShieldsLockState("openclaw", openClawTarget, { exec })).toEqual({
+      ok: true,
+      issues: [],
+    });
+  });
+
+  it("requires a protected parent for managed top-level configs but not custom agents", async () => {
+    const { verifyShieldsLockState } = await loadVerifier();
+    const openClawTarget = { ...target, agentName: "openclaw" };
+    const replaceableParent = makeExec({
+      "/sandbox/.openclaw/openclaw.json": "444 root:root",
+      "/sandbox/.openclaw/.config-hash": "444 root:root",
+      "/sandbox/.openclaw": "755 root:root",
+      "/sandbox": "755 sandbox:sandbox",
+    });
+
+    expect(
+      verifyShieldsLockState("openclaw", openClawTarget, {
+        exec: replaceableParent,
+        verifyParentProtection: true,
+      }).issues,
+    ).toEqual(
+      expect.arrayContaining([
+        "parent dir mode=755 (expected 1775)",
+        "parent dir owner=sandbox:sandbox (expected root:sandbox)",
+      ]),
+    );
+
+    const customTarget = {
+      agentName: "dcode",
+      configPath: "/sandbox/.dcode/config.json",
+      configDir: "/sandbox/.dcode",
+      sensitiveFiles: ["/sandbox/.dcode/.config-hash"],
+    };
+    const customExec = makeExec({
+      "/sandbox/.dcode/config.json": "444 root:root",
+      "/sandbox/.dcode/.config-hash": "444 root:root",
+      "/sandbox/.dcode": "755 root:root",
+      "/sandbox": "755 sandbox:sandbox",
+    });
+    expect(
+      verifyShieldsLockState("dcode", customTarget, {
+        exec: customExec,
+        verifyParentProtection: true,
+      }),
+    ).toEqual({ ok: true, issues: [] });
+
+    const deepAgentsTarget = {
+      agentName: "langchain-deepagents-code",
+      configPath: "/sandbox/.deepagents/config.toml",
+      configDir: "/sandbox/.deepagents",
+      sensitiveFiles: ["/sandbox/.deepagents/.config-hash"],
+    };
+    const replaceableDeepAgentsParent = makeExec({
+      "/sandbox/.deepagents/config.toml": "444 root:root",
+      "/sandbox/.deepagents/.config-hash": "444 root:root",
+      "/sandbox/.deepagents": "755 root:root",
+      "/sandbox": "755 sandbox:sandbox",
+    });
+    expect(
+      verifyShieldsLockState("dcode", deepAgentsTarget, {
+        exec: replaceableDeepAgentsParent,
+        verifyParentProtection: true,
+      }).issues,
+    ).toEqual(
+      expect.arrayContaining([
+        "parent dir mode=755 (expected 1775)",
+        "parent dir owner=sandbox:sandbox (expected root:sandbox)",
       ]),
     );
   });
@@ -141,6 +303,33 @@ describe("verifyShieldsLockState", () => {
       expect.arrayContaining([
         "/sandbox/.openclaw/openclaw.json immutable bit not set",
         "/sandbox/.openclaw/.config-hash immutable bit not set",
+      ]),
+    );
+  });
+
+  it("flags lsattr failures as drift instead of swallowing them", async () => {
+    const { verifyShieldsLockState } = await loadVerifier();
+    const locked = makeExec({
+      "/sandbox/.openclaw/openclaw.json": "444 root:root",
+      "/sandbox/.openclaw/.config-hash": "444 root:root",
+      "/sandbox/.openclaw": "755 root:root",
+    });
+    const failing: Record<string, () => never> = {
+      lsattr: () => {
+        throw new Error("lsattr: Inappropriate ioctl for device While reading flags");
+      },
+    };
+    const exec = (cmd: string[]): string => (failing[cmd[0]] ?? (() => locked(cmd)))();
+
+    const result = verifyShieldsLockState("openclaw", target, { exec, verifyChattr: true });
+
+    expect(result.ok).toBe(false);
+    expect(result.issues).toEqual(
+      expect.arrayContaining([
+        "/sandbox/.openclaw/openclaw.json immutable bit unverified (lsattr failed: " +
+          "lsattr: Inappropriate ioctl for device While reading flags)",
+        "/sandbox/.openclaw/.config-hash immutable bit unverified (lsattr failed: " +
+          "lsattr: Inappropriate ioctl for device While reading flags)",
       ]),
     );
   });

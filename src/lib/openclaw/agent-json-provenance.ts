@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { isRecord } from "../core/json-types";
+import { isObjectRecord, type UnknownRecord } from "../core/json-types";
 import { redactFull } from "../security/redact";
 
 const FAILURE_STATUS_VALUES = new Set(["error", "errored", "failed", "failure"]);
@@ -23,15 +23,15 @@ type WalkEntry = {
 };
 
 function snippet(value: string, limit = 300): string {
-  const squashed = value
+  const sanitized = value
     .replace(ANSI_OSC_PATTERN, "")
     .replace(ANSI_CSI_PATTERN, "")
     .replace(/\r|\u0008/gu, "")
-    .replace(CONTROL_PATTERN, "")
-    .replace(/\s+/gu, " ")
-    .trim();
-  const redacted = redactProvenanceDetail(squashed);
-  return redacted.length <= limit ? redacted : `${redacted.slice(0, limit - 3)}...`;
+    .replace(CONTROL_PATTERN, "");
+  // Preserve line boundaries while redacting so line-oriented header patterns
+  // cannot consume unrelated details that happen to follow on another line.
+  const squashed = redactProvenanceDetail(sanitized).replace(/\s+/gu, " ").trim();
+  return squashed.length <= limit ? squashed : `${squashed.slice(0, limit - 3)}...`;
 }
 
 function redactProvenanceDetail(value: string): string {
@@ -60,7 +60,7 @@ function strings(value: unknown): string[] {
 
     const children = Array.isArray(entry.value)
       ? entry.value
-      : isRecord(entry.value)
+      : isObjectRecord(entry.value)
         ? Object.values(entry.value)
         : [];
     if (children.length === 0) continue;
@@ -79,7 +79,7 @@ function strings(value: unknown): string[] {
 
 function detailFromValue(value: unknown): string | null {
   if (typeof value === "string") return snippet(value);
-  if (Array.isArray(value) || isRecord(value)) {
+  if (Array.isArray(value) || isObjectRecord(value)) {
     const nested = strings(value)
       .map((part) => snippet(part))
       .filter(Boolean);
@@ -167,19 +167,23 @@ function collectToolFailureProvenance(value: unknown): string[] {
     visited += 1;
     if (entry.depth > MAX_PROVENANCE_WALK_DEPTH) continue;
 
-    const children = Array.isArray(entry.value)
-      ? entry.value
-      : isRecord(entry.value)
-        ? Object.values(entry.value)
-        : [];
-    if (!Array.isArray(entry.value) && !isRecord(entry.value)) continue;
+    let children: unknown[];
+    let recordValue: UnknownRecord | null = null;
+    if (Array.isArray(entry.value)) {
+      children = entry.value;
+    } else if (isObjectRecord(entry.value)) {
+      recordValue = entry.value;
+      children = Object.values(recordValue);
+    } else {
+      continue;
+    }
 
     const objectValue = entry.value as object;
     if (seen.has(objectValue)) continue;
     seen.add(objectValue);
 
-    if (isRecord(entry.value)) {
-      const line = toolFailureLine(entry.value);
+    if (recordValue) {
+      const line = toolFailureLine(recordValue);
       if (line) lines.push(line);
     }
 
@@ -280,4 +284,122 @@ export function openClawAgentJsonProvenanceLines(raw: string): string[] {
     ...collectUntrustedChildProvenance(raw, docs),
     ...docs.flatMap(collectToolFailureProvenance),
   ]);
+}
+
+// Turn-level completion markers (#8796).
+//
+// Read ONLY from the run-metadata record the envelope declares, never from
+// arbitrary descendants. Tool results and tool-call arguments are untrusted
+// data: a successful turn whose tool output merely CONTAINS
+// {"replayInvalid": true} must not be reported as a failure, because callers
+// would then retry a turn that already completed and repeat its side effects.
+//
+// Accepted paths, from the OpenClaw 2026.7.1 type declarations
+// (dist/types-*.d.ts, dist/agent-runtime-*.d.ts):
+//   EmbeddedAgentRunResult = { payloads?, meta: EmbeddedAgentRunMeta, ... }
+//   agentCommandInternal() -> { payloads, meta: EmbeddedAgentRunMeta & ... }
+// so run metadata is a sibling of `payloads`, reachable only in a local
+// `{ payloads, meta }` response or a gateway
+// `{ status, result: { payloads, meta } }` response. Tool results live under
+// `result.messages[].content` and are therefore never consulted.
+//
+// The markers themselves, all declared on EmbeddedAgentRunMeta:
+//   replayInvalid?: boolean
+//   livenessState?: "working" | "paused" | "blocked" | "abandoned"
+//   timeoutPhase?: "queue" | "preflight" | "provider" | "post_turn" | "gateway_draining"
+//   error?: { kind: ... | "incomplete_turn" | ... }
+//
+// `timeoutPhase` marks a run whose deadline fired (#8723). It is optional and
+// absent from a turn that answered, so its presence is the marker and any phase
+// value counts; the declared phases are recorded above as documentation, not as
+// an allowlist, so a phase added upstream is still classified as a timeout
+// instead of being reported as a success.
+//
+// `livenessState` is deliberately not a timeout marker. Two identical timed-out
+// runs reported `blocked` and `working`, so only `abandoned` stays tied to the
+// abandonment case it was added for.
+const ABANDONED_LIVENESS_VALUE = "abandoned";
+// Compared after `normalized()`, which lowercases and maps `_` to `-`.
+const INCOMPLETE_TURN_ERROR_KIND = "incomplete-turn";
+
+export type OpenClawIncompleteTurnSignal = {
+  /** Human-readable `field=value` markers, deduped. */
+  markers: string[];
+  /** The declared phase the deadline fired in, absent when the run did not time out. */
+  timeoutPhase?: string;
+};
+
+/** The declared run-metadata record from an agent response envelope. */
+function agentResponseMetaRecord(doc: unknown): UnknownRecord | null {
+  if (!isObjectRecord(doc)) return null;
+
+  const result = doc.result;
+  if (
+    typeof doc.status === "string" &&
+    isObjectRecord(result) &&
+    (!Object.hasOwn(result, "payloads") || Array.isArray(result.payloads)) &&
+    isObjectRecord(result.meta)
+  ) {
+    return result.meta;
+  }
+
+  if (
+    !Object.hasOwn(doc, "event") &&
+    (!Object.hasOwn(doc, "payloads") || Array.isArray(doc.payloads)) &&
+    isObjectRecord(doc.meta)
+  ) {
+    return doc.meta;
+  }
+  return null;
+}
+
+/** Select the final agent response without treating JSON log records as responses. */
+function finalAgentResponseMetaRecord(docs: unknown[]): UnknownRecord | null {
+  for (let index = docs.length - 1; index >= 0; index -= 1) {
+    const meta = agentResponseMetaRecord(docs[index]);
+    if (meta) return meta;
+  }
+  return null;
+}
+
+/** The phase the run's deadline fired in, or null when the run did not time out. */
+function timedOutPhase(meta: UnknownRecord): string | null {
+  const phase = meta.timeoutPhase;
+  if (typeof phase !== "string") return null;
+  const trimmed = phase.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function turnMetaMarkers(meta: UnknownRecord): string[] {
+  const markers: string[] = [];
+  if (meta.replayInvalid === true) markers.push("replayInvalid=true");
+  if (normalized(meta.livenessState) === ABANDONED_LIVENESS_VALUE) {
+    markers.push(`livenessState=${String(meta.livenessState)}`);
+  }
+  const timeoutPhase = timedOutPhase(meta);
+  if (timeoutPhase) markers.push(`timeoutPhase=${timeoutPhase}`);
+  const error = meta.error;
+  if (isObjectRecord(error) && normalized(error.kind) === INCOMPLETE_TURN_ERROR_KIND) {
+    markers.push(`error.kind=${String(error.kind)}`);
+  }
+  return markers;
+}
+
+/**
+ * Detect a turn the run metadata itself marks incomplete, abandoned, or timed
+ * out. Returns null when no marker is present, so a healthy turn is never
+ * reclassified. A timed-out run also carries its declared phase, which the
+ * caller uses to pick deadline-specific recovery guidance.
+ */
+export function openClawAgentIncompleteTurnSignal(
+  raw: string,
+): OpenClawIncompleteTurnSignal | null {
+  const docs = parseOpenClawJsonDocs(raw);
+  if (docs.length === 0) return null;
+  const meta = finalAgentResponseMetaRecord(docs);
+  if (!meta) return null;
+  const markers = dedupe(turnMetaMarkers(meta));
+  if (markers.length === 0) return null;
+  const timeoutPhase = timedOutPhase(meta);
+  return timeoutPhase ? { markers, timeoutPhase } : { markers };
 }

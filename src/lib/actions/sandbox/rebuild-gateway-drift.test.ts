@@ -1,18 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { createRequire } from "node:module";
-
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 
-import type { OpenShellStateRpcIssue } from "../../adapters/openshell/gateway-drift";
+import * as gatewayDrift from "../../adapters/openshell/gateway-drift";
+import * as openshellRuntime from "../../adapters/openshell/runtime";
+import * as gatewayRuntime from "../../gateway-runtime-action";
+import * as dockerDriverRecovery from "../../onboard/docker-driver-sandbox-recovery";
+import * as openshellDockerContainers from "../../onboard/openshell-docker-sandbox-containers";
+import * as registry from "../../state/registry";
+import * as registryPersistence from "../../state/registry/persistence";
+import { type RebuildSandboxEntry, resolveRebuildLiveState } from "./rebuild-flow-helpers";
+import {
+  checkRebuildGatewaySchemaPreflight,
+  runRebuildGatewayIntentPreflight,
+} from "./rebuild-preflight-guards";
 
-type RebuildSandbox =
-  typeof import("../../../../dist/lib/actions/sandbox/rebuild")["rebuildSandbox"];
+const removeStaleRebuildDockerOrphan = openshellDockerContainers.removeStaleRebuildDockerOrphan;
+type QueryDockerContainers = typeof openshellDockerContainers.queryOpenShellDockerSandboxContainers;
+type ForceRemoveDockerContainer = (containerId: string) => { status?: number | null };
 
-const requireDist = createRequire(import.meta.url);
-
-const driftIssue: OpenShellStateRpcIssue = {
+const driftIssue: gatewayDrift.OpenShellStateRpcIssue = {
   kind: "image_drift",
   drift: {
     containerName: "openshell-cluster-nemoclaw",
@@ -22,48 +30,47 @@ const driftIssue: OpenShellStateRpcIssue = {
   },
 };
 
-function mockExit() {
-  return vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
-    throw new Error(`process.exit(${code ?? 0})`);
-  }) as never);
+const recoveryStates = [
+  "missing_named",
+  "named_unhealthy",
+  "named_unreachable",
+  "connected_other",
+] as const;
+
+function makeSandboxEntry(gatewayName = "nemoclaw", gatewayPort = 8080): RebuildSandboxEntry {
+  return {
+    name: "alpha",
+    provider: "ollama-local",
+    model: "nvidia/nemotron",
+    policies: [],
+    nimContainer: null,
+    agent: null,
+    nemoclawVersion: "0.1.0",
+    dashboardPort: 18789,
+    gatewayName,
+    gatewayPort,
+  };
+}
+
+function bail(message: string): never {
+  throw new Error(message);
 }
 
 describe("rebuild gateway drift preflight", () => {
-  let rebuildSandbox: RebuildSandbox;
-  let exitSpy: ReturnType<typeof mockExit>;
-  let errorSpy: MockInstance;
-  let spies: MockInstance[];
-  let checkAgentVersionSpy: MockInstance;
-  let detectPreflightIssueSpy: MockInstance;
   let captureOpenshellSpy: MockInstance;
   let runOpenshellSpy: MockInstance;
-  let printIssueSpy: MockInstance;
   let recoverNamedGatewayRuntimeSpy: MockInstance;
+  let getNamedGatewayLifecycleStateSpy: MockInstance;
+  let recoverDockerDriverSandboxSpy: MockInstance;
+  let queryDockerContainersSpy: ReturnType<typeof vi.fn<QueryDockerContainers>>;
+  let forceRemoveDockerContainerSpy: ReturnType<typeof vi.fn<ForceRemoveDockerContainer>>;
+  let errorSpy: MockInstance;
+  let logSpy: MockInstance;
 
-  beforeEach(async () => {
-    spies = [];
-    exitSpy = mockExit();
-    errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-
-    const gatewayDrift = requireDist("../../../../dist/lib/adapters/openshell/gateway-drift.js");
-    const openshellRuntime = requireDist("../../../../dist/lib/adapters/openshell/runtime.js");
-    const gatewayRuntime = requireDist("../../../../dist/lib/gateway-runtime-action.js");
-    const registry = requireDist("../../../../dist/lib/state/registry.js");
-    const resolve = requireDist("../../../../dist/lib/adapters/openshell/resolve.js");
-    const sandboxSession = requireDist("../../../../dist/lib/state/sandbox-session.js");
-    const onboardSession = requireDist("../../../../dist/lib/state/onboard-session.js");
-    const sandboxVersion = requireDist("../../../../dist/lib/sandbox/version.js");
-    const agentRuntime = requireDist("../../../../dist/lib/agent/runtime.js");
-
-    printIssueSpy = vi
-      .spyOn(gatewayDrift, "printOpenShellStateRpcIssue")
-      .mockImplementation(() => undefined);
-    detectPreflightIssueSpy = vi
-      .spyOn(gatewayDrift, "detectOpenShellStateRpcPreflightIssue")
-      .mockReturnValue(driftIssue);
-    checkAgentVersionSpy = vi
-      .spyOn(sandboxVersion, "checkAgentVersion")
-      .mockReturnValue({ expectedVersion: "0.1.0", sandboxVersion: "0.0.1" } as never);
+  beforeEach(() => {
+    vi.spyOn(gatewayDrift, "detectOpenShellStateRpcPreflightIssue").mockReturnValue(null);
+    vi.spyOn(gatewayDrift, "detectOpenShellStateRpcResultIssue").mockReturnValue(null);
+    vi.spyOn(gatewayDrift, "printOpenShellStateRpcIssue").mockImplementation(() => undefined);
     captureOpenshellSpy = vi
       .spyOn(openshellRuntime, "captureOpenshell")
       .mockReturnValue({ status: 0, output: "alpha Ready" });
@@ -72,232 +79,311 @@ describe("rebuild gateway drift preflight", () => {
       .mockReturnValue({ status: 0, output: "" } as never);
     recoverNamedGatewayRuntimeSpy = vi
       .spyOn(gatewayRuntime, "recoverNamedGatewayRuntime")
-      .mockResolvedValue({ recovered: true });
-
-    spies.push(
-      detectPreflightIssueSpy,
-      vi.spyOn(gatewayDrift, "detectOpenShellStateRpcResultIssue").mockReturnValue(null),
-      captureOpenshellSpy,
-      runOpenshellSpy,
-      recoverNamedGatewayRuntimeSpy,
-      printIssueSpy,
-      vi.spyOn(registry, "getSandbox").mockReturnValue({
-        name: "alpha",
-        provider: "ollama-local",
-        model: "nvidia/nemotron",
-        policies: [],
-        nimContainer: null,
-        agent: null,
-      } as never),
-      vi.spyOn(resolve, "resolveOpenshell").mockReturnValue(null),
-      vi.spyOn(sandboxSession, "getActiveSandboxSessions").mockReturnValue({
-        detected: false,
-        sessions: [],
-      }),
-      vi.spyOn(onboardSession, "loadSession").mockReturnValue(null),
-      vi.spyOn(agentRuntime, "getSessionAgent").mockReturnValue(null),
-      vi.spyOn(agentRuntime, "getAgentDisplayName").mockReturnValue("OpenClaw"),
-      checkAgentVersionSpy,
+      .mockResolvedValue({
+        recovered: true,
+        attempted: true,
+        before: { state: "healthy_named" },
+        after: { state: "healthy_named" },
+      } as never);
+    getNamedGatewayLifecycleStateSpy = vi
+      .spyOn(gatewayRuntime, "getNamedGatewayLifecycleState")
+      .mockReturnValue({ state: "healthy_named", activeGateway: "nemoclaw", status: "" } as never);
+    recoverDockerDriverSandboxSpy = vi
+      .spyOn(dockerDriverRecovery, "recoverDockerDriverSandbox")
+      .mockReturnValue({ recovered: false, via: null });
+    queryDockerContainersSpy = vi
+      .fn<QueryDockerContainers>()
+      .mockReturnValue({ ok: true, ids: [] });
+    forceRemoveDockerContainerSpy = vi
+      .fn<ForceRemoveDockerContainer>()
+      .mockReturnValue({ status: 0 });
+    vi.spyOn(openshellDockerContainers, "removeStaleRebuildDockerOrphan").mockImplementation(
+      (sandboxName, openshellDriver, log) =>
+        removeStaleRebuildDockerOrphan(sandboxName, openshellDriver, log, {
+          queryContainers: queryDockerContainersSpy,
+          forceRemove: forceRemoveDockerContainerSpy,
+        }),
     );
-
-    ({ rebuildSandbox } = requireDist("../../../../dist/lib/actions/sandbox/rebuild.js"));
+    vi.spyOn(registry, "getSandbox").mockReturnValue(makeSandboxEntry() as never);
+    vi.spyOn(registryPersistence, "load").mockReturnValue({
+      sandboxes: { alpha: makeSandboxEntry() },
+    } as never);
+    errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
   });
 
   afterEach(() => {
-    for (const spy of spies) spy.mockRestore();
-    exitSpy.mockRestore();
-    errorSpy.mockRestore();
+    vi.restoreAllMocks();
   });
 
-  it("fails before version or liveness RPCs when gateway image drift is detected", async () => {
-    await expect(rebuildSandbox("alpha", ["--yes"])).rejects.toThrow("process.exit(1)");
+  it("rejects gateway image drift before confirming rebuild intent", async () => {
+    vi.mocked(gatewayDrift.detectOpenShellStateRpcPreflightIssue).mockReturnValue(driftIssue);
+    const confirmIntent = vi.fn();
 
-    expect(printIssueSpy).toHaveBeenCalledWith(
-      driftIssue,
-      expect.objectContaining({ command: "nemoclaw alpha rebuild" }),
-    );
-    expect(checkAgentVersionSpy).not.toHaveBeenCalled();
+    await expect(
+      runRebuildGatewayIntentPreflight({
+        checkGatewaySchema: () =>
+          checkRebuildGatewaySchemaPreflight("alpha", makeSandboxEntry(), bail),
+        confirmIntent,
+      }),
+    ).rejects.toThrow("OpenShell gateway schema mismatch.");
+
+    expect(gatewayDrift.detectOpenShellStateRpcPreflightIssue).toHaveBeenCalledWith({
+      gatewayName: "nemoclaw",
+    });
+    expect(gatewayDrift.printOpenShellStateRpcIssue).toHaveBeenCalledWith(driftIssue, {
+      action: "rebuilding sandbox 'alpha'",
+      command: "nemoclaw alpha rebuild",
+    });
+    expect(confirmIntent).not.toHaveBeenCalled();
     expect(captureOpenshellSpy).not.toHaveBeenCalled();
     expect(recoverNamedGatewayRuntimeSpy).not.toHaveBeenCalled();
   });
 
-  it("recovers the named gateway and retries the liveness query before entering stale recovery", async () => {
-    detectPreflightIssueSpy.mockReturnValue(null);
-    // First `sandbox list` fails (gateway down) and triggers recovery; the retry
-    // shows only 'beta', so 'alpha' is absent. Before treating that as stale,
-    // rebuild reconciles against the NAMED gateway, which reports a healthy
-    // nemoclaw (status Connected + gateway info), confirming the sandbox is
-    // genuinely gone (#4497).
-    let listCalls = 0;
-    captureOpenshellSpy.mockImplementation((args: string[]) => {
-      if (args[0] === "sandbox" && args[1] === "list") {
-        listCalls += 1;
-        return listCalls === 1
-          ? { status: 1, output: "client error (Connect): Connection refused" }
-          : { status: 0, output: "beta Ready" };
-      }
-      if (args[0] === "status") {
-        return {
-          status: 0,
-          output: "Server Status\n\n  Gateway: nemoclaw\n  Status: Connected\n",
-        };
-      }
-      if (args[0] === "gateway" && args[1] === "info") {
-        return { status: 0, output: "Gateway Info\n\nGateway: nemoclaw\n" };
-      }
-      if (args[0] === "sandbox" && args[1] === "get") {
-        return { status: 1, output: "Error:   × Not Found: sandbox not found" };
-      }
-      return { status: 0, output: "" };
-    });
+  it("prints the safe-abort diagnostic before bailing on gateway schema drift (#7794)", () => {
+    vi.mocked(gatewayDrift.detectOpenShellStateRpcPreflightIssue).mockReturnValue(driftIssue);
+    const nonThrowingBail = vi.fn();
 
-    // The reconcile confirms the stale state, so rather than dead-ending at
-    // "Cannot back up state", rebuild skips backup and recreates from the
-    // preserved registry metadata. Stub the destructive steps + recreate handoff
-    // so the path stays hermetic, and assert the recreate failure surfaces the
-    // stale-recovery message instead of "not running".
-    const destroy = requireDist("../../../../dist/lib/actions/sandbox/destroy.js");
-    const onboardMod = requireDist("../../../../dist/lib/onboard.js");
-    spies.push(
-      vi.spyOn(destroy, "removeSandboxRegistryEntry").mockImplementation(() => undefined),
-      vi.spyOn(onboardMod, "onboard").mockRejectedValue(new Error("recreate-stub")),
-    );
+    expect(
+      checkRebuildGatewaySchemaPreflight("alpha", makeSandboxEntry(), nonThrowingBail as never),
+    ).toBe(false);
 
-    await expect(rebuildSandbox("alpha", ["--yes"], { throwOnError: true })).rejects.toThrow(
-      /stale-sandbox recovery/,
-    );
-
-    expect(recoverNamedGatewayRuntimeSpy).toHaveBeenCalledWith({
-      gatewayName: "nemoclaw",
-      recoverableStates: [
-        "missing_named",
-        "named_unhealthy",
-        "named_unreachable",
-        "connected_other",
-      ],
-    });
-    // The liveness query ran twice (initial failure + post-recovery retry).
-    expect(listCalls).toBe(2);
+    const diagnostics = errorSpy.mock.calls.flat().join("\n");
+    expect(diagnostics).toContain("Rebuild preflight failed:");
+    expect(diagnostics).toContain("OpenShell gateway schema is incompatible with this rebuild.");
+    expect(diagnostics).toContain("Follow the gateway recovery guidance above");
+    expect(diagnostics).toContain("Aborting rebuild — sandbox is untouched, no data was lost.");
+    expect(nonThrowingBail).toHaveBeenCalledWith("OpenShell gateway schema mismatch.");
   });
 
-  it("recovers the persisted non-default gateway when the sandbox is bound to nemoclaw-<port>", async () => {
-    detectPreflightIssueSpy.mockReturnValue(null);
-    // Reseed the sandbox lookup to expose a non-default gateway binding
-    // (gatewayPort=12345 → gateway name `nemoclaw-12345`). The stale-recovery
-    // path must address that gateway, not the default `nemoclaw`, otherwise a
-    // sandbox onboarded against `NEMOCLAW_GATEWAY_PORT=12345` would try to
-    // recover the wrong (and possibly nonexistent) default gateway.
-    for (const spy of spies) spy.mockRestore();
-    spies.length = 0;
-    const gatewayDrift = requireDist("../../../../dist/lib/adapters/openshell/gateway-drift.js");
-    const openshellRuntime = requireDist("../../../../dist/lib/adapters/openshell/runtime.js");
-    const gatewayRuntime = requireDist("../../../../dist/lib/gateway-runtime-action.js");
-    const registry = requireDist("../../../../dist/lib/state/registry.js");
-    const resolve = requireDist("../../../../dist/lib/adapters/openshell/resolve.js");
-    const sandboxSession = requireDist("../../../../dist/lib/state/sandbox-session.js");
-    const onboardSession = requireDist("../../../../dist/lib/state/onboard-session.js");
-    const sandboxVersion = requireDist("../../../../dist/lib/sandbox/version.js");
-    const agentRuntime = requireDist("../../../../dist/lib/agent/runtime.js");
+  it.each([
+    {
+      recordedGateway: "nemoclaw",
+      recordedPort: 8080,
+      activeGateway: "other-gw",
+    },
+    {
+      recordedGateway: "nemoclaw-9000",
+      recordedPort: 9000,
+      activeGateway: "nemoclaw",
+    },
+  ])(
+    "recovers $recordedGateway as stale even while $activeGateway is ambiently active, since the sandbox RPC is gateway-pinned (#4497)",
+    async ({ recordedGateway, recordedPort, activeGateway }) => {
+      const entry = makeSandboxEntry(recordedGateway, recordedPort);
+      const registrySnapshot = { sandboxes: { alpha: entry } };
+      vi.mocked(registry.getSandbox).mockReturnValue(entry as never);
+      vi.mocked(registryPersistence.load).mockReturnValue(registrySnapshot as never);
+      captureOpenshellSpy
+        .mockReturnValueOnce({ status: 0, output: "" })
+        .mockReturnValueOnce({ status: 1, output: "Error:   × Not Found: sandbox not found" });
+      getNamedGatewayLifecycleStateSpy.mockReturnValue({
+        state: "connected_other",
+        activeGateway,
+        status: `Gateway: ${activeGateway}\nStatus: Connected`,
+      } as never);
+      const behaviorLog = vi.fn();
 
-    let listCalls = 0;
-    detectPreflightIssueSpy = vi
-      .spyOn(gatewayDrift, "detectOpenShellStateRpcPreflightIssue")
-      .mockReturnValue(null);
-    captureOpenshellSpy = vi.spyOn(openshellRuntime, "captureOpenshell").mockImplementation(((
-      args: string[],
-    ) => {
-      if (args[0] === "sandbox" && args[1] === "list") {
-        listCalls += 1;
-        return listCalls === 1
-          ? { status: 1, output: "client error (Connect): Connection refused" }
-          : { status: 0, output: "beta Ready" };
-      }
-      if (args[0] === "status") {
-        return {
-          status: 0,
-          output: "Server Status\n\n  Gateway: nemoclaw-12345\n  Status: Connected\n",
-        };
-      }
-      if (args[0] === "gateway" && args[1] === "info") {
-        return { status: 0, output: "Gateway Info\n\nGateway: nemoclaw-12345\n" };
-      }
-      if (args[0] === "sandbox" && args[1] === "get") {
-        return { status: 1, output: "Error:   × Not Found: sandbox not found" };
-      }
-      return { status: 0, output: "" };
-    }) as never);
-    runOpenshellSpy = vi
-      .spyOn(openshellRuntime, "runOpenshell")
-      .mockReturnValue({ status: 0, output: "" } as never);
-    recoverNamedGatewayRuntimeSpy = vi
-      .spyOn(gatewayRuntime, "recoverNamedGatewayRuntime")
-      .mockResolvedValue({ recovered: true });
-    checkAgentVersionSpy = vi
-      .spyOn(sandboxVersion, "checkAgentVersion")
-      .mockReturnValue({ expectedVersion: "0.1.0", sandboxVersion: "0.0.1" } as never);
-    printIssueSpy = vi
-      .spyOn(gatewayDrift, "printOpenShellStateRpcIssue")
-      .mockImplementation(() => undefined);
+      const result = await resolveRebuildLiveState("alpha", entry, behaviorLog, bail);
 
-    const destroy = requireDist("../../../../dist/lib/actions/sandbox/destroy.js");
-    const onboardMod = requireDist("../../../../dist/lib/onboard.js");
-    spies.push(
-      detectPreflightIssueSpy,
-      vi.spyOn(gatewayDrift, "detectOpenShellStateRpcResultIssue").mockReturnValue(null),
-      captureOpenshellSpy,
-      runOpenshellSpy,
-      recoverNamedGatewayRuntimeSpy,
-      printIssueSpy,
-      vi.spyOn(registry, "getSandbox").mockReturnValue({
-        name: "alpha",
-        provider: "ollama-local",
-        model: "nvidia/nemotron",
-        policies: [],
-        nimContainer: null,
-        agent: null,
-        gatewayName: "nemoclaw-12345",
-        gatewayPort: 12345,
-      } as never),
-      vi.spyOn(resolve, "resolveOpenshell").mockReturnValue(null),
-      vi.spyOn(sandboxSession, "getActiveSandboxSessions").mockReturnValue({
-        detected: false,
-        sessions: [],
-      }),
-      vi.spyOn(onboardSession, "loadSession").mockReturnValue(null),
-      vi.spyOn(agentRuntime, "getSessionAgent").mockReturnValue(null),
-      vi.spyOn(agentRuntime, "getAgentDisplayName").mockReturnValue("OpenClaw"),
-      checkAgentVersionSpy,
-      vi.spyOn(destroy, "removeSandboxRegistryEntry").mockImplementation(() => undefined),
-      vi.spyOn(onboardMod, "onboard").mockRejectedValue(new Error("recreate-stub")),
-    );
+      expect(result).toEqual({ staleRecovery: true, staleRegistrySnapshot: registrySnapshot });
+      expect(result?.staleRegistrySnapshot).not.toBe(registrySnapshot);
+      expect(getNamedGatewayLifecycleStateSpy).not.toHaveBeenCalled();
+      expect(runOpenshellSpy).toHaveBeenCalledWith(
+        ["gateway", "select", recordedGateway],
+        expect.objectContaining({ ignoreError: true }),
+      );
+      expect(captureOpenshellSpy).toHaveBeenNthCalledWith(
+        1,
+        ["sandbox", "list", "-g", recordedGateway],
+        expect.objectContaining({ ignoreError: true }),
+      );
+      expect(captureOpenshellSpy).toHaveBeenNthCalledWith(
+        2,
+        ["sandbox", "get", "-g", recordedGateway, "alpha"],
+        expect.anything(),
+      );
+      expect(recoverDockerDriverSandboxSpy).toHaveBeenCalledWith("alpha");
+      expect(registryPersistence.load).toHaveBeenCalledOnce();
+      expect(logSpy.mock.calls.flat().join("\n")).toContain(
+        "absent from the live OpenShell gateway",
+      );
+      expect(behaviorLog.mock.calls.flat().join("\n")).toContain("Stale-sandbox recovery");
+    },
+  );
 
-    ({ rebuildSandbox } = requireDist("../../../../dist/lib/actions/sandbox/rebuild.js"));
+  it("removes one exactly labeled Docker orphan before a registry-only rebuild (#8720)", async () => {
+    const entry = { ...makeSandboxEntry(), openshellDriver: "docker" };
+    vi.mocked(registry.getSandbox).mockReturnValue(entry as never);
+    captureOpenshellSpy
+      .mockReturnValueOnce({ status: 0, output: "" })
+      .mockReturnValueOnce({ status: 1, output: "Error: sandbox not found" });
+    queryDockerContainersSpy
+      .mockReturnValueOnce({ ok: true, ids: ["orphan-container-id"] })
+      .mockReturnValueOnce({ ok: true, ids: [] });
 
-    await expect(rebuildSandbox("alpha", ["--yes"], { throwOnError: true })).rejects.toThrow(
-      /stale-sandbox recovery/,
-    );
-
-    expect(recoverNamedGatewayRuntimeSpy).toHaveBeenCalledWith({
-      gatewayName: "nemoclaw-12345",
-      recoverableStates: [
-        "missing_named",
-        "named_unhealthy",
-        "named_unreachable",
-        "connected_other",
-      ],
+    await expect(resolveRebuildLiveState("alpha", entry, vi.fn(), bail)).resolves.toMatchObject({
+      staleRecovery: true,
     });
-    expect(listCalls).toBe(2);
+
+    expect(forceRemoveDockerContainerSpy).toHaveBeenCalledWith("orphan-container-id");
+    expect(queryDockerContainersSpy).toHaveBeenCalledTimes(2);
   });
 
-  it("does not recover generic sandbox list failures", async () => {
-    detectPreflightIssueSpy.mockReturnValue(null);
-    captureOpenshellSpy.mockReturnValue({ status: 1, output: "unknown option: sandbox list" });
+  it("preserves legacy stale recovery when Docker inspection is unavailable (#8720)", async () => {
+    const entry = makeSandboxEntry();
+    vi.mocked(registry.getSandbox).mockReturnValue(entry as never);
+    captureOpenshellSpy
+      .mockReturnValueOnce({ status: 0, output: "" })
+      .mockReturnValueOnce({ status: 1, output: "Error: sandbox not found" });
+    queryDockerContainersSpy.mockReturnValue({ ok: false, ids: [], error: "docker unavailable" });
 
-    await expect(rebuildSandbox("alpha", ["--yes"], { throwOnError: true })).rejects.toThrow(
+    await expect(resolveRebuildLiveState("alpha", entry, vi.fn(), bail)).resolves.toMatchObject({
+      staleRecovery: true,
+    });
+
+    expect(forceRemoveDockerContainerSpy).not.toHaveBeenCalled();
+    expect(registryPersistence.load).toHaveBeenCalledOnce();
+  });
+
+  it("refuses ambiguous labeled Docker orphan cleanup without removing either container (#8720)", async () => {
+    const entry = { ...makeSandboxEntry(), openshellDriver: "docker" };
+    vi.mocked(registry.getSandbox).mockReturnValue(entry as never);
+    captureOpenshellSpy
+      .mockReturnValueOnce({ status: 0, output: "" })
+      .mockReturnValueOnce({ status: 1, output: "Error: sandbox not found" });
+    queryDockerContainersSpy.mockReturnValue({ ok: true, ids: ["first-id", "second-id"] });
+
+    await expect(resolveRebuildLiveState("alpha", entry, vi.fn(), bail)).rejects.toThrow(
+      "refusing ambiguous orphan cleanup",
+    );
+
+    expect(forceRemoveDockerContainerSpy).not.toHaveBeenCalled();
+    expect(registryPersistence.load).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      failure: "query failure",
+      queryResults: [{ ok: false, ids: [], error: "docker unavailable" }],
+      removeResult: { status: 0 },
+      removeCalls: 0,
+    },
+    {
+      failure: "removal failure",
+      queryResults: [{ ok: true, ids: ["orphan-container-id"] }],
+      removeResult: { status: 1 },
+      removeCalls: 1,
+    },
+    {
+      failure: "confirmation failure",
+      queryResults: [
+        { ok: true, ids: ["orphan-container-id"] },
+        { ok: true, ids: ["orphan-container-id"] },
+      ],
+      removeResult: { status: 0 },
+      removeCalls: 1,
+    },
+  ])(
+    "fails closed before registry recovery on Docker orphan $failure (#8720)",
+    async ({ queryResults, removeResult, removeCalls }) => {
+      const entry = { ...makeSandboxEntry(), openshellDriver: "docker" };
+      vi.mocked(registry.getSandbox).mockReturnValue(entry as never);
+      captureOpenshellSpy
+        .mockReturnValueOnce({ status: 0, output: "" })
+        .mockReturnValueOnce({ status: 1, output: "Error: sandbox not found" });
+      queryDockerContainersSpy.mockReturnValueOnce(queryResults[0] as never);
+      queryDockerContainersSpy.mockReturnValueOnce((queryResults[1] ?? queryResults[0]) as never);
+      forceRemoveDockerContainerSpy.mockReturnValue(removeResult);
+
+      await expect(resolveRebuildLiveState("alpha", entry, vi.fn(), bail)).rejects.toThrow(
+        "Stale-recovery Docker orphan cleanup failed",
+      );
+
+      expect(forceRemoveDockerContainerSpy).toHaveBeenCalledTimes(removeCalls);
+      expect(registryPersistence.load).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { gatewayName: "nemoclaw", gatewayPort: 8080 },
+    { gatewayName: "nemoclaw-12345", gatewayPort: 12345 },
+  ])(
+    "recovers $gatewayName and returns stale state after confirming the sandbox is absent (#4497)",
+    async ({ gatewayName, gatewayPort }) => {
+      const entry = makeSandboxEntry(gatewayName, gatewayPort);
+      const registrySnapshot = { sandboxes: { alpha: entry } };
+      vi.mocked(registry.getSandbox).mockReturnValue(entry as never);
+      vi.mocked(registryPersistence.load).mockReturnValue(registrySnapshot as never);
+      captureOpenshellSpy
+        .mockReturnValueOnce({ status: 0, output: "beta Ready" })
+        .mockReturnValueOnce({ status: 1, output: "Error:   × Not Found: sandbox not found" });
+      getNamedGatewayLifecycleStateSpy.mockReturnValue({
+        state: "healthy_named",
+        activeGateway: gatewayName,
+        status: `Gateway: ${gatewayName}\nStatus: Connected`,
+      } as never);
+      const behaviorLog = vi.fn();
+
+      const result = await resolveRebuildLiveState("alpha", entry, behaviorLog, bail);
+
+      expect(result).toEqual({
+        staleRecovery: true,
+        staleRegistrySnapshot: registrySnapshot,
+      });
+      expect(result?.staleRegistrySnapshot).not.toBe(registrySnapshot);
+      expect(recoverNamedGatewayRuntimeSpy).toHaveBeenCalledOnce();
+      expect(recoverNamedGatewayRuntimeSpy).toHaveBeenCalledWith({
+        gatewayName,
+        recoverableStates: recoveryStates,
+      });
+      expect(recoverNamedGatewayRuntimeSpy.mock.invocationCallOrder[0]).toBeLessThan(
+        captureOpenshellSpy.mock.invocationCallOrder[0]!,
+      );
+      expect(captureOpenshellSpy).toHaveBeenNthCalledWith(
+        1,
+        ["sandbox", "list", "-g", gatewayName],
+        expect.objectContaining({ ignoreError: true }),
+      );
+      expect(captureOpenshellSpy).toHaveBeenNthCalledWith(
+        2,
+        ["sandbox", "get", "-g", gatewayName, "alpha"],
+        expect.anything(),
+      );
+      expect(getNamedGatewayLifecycleStateSpy).not.toHaveBeenCalled();
+      expect(recoverDockerDriverSandboxSpy).toHaveBeenCalledWith("alpha");
+      expect(registryPersistence.load).toHaveBeenCalledOnce();
+      expect(logSpy.mock.calls.flat().join("\n")).toContain(
+        "absent from the live OpenShell gateway",
+      );
+      expect(behaviorLog.mock.calls.flat().join("\n")).toContain("Stale-sandbox recovery");
+    },
+  );
+
+  it("recovers the named gateway before a generic sandbox-list query fails (#10421)", async () => {
+    const entry = makeSandboxEntry();
+    captureOpenshellSpy.mockReturnValueOnce({
+      status: 1,
+      output: "unknown option: sandbox list",
+    });
+
+    await expect(resolveRebuildLiveState("alpha", entry, vi.fn(), bail)).rejects.toThrow(
       "Failed to query running sandboxes from OpenShell.",
     );
 
-    expect(recoverNamedGatewayRuntimeSpy).not.toHaveBeenCalled();
-    expect(captureOpenshellSpy).toHaveBeenCalledTimes(1);
+    expect(recoverNamedGatewayRuntimeSpy).toHaveBeenCalledOnce();
+    expect(recoverNamedGatewayRuntimeSpy).toHaveBeenCalledWith({
+      gatewayName: "nemoclaw",
+      recoverableStates: recoveryStates,
+    });
+    expect(captureOpenshellSpy).toHaveBeenCalledOnce();
+    expect(captureOpenshellSpy).toHaveBeenCalledWith(
+      ["sandbox", "list", "-g", "nemoclaw"],
+      expect.objectContaining({ ignoreError: true }),
+    );
+    expect(getNamedGatewayLifecycleStateSpy).not.toHaveBeenCalled();
+    expect(recoverDockerDriverSandboxSpy).not.toHaveBeenCalled();
+    expect(registryPersistence.load).not.toHaveBeenCalled();
+    expect(errorSpy.mock.calls.flat().join("\n")).toContain("Failed to query running sandboxes");
   });
 });

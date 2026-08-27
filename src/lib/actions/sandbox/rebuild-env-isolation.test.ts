@@ -8,9 +8,9 @@ import {
   assessAmbientRecreateEnv,
   isolateAmbientRecreateEnv,
   sanitizeEnvValueForDisplay,
-} from "../../../../dist/lib/actions/sandbox/rebuild-env-isolation.js";
+} from "./rebuild-env-isolation.js";
 
-describe("sanitizeEnvValueForDisplay (#5735 PRA-7)", () => {
+describe("sanitizeEnvValueForDisplay PRA-7 (#5735)", () => {
   it("collapses a multi-line / ANSI value into a single safe line", () => {
     // Untrusted NEMOCLAW_AGENT with a newline + CR + ANSI escape that tries to
     // paint a fake "Installation complete" status line.
@@ -34,7 +34,7 @@ describe("sanitizeEnvValueForDisplay (#5735 PRA-7)", () => {
   });
 });
 
-describe("AMBIENT_RECREATE_ENV_VARS contract (#5735 PRA-4)", () => {
+describe("AMBIENT_RECREATE_ENV_VARS contract PRA-4 (#5735)", () => {
   it("pins the exact onboard-selection env set the recreate must isolate", () => {
     // Mirrors the ambient selection env vars `onboard --resume` reads at its
     // source boundary. Adding a new onboard-selection env var must be a conscious
@@ -47,6 +47,21 @@ describe("AMBIENT_RECREATE_ENV_VARS contract (#5735 PRA-4)", () => {
       "NEMOCLAW_PROVIDER_KEY",
       "NEMOCLAW_ENDPOINT_URL",
       "NEMOCLAW_MODEL",
+      "NEMOCLAW_COMPAT_MODEL",
+      "NEMOCLAW_CLOUD_EXPERIMENTAL_MODEL",
+      "NEMOCLAW_PREFERRED_API",
+      "NEMOCLAW_REASONING",
+      "NEMOCLAW_REASONING_EFFORT",
+      "NEMOCLAW_VLLM_MODEL",
+      "NEMOCLAW_VLLM_EXTRA_ARGS_JSON",
+      "NEMOCLAW_FROM_DOCKERFILE",
+      "NEMOCLAW_WEB_SEARCH_PROVIDER",
+      "NEMOCLAW_POLICY_TIER",
+      "NEMOCLAW_POLICY_MODE",
+      "NEMOCLAW_POLICY_PRESETS",
+      "NEMOCLAW_SANDBOX_GPU",
+      "NEMOCLAW_SANDBOX_GPU_DEVICE",
+      "NEMOCLAW_TOOL_DISCLOSURE",
     ]);
   });
 });
@@ -62,8 +77,15 @@ describe("assessAmbientRecreateEnv", () => {
     const result = assessAmbientRecreateEnv("openclaw", {
       NEMOCLAW_AGENT: "langchain-deepagents-code",
       NEMOCLAW_PROVIDER_KEY: "sk-bogus",
+      NEMOCLAW_PREFERRED_API: "chat-completions",
+      NEMOCLAW_REASONING: "true",
     });
-    expect(result.presentVars).toEqual(["NEMOCLAW_AGENT", "NEMOCLAW_PROVIDER_KEY"]);
+    expect(result.presentVars).toEqual([
+      "NEMOCLAW_AGENT",
+      "NEMOCLAW_PROVIDER_KEY",
+      "NEMOCLAW_PREFERRED_API",
+      "NEMOCLAW_REASONING",
+    ]);
     expect(result.agentMismatch).toEqual({
       envAgent: "langchain-deepagents-code",
       registryAgent: "openclaw",
@@ -92,31 +114,62 @@ describe("assessAmbientRecreateEnv", () => {
 });
 
 describe("isolateAmbientRecreateEnv", () => {
-  it("removes ambient selection vars and restores the originals (including unset)", () => {
-    const env: NodeJS.ProcessEnv = {
-      NEMOCLAW_AGENT: "langchain-deepagents-code",
-      NEMOCLAW_PROVIDER_KEY: "sk-bogus",
-      NEMOCLAW_MODEL: "some-model",
-      // not part of the selection set — must be left untouched
-      NVIDIA_API_KEY: "nvapi-keep-me",
-    };
+  it.each(AMBIENT_RECREATE_ENV_VARS)(
+    "removes ambient selection vars and restores the originals (including unset) [case %#]",
+    (name) => {
+      const env: NodeJS.ProcessEnv = {
+        NEMOCLAW_AGENT: "langchain-deepagents-code",
+        NEMOCLAW_PROVIDER_KEY: "sk-bogus",
+        NEMOCLAW_MODEL: "some-model",
+        NEMOCLAW_COMPAT_MODEL: "some-compat-model",
+        NEMOCLAW_PREFERRED_API: "openai-responses",
+        NEMOCLAW_REASONING: "false",
+        NEMOCLAW_REASONING_EFFORT: "medium",
+        NEMOCLAW_VLLM_MODEL: "ambient-vllm-model",
+        NEMOCLAW_VLLM_EXTRA_ARGS_JSON: '{"ambient":true}',
+        NEMOCLAW_FROM_DOCKERFILE: "/tmp/unrelated.Dockerfile",
+        NEMOCLAW_WEB_SEARCH_PROVIDER: "tavily",
+        NEMOCLAW_POLICY_TIER: "permissive",
+        NEMOCLAW_POLICY_MODE: "customize",
+        NEMOCLAW_POLICY_PRESETS: "ambient-preset",
+        NEMOCLAW_SANDBOX_GPU: "0",
+        NEMOCLAW_SANDBOX_GPU_DEVICE: "9",
+        NVIDIA_INFERENCE_API_KEY: "hosted-source-key",
+        // not part of the selection set — must be left untouched
+        NVIDIA_API_KEY: "nvapi-keep-me",
+      };
 
-    const restore = isolateAmbientRecreateEnv(env);
+      const restore = isolateAmbientRecreateEnv(env);
 
-    for (const name of AMBIENT_RECREATE_ENV_VARS) {
       expect(env[name]).toBeUndefined();
-    }
-    expect(env.NVIDIA_API_KEY).toBe("nvapi-keep-me");
 
-    restore();
+      expect(env.NVIDIA_INFERENCE_API_KEY).toBe("hosted-source-key");
+      expect(env.NVIDIA_API_KEY).toBe("nvapi-keep-me");
 
-    expect(env.NEMOCLAW_AGENT).toBe("langchain-deepagents-code");
-    expect(env.NEMOCLAW_PROVIDER_KEY).toBe("sk-bogus");
-    expect(env.NEMOCLAW_MODEL).toBe("some-model");
-    expect(env.NVIDIA_API_KEY).toBe("nvapi-keep-me");
-    // A var that was never set stays unset after restore.
-    expect("NEMOCLAW_PROVIDER" in env).toBe(false);
-  });
+      restore();
+
+      expect(env.NEMOCLAW_AGENT).toBe("langchain-deepagents-code");
+      expect(env.NEMOCLAW_PROVIDER_KEY).toBe("sk-bogus");
+      expect(env.NEMOCLAW_MODEL).toBe("some-model");
+      expect(env.NEMOCLAW_COMPAT_MODEL).toBe("some-compat-model");
+      expect(env.NEMOCLAW_PREFERRED_API).toBe("openai-responses");
+      expect(env.NEMOCLAW_REASONING).toBe("false");
+      expect(env.NEMOCLAW_REASONING_EFFORT).toBe("medium");
+      expect(env.NEMOCLAW_VLLM_MODEL).toBe("ambient-vllm-model");
+      expect(env.NEMOCLAW_VLLM_EXTRA_ARGS_JSON).toBe('{"ambient":true}');
+      expect(env.NEMOCLAW_FROM_DOCKERFILE).toBe("/tmp/unrelated.Dockerfile");
+      expect(env.NEMOCLAW_WEB_SEARCH_PROVIDER).toBe("tavily");
+      expect(env.NEMOCLAW_POLICY_TIER).toBe("permissive");
+      expect(env.NEMOCLAW_POLICY_MODE).toBe("customize");
+      expect(env.NEMOCLAW_POLICY_PRESETS).toBe("ambient-preset");
+      expect(env.NEMOCLAW_SANDBOX_GPU).toBe("0");
+      expect(env.NEMOCLAW_SANDBOX_GPU_DEVICE).toBe("9");
+      expect(env.NVIDIA_INFERENCE_API_KEY).toBe("hosted-source-key");
+      expect(env.NVIDIA_API_KEY).toBe("nvapi-keep-me");
+      // A var that was never set stays unset after restore.
+      expect("NEMOCLAW_PROVIDER" in env).toBe(false);
+    },
+  );
 
   it("is idempotent — a second restore call is a no-op", () => {
     const env: NodeJS.ProcessEnv = { NEMOCLAW_AGENT: "hermes" };

@@ -5,6 +5,14 @@ import type { NvidiaPlatform } from "../../../inference/nim";
 import type { GatewayReuseState } from "../../../state/gateway";
 import type { Session } from "../../../state/onboard-session";
 import type { GatewayContainerState } from "../../gateway-container-running";
+import {
+  describeGatewayOwner,
+  evaluateGatewayAttachment,
+  type GatewayAttachmentProbe,
+  type GatewayOwner,
+  GatewayOwnershipError,
+  isExternallySupervised,
+} from "../../gateway-ownership";
 import { withGatewayTrace } from "../../tracing";
 import { advanceTo, type OnboardStateTransitionResult } from "../result";
 
@@ -18,7 +26,16 @@ export interface GatewayStateOptions<Gpu> {
   recordedSandboxName: string | null;
   requestedSandboxName: string | null;
   recreateSandbox: boolean;
+  requiresBindMounts?: boolean;
   deps: {
+    /**
+     * The single declared lifecycle authority for this run (#6576). Resolved
+     * before any effect so an externally supervised gateway is attached to
+     * rather than started, replaced, or destroyed.
+     */
+    resolveGatewayOwner(): GatewayOwner;
+    probeGatewayAttachment(owner: GatewayOwner): Promise<GatewayAttachmentProbe>;
+    attachGateway(owner: GatewayOwner, expectedProbe: GatewayAttachmentProbe): Promise<void>;
     refreshDockerDriverGatewayReuseState(state: GatewayReuseState): Promise<GatewayReuseState>;
     gatewayCliSupportsLifecycleCommands(): boolean;
     verifyGatewayContainerRunning(gatewayName: string): GatewayContainerState;
@@ -71,7 +88,15 @@ export interface GatewayStateResult {
   stateResult: OnboardStateTransitionResult;
 }
 
-export async function handleGatewayState<Gpu>({
+export async function handleGatewayState<Gpu>(
+  options: GatewayStateOptions<Gpu>,
+): Promise<GatewayStateResult> {
+  return withGatewayTrace(options.initialGatewayReuseState, options.gpuPassthrough, () =>
+    handleGatewayStatePhase(options),
+  );
+}
+
+async function handleGatewayStatePhase<Gpu>({
   resume,
   session,
   initialGatewayReuseState,
@@ -81,8 +106,25 @@ export async function handleGatewayState<Gpu>({
   recordedSandboxName,
   requestedSandboxName,
   recreateSandbox,
+  requiresBindMounts = false,
   deps,
 }: GatewayStateOptions<Gpu>): Promise<GatewayStateResult> {
+  // Establish the lifecycle authority before anything in this phase can touch
+  // the gateway. Resume takes the same path as a fresh run: a recorded
+  // "complete" gateway step is not evidence that the declared owner still holds
+  // the port.
+  const owner = deps.resolveGatewayOwner();
+  if (isExternallySupervised(owner)) {
+    if (requiresBindMounts) {
+      throw new GatewayOwnershipError(
+        "capability_unsupported",
+        "Read-only host mounts require a NemoClaw-managed Docker-driver gateway; the declared external gateway lifecycle cannot be reconfigured safely.",
+        owner,
+      );
+    }
+    return attachToExternallySupervisedGateway(owner, deps);
+  }
+
   let gatewayReuseState = await deps.refreshDockerDriverGatewayReuseState(initialGatewayReuseState);
   const supportsLifecycleCommands = deps.gatewayCliSupportsLifecycleCommands();
 
@@ -100,8 +142,8 @@ export async function handleGatewayState<Gpu>({
     } else if (containerState === "stopped") {
       // #4187: a stopped legacy `openshell-cluster-*` container after a host
       // VM stop/start still holds the PVC volume. Attempt non-destructive
-      // recovery (openshell gateway start) before any destructive path so we
-      // never delete the k3s local-path PVC backing data.
+      // gateway recovery before any destructive path so we never delete the
+      // k3s local-path PVC backing data.
       console.log(
         "  Gateway container is stopped (likely host or Docker restart). Attempting non-destructive recovery...",
       );
@@ -223,9 +265,7 @@ export async function handleGatewayState<Gpu>({
     } else if (gatewayReuseState === "foreign-active") {
       gatewayReuseState = "missing";
     }
-    await withGatewayTrace(gatewayReuseState, gpuPassthrough, () =>
-      deps.startGateway(gpu, { gpuPassthrough }),
-    );
+    await deps.startGateway(gpu, { gpuPassthrough });
     session = await deps.recordStepComplete("gateway");
   }
 
@@ -233,7 +273,49 @@ export async function handleGatewayState<Gpu>({
     gatewayReuseState,
     session,
     stateResult: advanceTo("provider_selection", {
-      metadata: { state: "gateway", gatewayReuseState },
+      metadata: { state: "gateway", gatewayReuseState, gatewayOwner: describeGatewayOwner(owner) },
+    }),
+  };
+}
+
+/**
+ * Externally supervised gateways are attached to, never managed. This path runs
+ * no destructive effect: it validates the declared owner still holds the port
+ * and fails closed otherwise, so an unknown listener, a mismatched identity, or
+ * multiple owners is reported before any provider, policy, sandbox, or registry
+ * mutation can run.
+ */
+async function attachToExternallySupervisedGateway<Gpu>(
+  owner: GatewayOwner,
+  deps: GatewayStateOptions<Gpu>["deps"],
+): Promise<GatewayStateResult> {
+  const supervisor = owner.supervisor?.serviceName ?? "an external supervisor";
+  const probe = await deps.probeGatewayAttachment(owner);
+  const attachment = evaluateGatewayAttachment(owner, probe);
+  if (!attachment.ok) {
+    throw new GatewayOwnershipError(attachment.code, attachment.message, owner);
+  }
+  await deps.attachGateway(owner, probe);
+
+  deps.skippedStepMessage("gateway", `supervised by ${supervisor}`, "reuse");
+  deps.note(`  Attached to externally supervised OpenShell gateway (${supervisor}).`);
+  await deps.recordStateSkipped("gateway", {
+    reason: "external-supervision",
+    gatewayOwner: describeGatewayOwner(owner),
+  });
+
+  return {
+    // No NemoClaw-owned gateway runtime exists to reuse or recreate; the
+    // supervisor owns it, and downstream reuse decisions must not treat this as
+    // a gateway NemoClaw may recycle.
+    gatewayReuseState: "healthy",
+    session: await deps.recordStepComplete("gateway"),
+    stateResult: advanceTo("provider_selection", {
+      metadata: {
+        state: "gateway",
+        gatewayReuseState: "healthy",
+        gatewayOwner: describeGatewayOwner(owner),
+      },
     }),
   };
 }

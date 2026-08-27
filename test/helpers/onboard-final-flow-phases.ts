@@ -41,7 +41,6 @@ export type RecorderOverrides = {
     },
   ) => Promise<void>;
   recordStepComplete?: (stepName: string, updates?: SessionUpdates) => Promise<Session>;
-  recordPostVerifyStarted?: () => Promise<Session>;
   mergePolicyMessagingChannels?: PoliciesStateOptions<
     Agent | null,
     WebSearchConfig
@@ -50,12 +49,27 @@ export type RecorderOverrides = {
     sandboxName: string,
     chain: DashboardDeliveryChain,
   ) => Promise<VerifyDeploymentResult>;
+  isDeploymentHealthy?: (result: VerifyDeploymentResult) => boolean;
   printDashboard?: (
     sandboxName: string,
     model: string,
     provider: string,
     nimContainer: string | null,
     agent: Agent | null,
+  ) => void;
+  reportDeploymentReadiness?: (healthy: boolean) => void;
+  getActiveSandbox?: PoliciesStateOptions<Agent | null, WebSearchConfig>["deps"]["getActiveSandbox"];
+  setupPoliciesWithSelection?: PoliciesStateOptions<
+    Agent | null,
+    WebSearchConfig
+  >["deps"]["setupPoliciesWithSelection"];
+  persistAppliedPolicyPresets?: PoliciesStateOptions<
+    Agent | null,
+    WebSearchConfig
+  >["deps"]["persistAppliedPolicyPresets"];
+  revalidatePolicyRequirements?: (
+    context: OnboardFlowContext<Agent | null>,
+    operation: string,
   ) => void;
 };
 
@@ -75,6 +89,7 @@ export function sessionAt(state: OnboardMachineState): Session {
     sandboxName: "my-sandbox",
     provider: "nim",
     model: "nvidia/test",
+    policyAuthority: "nemoclaw-managed",
     machine: {
       version: MACHINE_SNAPSHOT_VERSION,
       state,
@@ -103,11 +118,19 @@ export function createRuntimeHarness(initialSession: Session) {
     markStepStarted: () => cloneSession(session),
     markStepComplete: (_stepName, updates: SessionUpdates = {}) =>
       updateSession((current) => Object.assign(current, filterSafeUpdates(updates))),
-    markStepCompleteRecordOnly: (_stepName, updates: SessionUpdates = {}) =>
-      updateSession((current) => Object.assign(current, filterSafeUpdates(updates))),
-    markStepSkipped: () => cloneSession(session),
+    markStepSkipped: (stepName) =>
+      updateSession((current) => {
+        const step = current.steps[stepName];
+        if (!step) return current;
+        if (step.status === "complete" || step.status === "failed" || step.status === "skipped")
+          return current;
+        step.status = "skipped";
+        step.startedAt = null;
+        step.completedAt = null;
+        step.error = null;
+        return current;
+      }),
     markStepFailed: () => cloneSession(session),
-    markStepFailedRecordOnly: () => cloneSession(session),
     completeSession: (updates: SessionUpdates = {}) =>
       updateSession((current) => {
         Object.assign(current, filterSafeUpdates(updates));
@@ -151,6 +174,8 @@ export function context(
     hermesAuthMethod: null,
     hermesToolGateways: ["local"],
     preferredInferenceApi: "chat",
+    compatibleEndpointReasoning: null,
+    compatibleEndpointReasoningEffort: null,
     nimContainer: "nim-test",
     webSearchConfig: null,
     webSearchSupported: true,
@@ -173,6 +198,7 @@ export function createPhases(
     VerifyDeploymentResult
   >({
     branchState,
+    revalidatePolicyRequirements: recorders.revalidatePolicyRequirements,
     agentSetupDeps: {
       handleAgentSetup: vi.fn(async () => {
         order.push("agent-setup");
@@ -182,6 +208,7 @@ export function createPhases(
         order.push("agent-forward");
         return 45123;
       }),
+      persistDashboardPort: vi.fn(),
       recordStepSkipped: recorders.recordStepSkipped ?? vi.fn(async () => createSession()),
       isOpenclawReady: () => false,
       skippedStepMessage: vi.fn(),
@@ -199,24 +226,29 @@ export function createPhases(
       toSessionUpdates: (updates) => updates as SessionUpdates,
     },
     policiesDeps: {
-      loadSession: recorders.loadSession ?? (() => createSession()),
-      getActiveSandbox: () => null,
+      loadSession:
+        recorders.loadSession ?? (() => createSession({ policyAuthority: "nemoclaw-managed" })),
+      getActiveSandbox: recorders.getActiveSandbox ?? (() => null),
       mergePolicyMessagingChannels:
         recorders.mergePolicyMessagingChannels ?? ((selected) => selected),
+      detectUnconfiguredMessagingChannels: () => [],
       verifyCompatibleEndpointSandboxSmoke: vi.fn(),
       preparePolicyPresetResumeSelection: () => ({
         policyPresets: ["balanced"],
         recordedPolicyPresetsNeedReconcile: false,
         disabledMessagingPolicyPresetApplied: false,
+        suppressedAgentRequiredPresetsLive: false,
       }),
       arePolicyPresetsApplied: () => false,
       skippedStepMessage: vi.fn(),
       recordStateSkipped: recorders.recordStateSkipped ?? vi.fn(async () => createSession()),
       startRecordedStep: recorders.startRecordedStep ?? vi.fn(async () => undefined),
-      setupPoliciesWithSelection: vi.fn(async () => {
-        order.push("policies");
-        return ["balanced"];
-      }),
+      setupPoliciesWithSelection:
+        recorders.setupPoliciesWithSelection ??
+        vi.fn(async () => {
+          order.push("policies");
+          return ["balanced"];
+        }),
       updateSession:
         recorders.updateSession ?? vi.fn((mutator) => mutator(createSession()) ?? createSession()),
       recordStepComplete:
@@ -225,12 +257,13 @@ export function createPhases(
           sessionWithUpdates(updates),
         ),
       toSessionUpdates: (updates) => updates as SessionUpdates,
-      persistAppliedPolicyPresets: vi.fn(),
+      persistAppliedPolicyPresets: recorders.persistAppliedPolicyPresets ?? vi.fn(),
     },
     finalization: {
       stagedLegacyKeys: [],
       migratedLegacyKeys: new Set(),
       webSearchEnabled: () => false,
+      webSearchProvider: (config) => (config.provider === "tavily" ? "tavily" : "brave"),
     },
     finalizationDeps: {
       ensureAgentDashboardForward: vi.fn(() => {
@@ -240,17 +273,26 @@ export function createPhases(
       setDefaultSandbox: vi.fn(() => {
         order.push("set-default");
       }),
-      recordPostVerifyStarted:
-        recorders.recordPostVerifyStarted ?? vi.fn(async () => createSession()),
       toSessionUpdates: (updates) => updates as NonNullable<SessionUpdates>,
       removeLegacyCredentialsFile: vi.fn(),
       cleanupStaleHostFiles: vi.fn(),
       checkAndRecoverSandboxProcesses: vi.fn(),
-      warmupScopeUpgrade: vi.fn(),
-      autoPairScopeApproval: vi.fn(),
+      settleOrdinaryOpenClawPairing: vi.fn(async () => ({ kind: "settled" as const })),
+      ordinaryOpenClawPairingIncompleteMessage: vi.fn(
+        () => "OpenClaw onboarding is incomplete; resume onboarding.",
+      ),
+      readRegistryAgent: vi.fn(() => "openclaw"),
+      settlePortablePairing: vi.fn(async () => ({ kind: "settled" as const })),
+      portablePairingIncompleteMessage: vi.fn(
+        () => "Portable onboarding is incomplete; resume onboarding.",
+      ),
+      isDeploymentHealthy:
+        recorders.isDeploymentHealthy ?? ((result: VerifyDeploymentResult) => result.healthy),
+      reportDeploymentReadiness: recorders.reportDeploymentReadiness ?? vi.fn(),
       getChatUiUrl: () => "http://127.0.0.1:45123",
       buildVerifyChain: (): DashboardDeliveryChain => ({
         accessUrl: "http://127.0.0.1:45123",
+        fallbackUrls: [],
         corsOrigins: ["http://127.0.0.1:45123"],
         forwardTarget: "45123",
         healthEndpoint: "/health",
@@ -272,6 +314,7 @@ export function createPhases(
               gatewayVersion: "test",
               inferenceRouteWorking: true,
               dashboardReachable: true,
+              agentApiReachable: null,
               messagingBridgesHealthy: true,
               messagingRuntimeChannelsMissing: null,
               messagingConfigChannelsMissing: null,

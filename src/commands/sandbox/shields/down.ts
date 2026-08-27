@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { Flags } from "@oclif/core";
-import { NemoClawCommand } from "../../../lib/cli/nemoclaw-oclif-command";
-
 import { shieldsTimeoutDurationFlag } from "../../../lib/cli/duration-flags";
-import * as shields from "../../../lib/shields/index";
+import {
+  assertHermesPortableCommandUnavailable,
+  NemoClawCommand,
+} from "../../../lib/cli/nemoclaw-oclif-command";
 import { sandboxNameArg } from "../../../lib/sandbox/command-support";
+import * as shields from "../../../lib/shields/index";
 
 export default class ShieldsDownCommand extends NemoClawCommand {
   static id = "sandbox:shields:down";
@@ -28,6 +30,9 @@ export default class ShieldsDownCommand extends NemoClawCommand {
       timeout: flags.timeout ?? null,
       reason: flags.reason ?? null,
       policy: flags.policy ?? "permissive",
+      throwOnError: true,
+      assertCommandAvailable: () =>
+        assertHermesPortableCommandUnavailable(args.sandboxName, "sandbox:shields:down"),
     });
   }
 }

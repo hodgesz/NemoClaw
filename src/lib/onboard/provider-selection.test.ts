@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 
-import { resolveRequestedProviderSelection } from "../../../dist/lib/onboard/provider-selection";
+import { resolveRequestedProviderSelection } from "./provider-selection";
 
 const option = (key: string) => ({ key, label: key });
 
@@ -13,6 +13,10 @@ const remoteProviderConfig = {
   openai: { providerName: "openai-api" },
   hermesProvider: { providerName: "hermes-provider" },
 };
+
+// Ternary accessor (no `if`, per the changed-test-file conditionals guardrail).
+const selectedKey = (result: ReturnType<typeof resolveRequestedProviderSelection>) =>
+  result.kind === "selected" ? result.selected.key : null;
 
 function resolve(overrides: Partial<Parameters<typeof resolveRequestedProviderSelection>[0]> = {}) {
   return resolveRequestedProviderSelection({
@@ -23,7 +27,9 @@ function resolve(overrides: Partial<Parameters<typeof resolveRequestedProviderSe
     isWsl: false,
     isWindowsHostOllama: false,
     windowsHostOllamaSupported: false,
+    windowsHostOllamaReachable: false,
     hermesProviderAvailable: false,
+    ollamaRunning: false,
     readRecordedProvider: () => null,
     readRecordedNimContainer: () => null,
     readRecordedModel: () => null,
@@ -44,6 +50,93 @@ describe("resolveRequestedProviderSelection", () => {
       assert.equal(result.recoveredFromSandbox, false);
       assert.equal(result.recoveredModel, null);
     }
+  });
+
+  it("reuses a running Ollama daemon instead of reinstalling on the Windows host (#7472)", () => {
+    // WSL mirrored networking: the Windows daemon answers on loopback first, so
+    // the probe reads isWindowsHostOllama false and the menu keeps the install
+    // entry. Express still requests it; the running daemon must win anyway.
+    const result = resolve({
+      options: [option("build"), option("ollama"), option("install-windows-ollama")],
+      requestedProvider: "install-windows-ollama",
+      isWsl: true,
+      isWindowsHostOllama: false,
+      windowsHostOllamaSupported: true,
+      ollamaRunning: true,
+    });
+
+    assert.equal(selectedKey(result), "ollama");
+  });
+
+  it("still installs on the Windows host when no daemon responds (#7472)", () => {
+    const result = resolve({
+      options: [option("build"), option("install-windows-ollama")],
+      requestedProvider: "install-windows-ollama",
+      isWsl: true,
+      windowsHostOllamaSupported: true,
+      ollamaRunning: false,
+    });
+
+    assert.equal(selectedKey(result), "install-windows-ollama");
+  });
+
+  it("restarts Windows-host Ollama when only WSL can reach the daemon (#10100)", () => {
+    const result = resolve({
+      options: [option("build"), option("ollama"), option("start-windows-ollama")],
+      requestedProvider: "install-windows-ollama",
+      isWsl: true,
+      isWindowsHostOllama: true,
+      windowsHostOllamaSupported: true,
+      windowsHostOllamaReachable: false,
+      ollamaRunning: true,
+    });
+
+    assert.equal(selectedKey(result), "start-windows-ollama");
+  });
+
+  it("restarts Docker-unreachable Windows-host Ollama for an explicit Ollama request (#10100)", () => {
+    const result = resolve({
+      options: [option("build"), option("ollama"), option("start-windows-ollama")],
+      requestedProvider: "ollama",
+      isWsl: true,
+      isWindowsHostOllama: true,
+      windowsHostOllamaSupported: true,
+      windowsHostOllamaReachable: false,
+      ollamaRunning: true,
+    });
+
+    assert.equal(selectedKey(result), "start-windows-ollama");
+  });
+
+  it("rejects explicit Windows-host Ollama on an unsupported container runtime (#10100)", () => {
+    const result = resolve({
+      options: [option("build"), option("ollama")],
+      requestedProvider: "ollama",
+      isWsl: true,
+      isWindowsHostOllama: true,
+      windowsHostOllamaSupported: false,
+      windowsHostOllamaReachable: false,
+      ollamaRunning: true,
+    });
+
+    assert.equal(result.kind, "failure");
+    assert.equal(
+      result.kind === "failure" ? result.reason.kind : null,
+      "unsupported-windows-host-ollama",
+    );
+  });
+
+  it("still installs WSL-local Ollama when a daemon is already running (#7472)", () => {
+    // Guards the narrow scope: widening the collapse to install-ollama would
+    // skip the upgrade entry resolveOllamaInstallMenuEntry keeps for a
+    // running-but-stale daemon.
+    const result = resolve({
+      options: [option("build"), option("ollama"), option("install-ollama")],
+      requestedProvider: "install-ollama",
+      ollamaRunning: true,
+    });
+
+    assert.equal(selectedKey(result), "install-ollama");
   });
 
   it("recovers the recorded provider and model when no provider was requested", () => {
@@ -127,5 +220,43 @@ describe("resolveRequestedProviderSelection", () => {
       assert.equal(result.selected.key, "build");
       assert.equal(result.recoveredFromSandbox, false);
     }
+  });
+
+  it("auto-selects managed vLLM on a DGX managed-vLLM platform when no provider is given (#7293)", () => {
+    const result = resolve({
+      options: [option("build"), option("install-vllm")],
+      preferManagedVllmDefault: true,
+    });
+
+    assert.equal(selectedKey(result), "install-vllm");
+  });
+
+  it("auto-selects an already-running local vLLM on a managed-vLLM platform (#7293)", () => {
+    // When vLLM is already running, the menu exposes only `vllm` (not install-vllm).
+    const result = resolve({
+      options: [option("build"), option("vllm")],
+      preferManagedVllmDefault: true,
+    });
+
+    assert.equal(selectedKey(result), "vllm");
+  });
+
+  it("keeps the cloud default when the caller does not prefer managed vLLM (#7293)", () => {
+    // The menu can expose managed vLLM without changing the automatic selection.
+    const result = resolve({
+      options: [option("build"), option("install-vllm")],
+      preferManagedVllmDefault: false,
+    });
+
+    assert.equal(selectedKey(result), "build");
+  });
+
+  it("keeps the cloud default when no managed-vLLM entry is available (#7293)", () => {
+    const result = resolve({
+      options: [option("build"), option("openai")],
+      preferManagedVllmDefault: true,
+    });
+
+    assert.equal(selectedKey(result), "build");
   });
 });

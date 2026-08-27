@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { getSandboxStatusReport, showSandboxStatus } from "../../lib/actions/sandbox/status";
+import {
+  getSandboxStatusReport,
+  isInferenceHealthFailing,
+  showSandboxStatus,
+} from "../../lib/actions/sandbox/status";
 import { NemoClawCommand } from "../../lib/cli/nemoclaw-oclif-command";
 import { sandboxNameArg } from "../../lib/sandbox/command-support";
 import { redactForLog } from "../../lib/security/redact";
@@ -10,10 +14,12 @@ export default class SandboxStatusCommand extends NemoClawCommand {
   static id = "sandbox:status";
   static strict = true;
   static enableJsonFlag = true;
-  static summary = "Sandbox health and NIM status";
-  static description = "Show sandbox health, OpenShell gateway state, and local NIM status.";
+  static summary = "Show one sandbox's health and runtime status";
+  static description =
+    "Show one sandbox's health, OpenShell gateway state, inference status, and local NIM status. Use global `status` for the all-sandbox/service overview.";
   static usage = ["<name> [--json]"];
   static examples = [
+    "<%= config.bin %> alpha status",
     "<%= config.bin %> sandbox status alpha",
     "<%= config.bin %> sandbox status alpha --json",
   ];
@@ -28,10 +34,13 @@ export default class SandboxStatusCommand extends NemoClawCommand {
       const report = await getSandboxStatusReport(args.sandboxName);
       if (
         !report.found ||
-        report.gatewayState !== "present" ||
-        report.rpcIssue ||
-        report.failureLayer ||
-        report.terminalRuntimeHealth?.kind === "degraded"
+        ("portableLifecyclePhase" in report
+          ? report.portableLifecyclePhase !== "active"
+          : report.gatewayState !== "present" ||
+            report.rpcIssue ||
+            report.failureLayer ||
+            isInferenceHealthFailing(report.inferenceHealth) ||
+            report.terminalRuntimeHealth?.kind === "degraded")
       ) {
         process.exitCode = 1;
       }

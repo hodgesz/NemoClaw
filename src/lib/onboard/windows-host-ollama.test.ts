@@ -3,10 +3,13 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const runCapture = vi.fn<(cmd: readonly string[]) => string>(() => "");
+const runCapture = vi.fn<typeof import("../runner").runCapture>(() => "");
 
 vi.mock("../runner", () => ({
-  runCapture: (cmd: readonly string[]) => runCapture(cmd),
+  runCapture: (
+    cmd: readonly string[],
+    options?: Parameters<typeof import("../runner").runCapture>[1],
+  ) => runCapture(cmd, options),
 }));
 
 vi.mock("../platform", () => ({
@@ -52,13 +55,37 @@ describe("detectWindowsHostOllama", () => {
     expect(runCapture).not.toHaveBeenCalled();
   });
 
-  it("returns uninstalled when all Windows Ollama probes miss", () => {
+  it("returns absent state when Windows-host probes do not respond (#9604)", () => {
     runCapture.mockImplementation(() => "");
 
-    expect(detectWindowsHostOllama()).toEqual({
+    expect(detectWindowsHostOllama({ isWsl: () => true, runCapture })).toEqual({
       installed: false,
       installedPath: "",
       loopbackOnly: false,
     });
+    expect(runCapture).toHaveBeenCalledTimes(3);
+    expect(runCapture.mock.calls.map(([, options]) => options)).toEqual([
+      { ignoreError: true, timeout: 5_000 },
+      { ignoreError: true, timeout: 5_000 },
+      { ignoreError: true, timeout: 5_000 },
+    ]);
+  });
+
+  it("continues when the Windows-host port probe does not respond (#9604)", () => {
+    const installedPath = "C:\\Users\\tester\\AppData\\Local\\Programs\\Ollama\\ollama.exe";
+    const outputs = [installedPath, "42", ""];
+    runCapture.mockImplementation(() => outputs.shift() ?? "");
+
+    expect(detectWindowsHostOllama()).toEqual({
+      installed: true,
+      installedPath,
+      loopbackOnly: false,
+    });
+    expect(runCapture).toHaveBeenCalledTimes(3);
+    expect(runCapture.mock.calls.map(([, options]) => options)).toEqual([
+      { ignoreError: true, timeout: 5_000 },
+      { ignoreError: true, timeout: 5_000 },
+      { ignoreError: true, timeout: 5_000 },
+    ]);
   });
 });

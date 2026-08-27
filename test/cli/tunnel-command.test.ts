@@ -30,11 +30,20 @@ describe("tunnel CLI dispatch", () => {
     expect(r.out).toContain("Start the cloudflared public-URL tunnel");
   });
 
-  it("deprecated start --help exits 0 and shows alias usage", () => {
+  it("deprecated start --help exits 0 and describes migration-only behavior", () => {
     const r = run("start --help");
     expect(r.code).toBe(0);
-    expect(r.out).toContain("start");
-    expect(r.out).toContain("Deprecated alias");
+    expect(r.out).toContain("this command does not");
+    expect(r.out).toContain("start a sandbox or public-URL tunnel");
+    expect(r.out).toContain("nemoclaw <name> start");
+    expect(r.out).toContain("nemoclaw tunnel start");
+  });
+
+  it("deprecated start exits 0 with sandbox-scoped migration guidance (#9303)", () => {
+    const r = run("start 2>&1");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("nemoclaw <name> start");
+    expect(r.out).toContain("nemoclaw tunnel start");
   });
 
   it("tunnel stop --help exits 0 and shows tunnel usage", () => {
@@ -66,10 +75,11 @@ describe("tunnel CLI dispatch", () => {
     expect(r.out).toContain("tunnel status");
   });
 
-  it("deprecated stop --help exits 0 and shows alias usage", () => {
+  it("deprecated stop --help exits 0 and explains legacy full-stop behavior", () => {
     const r = run("stop --help");
     expect(r.code).toBe(0);
     expect(r.out).toContain("stop");
-    expect(r.out).toContain("Deprecated alias");
+    expect(r.out).toContain("Deprecated full stop");
+    expect(r.out).toContain("releases the managed host gateway port");
   });
 });

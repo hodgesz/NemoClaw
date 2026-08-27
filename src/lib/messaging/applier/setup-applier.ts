@@ -4,6 +4,7 @@
 import { Buffer } from "node:buffer";
 
 import type { ChannelHookPhase, SandboxMessagingPlan } from "../manifest";
+import { parseSandboxMessagingPlan } from "../plan-validation";
 import {
   applyAgentConfigAtOpenShell as applyAgentConfigPlanAtOpenShell,
   listHookRequests as listPlanHookRequests,
@@ -28,18 +29,51 @@ import {
   type MessagingSetupEnvOptions,
 } from "./types";
 
+function canonicalizeJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => canonicalizeJsonValue(item));
+  }
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+
+  const record = value as Record<string, unknown>;
+  return Object.fromEntries(
+    Object.keys(record)
+      .sort()
+      .map((key) => [key, canonicalizeJsonValue(record[key])]),
+  );
+}
+
+function canonicalJsonStringify(value: unknown): string {
+  // Preserve JSON.stringify's validation and value-normalization semantics
+  // before sorting keys. In particular, cyclic plans must still fail instead
+  // of being silently truncated or recursed indefinitely.
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) {
+    throw new TypeError("Expected a JSON-serializable messaging plan.");
+  }
+  return JSON.stringify(canonicalizeJsonValue(JSON.parse(serialized)));
+}
+
 export class MessagingSetupApplier {
   static encodePlan(plan: SandboxMessagingPlan): string {
-    assertSandboxMessagingPlan(plan);
-    assertJsonSerializable(plan);
     return Buffer.from(JSON.stringify(plan), "utf8").toString("base64");
+  }
+
+  static encodePlanForImageBuild(plan: SandboxMessagingPlan): string {
+    const { workflow: _workflow, ...imageBuildPlan } = plan;
+    return Buffer.from(canonicalJsonStringify(imageBuildPlan), "utf8").toString("base64");
   }
 
   static decodePlan(encoded: string): SandboxMessagingPlan {
     const raw = Buffer.from(encoded, "base64").toString("utf8");
     const parsed = JSON.parse(raw) as unknown;
-    assertSandboxMessagingPlan(parsed);
-    return parsed;
+    const plan = parseSandboxMessagingPlan(parsed);
+    if (!plan) {
+      throw new Error("Expected a serializable SandboxMessagingPlan.");
+    }
+    return plan;
   }
 
   static writePlanToEnv(plan: SandboxMessagingPlan, options: MessagingSetupEnvOptions = {}): void {
@@ -70,17 +104,14 @@ export class MessagingSetupApplier {
     plan: SandboxMessagingPlan,
     phase?: ChannelHookPhase,
   ): MessagingHookApplyRequest[] {
-    assertSandboxMessagingPlan(plan);
     return listPlanHookRequests(plan, phase);
   }
 
   static listPreEnableChecks(plan: SandboxMessagingPlan): MessagingHookApplyRequest[] {
-    assertSandboxMessagingPlan(plan);
     return listPlanHookRequests(plan, "pre-enable");
   }
 
   static listHealthChecks(plan: SandboxMessagingPlan): MessagingHookApplyRequest[] {
-    assertSandboxMessagingPlan(plan);
     return listPlanHookRequests(plan, "health-check");
   }
 
@@ -89,7 +120,6 @@ export class MessagingSetupApplier {
     phase: ChannelHookPhase,
     options: MessagingHookPhaseOptions = {},
   ): ReturnType<typeof applyPlanHooksForPhase> {
-    assertSandboxMessagingPlan(plan);
     return applyPlanHooksForPhase(plan, phase, options);
   }
 
@@ -97,7 +127,6 @@ export class MessagingSetupApplier {
     plan: SandboxMessagingPlan,
     options: MessagingHookPhaseOptions = {},
   ): ReturnType<typeof applyPlanPreEnableChecks> {
-    assertSandboxMessagingPlan(plan);
     return applyPlanPreEnableChecks(plan, options);
   }
 
@@ -105,7 +134,6 @@ export class MessagingSetupApplier {
     plan: SandboxMessagingPlan,
     options: MessagingHookPhaseOptions = {},
   ): ReturnType<typeof applyPlanHealthChecks> {
-    assertSandboxMessagingPlan(plan);
     return applyPlanHealthChecks(plan, options);
   }
 
@@ -120,7 +148,6 @@ export class MessagingSetupApplier {
     readonly appliedHooks: readonly string[];
     readonly unresolvedTemplateRefs: readonly string[];
   }> {
-    assertSandboxMessagingPlan(plan);
     return applyAgentConfigPlanAtOpenShell(plan, options);
   }
 
@@ -128,7 +155,6 @@ export class MessagingSetupApplier {
     plan: SandboxMessagingPlan,
     options: MessagingCredentialApplyOptions,
   ): MessagingCredentialApplyResult {
-    assertSandboxMessagingPlan(plan);
     return applyCredentialsPlanAtOpenShell(plan, options);
   }
 
@@ -136,106 +162,6 @@ export class MessagingSetupApplier {
     plan: SandboxMessagingPlan,
     options: MessagingPolicyApplyOptions,
   ): MessagingPolicyApplyResult {
-    assertSandboxMessagingPlan(plan);
     return applyPolicyPlanAtOpenShell(plan, options);
-  }
-}
-
-function assertSandboxMessagingPlan(value: unknown): asserts value is SandboxMessagingPlan {
-  if (
-    !isObject(value) ||
-    value.schemaVersion !== 1 ||
-    typeof value.sandboxName !== "string" ||
-    typeof value.agent !== "string" ||
-    typeof value.workflow !== "string" ||
-    !Array.isArray(value.channels) ||
-    !value.channels.every(isSerializableChannelPlan) ||
-    !Array.isArray(value.disabledChannels) ||
-    !Array.isArray(value.credentialBindings) ||
-    !isObject(value.networkPolicy) ||
-    !Array.isArray(value.agentRender) ||
-    !Array.isArray(value.buildSteps) ||
-    !isRuntimeSetup(value.runtimeSetup) ||
-    !Array.isArray(value.stateUpdates) ||
-    !Array.isArray(value.healthChecks)
-  ) {
-    throw new Error("Expected a serializable SandboxMessagingPlan.");
-  }
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isSerializableChannelPlan(value: unknown): boolean {
-  if (!isObject(value)) return false;
-  if (!Object.hasOwn(value, "hostForward")) return true;
-  const hostForward = value.hostForward;
-  return (
-    isObject(hostForward) &&
-    typeof hostForward.channelId === "string" &&
-    typeof hostForward.port === "number" &&
-    Number.isInteger(hostForward.port) &&
-    hostForward.port >= 1 &&
-    hostForward.port <= 65535 &&
-    typeof hostForward.label === "string"
-  );
-}
-
-function isRuntimeSetup(value: unknown): boolean {
-  if (value === undefined) return true;
-  return (
-    isObject(value) &&
-    Array.isArray(value.nodePreloads) &&
-    Array.isArray(value.envAliases) &&
-    Array.isArray(value.secretScans)
-  );
-}
-
-function assertJsonSerializable(
-  value: unknown,
-  path = "$",
-  visiting: Set<object> = new Set(),
-): void {
-  if (
-    value === null ||
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean" ||
-    typeof value === "undefined"
-  ) {
-    return;
-  }
-  if (Array.isArray(value)) {
-    assertAcyclicObject(value, path, visiting, () => {
-      value.forEach((entry, index) => assertJsonSerializable(entry, `${path}[${index}]`, visiting));
-    });
-    return;
-  }
-  if (typeof value === "object") {
-    assertAcyclicObject(value, path, visiting, () => {
-      for (const [key, entry] of Object.entries(value)) {
-        assertJsonSerializable(entry, `${path}.${key}`, visiting);
-      }
-    });
-    return;
-  }
-  throw new Error(`Messaging setup plan is not JSON-serializable at ${path}.`);
-}
-
-function assertAcyclicObject(
-  value: object,
-  path: string,
-  visiting: Set<object>,
-  visit: () => void,
-): void {
-  if (visiting.has(value)) {
-    throw new Error(`Messaging setup plan contains a cycle at ${path}.`);
-  }
-  visiting.add(value);
-  try {
-    visit();
-  } finally {
-    visiting.delete(value);
   }
 }

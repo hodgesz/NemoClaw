@@ -20,6 +20,7 @@ export interface WindowsHostOllamaState {
 }
 
 const POWERSHELL = "powershell.exe";
+const WINDOWS_HOST_OLLAMA_PROBE_TIMEOUT_MS = 5_000;
 
 const GET_COMMAND_OLLAMA =
   "Get-Command ollama.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source";
@@ -40,12 +41,31 @@ const GET_KNOWN_OLLAMA_INSTALL_PATH =
 const GET_NETTCP_OLLAMA_LISTEN =
   "Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty LocalAddress";
 
-function powershell(script: string): string {
-  return runCapture([POWERSHELL, "-Command", script], { ignoreError: true }).trim();
+export interface DetectWindowsHostOllamaDeps {
+  isWsl: () => boolean;
+  runCapture: typeof runCapture;
 }
 
-function probeInstalledPath(): string {
-  const onPath = powershell(GET_COMMAND_OLLAMA);
+function resolveDeps(
+  overrides: Partial<DetectWindowsHostOllamaDeps> = {},
+): DetectWindowsHostOllamaDeps {
+  return {
+    isWsl: overrides.isWsl ?? isWsl,
+    runCapture: overrides.runCapture ?? runCapture,
+  };
+}
+
+function powershell(script: string, deps: DetectWindowsHostOllamaDeps): string {
+  return deps
+    .runCapture([POWERSHELL, "-Command", script], {
+      ignoreError: true,
+      timeout: WINDOWS_HOST_OLLAMA_PROBE_TIMEOUT_MS,
+    })
+    .trim();
+}
+
+function probeInstalledPath(deps: DetectWindowsHostOllamaDeps): string {
+  const onPath = powershell(GET_COMMAND_OLLAMA, deps);
   if (onPath.length > 0) return onPath;
   // PATH miss: service-style installs and any installer that does not
   // update the calling user's PATH leave ollama.exe invisible to
@@ -53,31 +73,32 @@ function probeInstalledPath(): string {
   // the live process so the restart launcher in windows.ts can target
   // the verified executable instead of falling back to a broken PATH
   // lookup (#3949).
-  const processPath = powershell(GET_PROCESS_OLLAMA_PATH);
+  const processPath = powershell(GET_PROCESS_OLLAMA_PATH, deps);
   if (processPath.length > 0) return processPath;
   // Silent installs often land in fixed locations without updating PATH or
   // leaving a running daemon to probe. Check those paths even when no PID is
   // visible so WSL onboarding offers Start instead of Install (#4066).
-  return powershell(GET_KNOWN_OLLAMA_INSTALL_PATH);
+  return powershell(GET_KNOWN_OLLAMA_INSTALL_PATH, deps);
 }
 
-function probeLoopbackOnly(): boolean {
-  const pid = powershell(GET_PROCESS_OLLAMA_ID);
+function probeLoopbackOnly(deps: DetectWindowsHostOllamaDeps): boolean {
+  const pid = powershell(GET_PROCESS_OLLAMA_ID, deps);
   if (!pid) return false;
-  const listenAddrs = runCapture([POWERSHELL, "-Command", GET_NETTCP_OLLAMA_LISTEN], {
-    ignoreError: true,
-  });
+  const listenAddrs = powershell(GET_NETTCP_OLLAMA_LISTEN, deps);
   return /127\.0\.0\.1/.test(listenAddrs) && !/0\.0\.0\.0|^::\s*$/m.test(listenAddrs);
 }
 
-export function detectWindowsHostOllama(): WindowsHostOllamaState {
-  if (!isWsl()) {
+export function detectWindowsHostOllama(
+  overrides: Partial<DetectWindowsHostOllamaDeps> = {},
+): WindowsHostOllamaState {
+  const deps = resolveDeps(overrides);
+  if (!deps.isWsl()) {
     return { installed: false, installedPath: "", loopbackOnly: false };
   }
-  const installedPath = probeInstalledPath();
+  const installedPath = probeInstalledPath(deps);
   // `installed` reflects binary presence on disk, not a live daemon. Onboard
   // still gates Start/Restart on reachability and loopback binding (#3949).
   const installed = installedPath.length > 0;
-  const loopbackOnly = installed ? probeLoopbackOnly() : false;
+  const loopbackOnly = installed ? probeLoopbackOnly(deps) : false;
   return { installed, installedPath, loopbackOnly };
 }

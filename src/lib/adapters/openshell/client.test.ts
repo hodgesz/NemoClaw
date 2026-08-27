@@ -3,8 +3,9 @@
 
 import type { SpawnSyncReturns } from "node:child_process";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { withStdoutRedirectedToStderr } from "../../cli/stdout-guard";
 import {
   captureOpenshellCommand,
   captureOpenshellCommandAsync,
@@ -16,6 +17,7 @@ import {
   stripAnsi,
   versionGte,
 } from "./client";
+import { processTreeBoundedOpenshellInvocation } from "./process-tree-timeout";
 
 interface SpawnResultSpec {
   status: number | null;
@@ -50,6 +52,25 @@ function exitWithCode(code: number): never {
 }
 
 describe("openshell helpers", () => {
+  it("wraps a synchronous Linux probe in a process-group timeout (#10238)", () => {
+    expect(
+      processTreeBoundedOpenshellInvocation(
+        "/opt/openshell",
+        ["sandbox", "list"],
+        { killProcessTreeOnTimeout: true, timeout: 1000 },
+        { platform: "linux", timeoutExecutableExists: () => true },
+      ),
+    ).toEqual({
+      binary: "/usr/bin/timeout",
+      args: ["--signal=KILL", "0.75s", "/opt/openshell", "sandbox", "list"],
+      killSignal: "SIGKILL",
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("strips ANSI sequences", () => {
     expect(stripAnsi("\u001b[32mConnected\u001b[0m")).toBe("Connected");
   });
@@ -57,6 +78,21 @@ describe("openshell helpers", () => {
   it("parses semantic versions from CLI output", () => {
     expect(parseVersionFromText("openshell 0.0.9")).toBe("0.0.9");
     expect(parseVersionFromText("v1.2.3\n")).toBe("1.2.3");
+    expect(parseVersionFromText("Hermes Agent v0.17.0 (2026.6.19)")).toBe("0.17.0");
+    expect(parseVersionFromText("built on 2026.7.1, dcode 0.1.12", "dcode --version")).toBe(
+      "0.1.12",
+    );
+    expect(
+      parseVersionFromText("Python 3.12.0\ndcode command failed", "dcode --version"),
+    ).toBeNull();
+    expect(parseVersionFromText("LangChain Deep Agents Code v0.1.12", "dcode --version")).toBe(
+      "0.1.12",
+    );
+    expect(
+      parseVersionFromText("built on 2026.7.1, dcode 0.1.12, dcode 0.2.0", "dcode --version"),
+    ).toBe("0.1.12");
+    expect(parseVersionFromText("dcode 0.1.12", "/opt/venv/bin/dcode --version")).toBe("0.1.12");
+    expect(parseVersionFromText("OpenClaw 2026.5.27.1", "openclaw --version")).toBeNull();
     expect(parseVersionFromText("no version here")).toBeNull();
   });
 
@@ -118,14 +154,71 @@ describe("openshell helpers", () => {
     expect(result.status).toBe(0);
   });
 
-  it("passes timeout and maxBuffer options through to OpenShell spawn calls", () => {
-    const observedOptions: Array<{ timeout?: number; maxBuffer?: number }> = [];
+  it("redirects inherited stdout while the JSONL stdout guard is active", async () => {
+    const observedStdio: unknown[] = [];
     const spawnSyncImpl: OpenshellSpawnSync = (_command, _args, options) => {
-      observedOptions.push({ timeout: options.timeout, maxBuffer: options.maxBuffer });
+      observedStdio.push(options.stdio);
+      return makeSpawnResult({ status: 0, stdout: "", stderr: "" });
+    };
+
+    runOpenshellCommand("openshell", ["status"], { spawnSyncImpl });
+    await withStdoutRedirectedToStderr(async () => {
+      runOpenshellCommand("openshell", ["status"], { spawnSyncImpl });
+    });
+
+    expect(observedStdio).toEqual(["inherit", ["inherit", process.stderr, "inherit"]]);
+  });
+
+  it("can replace the parent environment for credential-bearing OpenShell commands", () => {
+    vi.stubEnv("NEMOCLAW_TEST_UNRELATED_SECRET", "must-not-leak");
+    let observedEnv: NodeJS.ProcessEnv | undefined;
+    runOpenshellCommand("openshell", ["provider", "create"], {
+      replaceEnv: true,
+      env: { PATH: "/safe/bin", MCP_TOKEN: "selected-secret" },
+      spawnSyncImpl: (_command, _args, options) => {
+        observedEnv = options.env;
+        return makeSpawnResult({ status: 0, stdout: "ok\n", stderr: "" });
+      },
+    });
+
+    expect(observedEnv).toEqual({ PATH: "/safe/bin", MCP_TOKEN: "selected-secret" });
+  });
+
+  it("filters unrelated parent secrets from ordinary OpenShell commands", () => {
+    vi.stubEnv("NEMOCLAW_TEST_UNRELATED_SECRET", "must-not-leak");
+    let observedEnv: NodeJS.ProcessEnv | undefined;
+    runOpenshellCommand("openshell", ["status"], {
+      spawnSyncImpl: (_command, _args, options) => {
+        observedEnv = options.env;
+        return makeSpawnResult({ status: 0, stdout: "ok\n", stderr: "" });
+      },
+    });
+
+    expect(observedEnv?.NEMOCLAW_TEST_UNRELATED_SECRET).toBeUndefined();
+    expect(observedEnv?.PATH).toBe(process.env.PATH);
+  });
+
+  it("passes timeout, kill signal, and maxBuffer options through to OpenShell spawn calls", () => {
+    const observedOptions: Array<{
+      timeout?: number;
+      killSignal?: NodeJS.Signals | number;
+      maxBuffer?: number;
+    }> = [];
+    const spawnSyncImpl: OpenshellSpawnSync = (_command, _args, options) => {
+      observedOptions.push({
+        timeout: options.timeout,
+        killSignal: options.killSignal,
+        maxBuffer: options.maxBuffer,
+      });
       return makeSpawnResult({ status: 0, stdout: "ok\n", stderr: "" });
     };
 
-    runOpenshellCommand("openshell", ["status"], { timeout: 4321, spawnSyncImpl });
+    runOpenshellCommand("openshell", ["status"], {
+      timeout: 4321,
+      killSignal: "SIGKILL",
+      maxBuffer: 65432,
+      spawnSyncImpl,
+    });
     captureOpenshellCommand("openshell", ["status"], {
       timeout: 9876,
       maxBuffer: 123456,
@@ -133,8 +226,8 @@ describe("openshell helpers", () => {
     });
 
     expect(observedOptions).toEqual([
-      { timeout: 4321, maxBuffer: undefined },
-      { timeout: 9876, maxBuffer: 123456 },
+      { timeout: 4321, killSignal: "SIGKILL", maxBuffer: 65432 },
+      { timeout: 9876, killSignal: undefined, maxBuffer: 123456 },
     ]);
   });
 
@@ -177,6 +270,21 @@ describe("openshell helpers", () => {
       error: expect.objectContaining({ message: expect.stringContaining("ETIMEDOUT") }),
       signal: "SIGTERM",
     });
+  });
+
+  it("preserves a capture signal even when spawnSync reports no Error", () => {
+    const result = captureOpenshellCommand("openshell", ["sandbox", "get", "alpha"], {
+      ignoreError: true,
+      spawnSyncImpl: stubSpawnSync({
+        status: null,
+        stdout: "partial\n",
+        stderr: "terminated\n",
+        signal: "SIGTERM",
+      }),
+      exit: exitWithCode,
+    });
+
+    expect(result).toEqual({ status: null, output: "partial", signal: "SIGTERM" });
   });
 
   it("returns ignored capture buffer failures with partial streams", () => {
@@ -224,6 +332,31 @@ describe("openshell helpers", () => {
     expect(calls).toEqual([
       ["sandbox", "get", "alpha"],
       ["sandbox", "ssh-config", "alpha"],
+    ]);
+  });
+
+  it("scopes both sandbox lookups to the requested gateway (#7429)", () => {
+    const calls: string[][] = [];
+    const spawnSyncImpl: OpenshellSpawnSync = (_command, args) => {
+      calls.push([...args]);
+      return makeSpawnResult({
+        status: 0,
+        stdout: args.includes("get") ? "alpha Ready\n" : "Host openshell-alpha\n",
+        stderr: "",
+      });
+    };
+
+    captureSandboxSshConfigCommand("openshell", "alpha", {
+      spawnSyncImpl,
+      gatewayName: "nemoclaw-18080",
+    });
+
+    // Both hops must carry the gateway: `get` succeeding on one gateway while
+    // `ssh-config` resolves against another would emit a config for the wrong
+    // sandbox.
+    expect(calls).toEqual([
+      ["sandbox", "get", "-g", "nemoclaw-18080", "alpha"],
+      ["sandbox", "ssh-config", "-g", "nemoclaw-18080", "alpha"],
     ]);
   });
 
@@ -361,7 +494,7 @@ describe("openshell helpers", () => {
     const version = getInstalledOpenshellVersion("openshell", {
       spawnSyncImpl: stubSpawnSync({
         status: 0,
-        stdout: "openshell 0.0.11\n",
+        stdout: "built on 2026.7.1, openshell 0.0.11\n",
         stderr: "",
       }),
     });

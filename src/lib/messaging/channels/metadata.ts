@@ -8,7 +8,16 @@ import type {
   ChannelPolicyPresetSpec,
   MessagingAgentId,
 } from "../manifest";
-import { BUILT_IN_CHANNEL_MANIFESTS } from "./built-ins";
+import { BUILT_IN_CHANNEL_MANIFESTS } from "./built-ins.ts";
+
+const CONFIG_ENV_ALIASES_BY_ENV_KEY: Readonly<Record<string, readonly string[]>> = {
+  DISCORD_SERVER_ID: ["DISCORD_SERVER_IDS"],
+  DISCORD_USER_ID: ["DISCORD_ALLOWED_IDS"],
+  MSTEAMS_APP_ID: ["TEAMS_CLIENT_ID"],
+  MSTEAMS_TENANT_ID: ["TEAMS_TENANT_ID"],
+  TEAMS_ALLOWED_USERS: ["MSTEAMS_ALLOWED_USERS"],
+  MSTEAMS_PORT: ["TEAMS_PORT"],
+};
 
 export interface MessagingManifestMetadataOptions {
   readonly agent?: MessagingAgentId;
@@ -26,11 +35,18 @@ export interface MessagingCredentialMetadata {
   readonly primary: boolean;
 }
 
+export interface MessagingCredentialEnvAssignmentMetadata {
+  readonly channelId: string;
+  readonly agent: MessagingAgentId;
+  readonly sourceEnvKey: string;
+  readonly targetEnvKey: string;
+  readonly placeholder: string;
+}
+
 export interface MessagingConfigEnvMetadata {
   readonly channelId: string;
   readonly inputId: string;
   readonly envKey: string;
-  readonly envAliases: readonly string[];
   readonly statePath?: string;
   readonly validValues?: readonly string[];
 }
@@ -86,6 +102,38 @@ export function listMessagingCredentialMetadata(
       primary: credential.primary === true,
     })),
   );
+}
+
+export function listMessagingCredentialEnvAssignments(
+  options: MessagingManifestMetadataOptions = {},
+): MessagingCredentialEnvAssignmentMetadata[] {
+  return selectManifests(options).flatMap((manifest) => {
+    const credentialsByTemplate = new Map(
+      manifest.credentials.map((credential) => [
+        `{{credential.${credential.id}.placeholder}}`,
+        credential,
+      ]),
+    );
+    return manifest.render.flatMap((render) => {
+      if (options.agent && render.agent !== options.agent) return [];
+      if (render.kind !== "env-lines") return [];
+      return render.lines.flatMap((line) => {
+        const separator = line.indexOf("=");
+        if (separator <= 0) return [];
+        const credential = credentialsByTemplate.get(line.slice(separator + 1));
+        if (!credential) return [];
+        return [
+          {
+            channelId: manifest.id,
+            agent: render.agent,
+            sourceEnvKey: credential.providerEnvKey,
+            targetEnvKey: line.slice(0, separator),
+            placeholder: credential.placeholder,
+          },
+        ];
+      });
+    });
+  });
 }
 
 export function getMessagingCredentialEnvKeysByChannel(
@@ -162,7 +210,6 @@ export function listMessagingConfigEnvMetadata(
           channelId: manifest.id,
           inputId: input.id,
           envKey: input.envKey,
-          envAliases: input.envAliases ?? [],
           ...(input.statePath ? { statePath: input.statePath } : {}),
           ...(input.validValues ? { validValues: input.validValues } : {}),
         },
@@ -180,10 +227,9 @@ export function listMessagingConfigEnvKeys(
 export function getMessagingConfigEnvAliases(
   options: MessagingManifestMetadataOptions = {},
 ): Readonly<Record<string, readonly string[]>> {
+  const envKeys = new Set(listMessagingConfigEnvKeys(options));
   return Object.fromEntries(
-    listMessagingConfigEnvMetadata(options)
-      .filter((input) => input.envAliases.length > 0)
-      .map((input) => [input.envKey, input.envAliases]),
+    Object.entries(CONFIG_ENV_ALIASES_BY_ENV_KEY).filter(([envKey]) => envKeys.has(envKey)),
   );
 }
 
@@ -242,6 +288,19 @@ export function listRequiredCreateTimeMessagingPolicyPresetsByChannel(
   return result;
 }
 
+export function listMessagingPolicyPresetsByChannel(
+  options: MessagingManifestMetadataOptions = {},
+): Readonly<Record<string, readonly string[]>> {
+  const result: Record<string, string[]> = {};
+  for (const preset of listMessagingPolicyPresetMetadata(options)) {
+    result[preset.channelId] = uniqueStrings([
+      ...(result[preset.channelId] ?? []),
+      preset.presetName,
+    ]);
+  }
+  return result;
+}
+
 export function getMessagingPolicyKeyAliases(
   options: MessagingManifestMetadataOptions = {},
 ): Readonly<Record<string, readonly string[]>> {
@@ -277,6 +336,21 @@ export function listOpenClawManagedChannelNames(
     selectManifests({ ...options, agent: "openclaw" }).flatMap((manifest) =>
       manifest.runtime?.openclaw?.channelName ? [manifest.runtime.openclaw.channelName] : [],
     ),
+  );
+}
+
+export function listOpenClawPluginExtensionIds(
+  options: MessagingManifestMetadataOptions = {},
+): string[] {
+  return uniqueStrings(
+    selectManifests({ ...options, agent: "openclaw" }).flatMap((manifest) => {
+      const extensionId = manifest.runtime?.openclaw?.channelName;
+      const installsPlugin = (manifest.agentPackages ?? []).some(
+        (agentPackage) =>
+          agentPackage.agent === "openclaw" && agentPackage.manager === "openclaw-plugin",
+      );
+      return extensionId && installsPlugin ? [extensionId] : [];
+    }),
   );
 }
 

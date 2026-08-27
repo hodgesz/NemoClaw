@@ -76,12 +76,13 @@ describe("CLI dispatch", () => {
           "sandbox provider detach alpha alpha-slack-bridge",
           "sandbox provider detach alpha alpha-slack-app",
           "sandbox provider detach alpha alpha-brave-search",
+          "sandbox provider detach alpha alpha-tavily-search",
         ];
-        for (const line of expectedDetachLines) {
+        expectedDetachLines.forEach((line) => {
           const idx = indexOfArg(log, line);
           expect(idx, `${line} should appear in openshell log`).toBeGreaterThan(-1);
           expect(idx, `${line} should precede 'sandbox delete alpha'`).toBeLessThan(deleteIdx);
-        }
+        });
       } finally {
         fs.rmSync(home, { recursive: true, force: true });
       }

@@ -6,7 +6,10 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { launchReadinessRegistryFixture } from "../helpers/launch-readiness-fixture";
 import { runWithEnv, writeSandboxRegistry } from "./helpers";
+
+const PLATFORM_EVIDENCE_UNAVAILABLE = "launch-readiness evidence is unavailable on this platform";
 
 describe("CLI dispatch for terminal agents", () => {
   it("connect --probe-only runs terminal-agent smoke checks without gateway recovery", () => {
@@ -15,6 +18,7 @@ describe("CLI dispatch for terminal agents", () => {
     const markerFile = path.join(home, "openshell-calls");
     fs.mkdirSync(localBin, { recursive: true });
     writeSandboxRegistry(home, {
+      ...launchReadinessRegistryFixture(),
       agent: "langchain-deepagents-code",
       provider: "",
       model: "",
@@ -25,7 +29,19 @@ describe("CLI dispatch for terminal agents", () => {
         "#!/usr/bin/env bash",
         `marker_file=${JSON.stringify(markerFile)}`,
         'printf \'%s\\n\' "$*" >> "$marker_file"',
-        'if [ "$1" = "sandbox" ] && [ "$2" = "get" ] && [ "$3" = "alpha" ]; then',
+        'if [ "$1" = "sandbox" ] && [ "$2" = "list" ]; then',
+        "  echo 'alpha  Ready'",
+        "  exit 0",
+        "fi",
+        'if [ "$1" = "policy" ] && [ "$2" = "get" ]; then',
+        "  printf '%s\\n' 'version: 1' 'network_policies:' '  fixture_api:' '    name: Fixture API' '    endpoints:' '      - host: example.com' '        port: 443' '    binaries:' '      - path: /usr/bin/curl'",
+        "  exit 0",
+        "fi",
+        'if [ "$1" = "inference" ] && [ "$2" = "get" ]; then',
+        "  printf '%s\\n' 'Gateway inference:' '  Not configured'",
+        "  exit 0",
+        "fi",
+        'if [ "$1" = "sandbox" ] && [ "$2" = "get" ] && { [ "$3" = "alpha" ] || [ "$5" = "alpha" ]; }; then',
         "  echo 'Sandbox:'",
         "  echo",
         "  echo '  Id: abc'",
@@ -35,10 +51,13 @@ describe("CLI dispatch for terminal agents", () => {
         "  exit 0",
         "fi",
         'if [ "$1" = "sandbox" ] && [ "$2" = "exec" ] && [ "$3" = "-n" ] && [ "$4" = "alpha" ]; then',
-        '  cmd="${10}"',
+        // The smoke command is always the final argument. Read it from the end
+        // so the stub does not depend on how many flags precede it (#8624).
+        '  cmd="${*: -1}"',
         '  case "$cmd" in',
-        '    *"dcode --version"*) echo "dcode 0.1.12"; echo "NEMOCLAW_AGENT_SMOKE_EXIT:0"; exit 0 ;;',
-        '    *"config.toml"*) echo "NEMOCLAW_DEEPAGENTS_CONFIG_OK"; echo "NEMOCLAW_AGENT_SMOKE_EXIT:0"; exit 0 ;;',
+        '    *"dcode --version"*) echo "NEMOCLAW_AGENT_SMOKE_BEGIN"; echo "dcode 0.1.55"; echo "NEMOCLAW_AGENT_SMOKE_EXIT:0"; exit 0 ;;',
+        '    *"config.toml"*) echo "NEMOCLAW_AGENT_SMOKE_BEGIN"; echo "NEMOCLAW_DEEPAGENTS_CONFIG_OK"; echo "NEMOCLAW_AGENT_SMOKE_EXIT:0"; exit 0 ;;',
+        '    *"NEMOCLAW_DCODE_EMPTY_PROMPT_OK"*) echo "NEMOCLAW_AGENT_SMOKE_BEGIN"; echo "NEMOCLAW_DCODE_EMPTY_PROMPT_OK"; echo "NEMOCLAW_AGENT_SMOKE_EXIT:0"; exit 0 ;;',
         "  esac",
         "fi",
         "exit 0",
@@ -51,15 +70,23 @@ describe("CLI dispatch for terminal agents", () => {
       PATH: `${localBin}:${process.env.PATH || ""}`,
     });
 
+    // Evidence unavailability on macOS is a note, not a failure (#9278).
     expect(r.code).toBe(0);
+    expect(r.out.includes(PLATFORM_EVIDENCE_UNAVAILABLE)).toBe(process.platform === "darwin");
     expect(r.out).toContain("terminal smoke checks passed");
     const calls = fs.readFileSync(markerFile, "utf8").trim().split("\n").filter(Boolean);
-    expect(calls).toContain("sandbox get alpha");
+    expect(calls).toContain("sandbox get -g nemoclaw alpha");
     expect(calls.some((call) => call.includes("NEMOCLAW_AGENT_SMOKE_EXIT"))).toBe(true);
     expect(calls.some((call) => call.includes("nemoclaw-agent-smoke dcode --version"))).toBe(true);
     expect(
       calls.some((call) =>
         call.includes("nemoclaw-agent-smoke test -s /sandbox/.deepagents/config.toml"),
+      ),
+    ).toBe(true);
+    expect(
+      calls.some(
+        (call) =>
+          call.includes("nemoclaw-agent-smoke") && call.includes("NEMOCLAW_DCODE_EMPTY_PROMPT_OK"),
       ),
     ).toBe(true);
     expect(calls.some((call) => call.includes("OPENCLAW="))).toBe(false);

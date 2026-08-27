@@ -2,18 +2,60 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { OPENSHELL_PROBE_TIMEOUT_MS } from "../adapters/openshell/timeouts";
+import { waitUntil } from "../core/wait";
 
 import { getOccupiedPorts } from "./dashboard-port";
+
+const FORWARD_RELEASE_TIMEOUT_MS = 5_000;
+const FORWARD_RELEASE_POLL_MS = 250;
+const FORWARD_RECOVERY_INITIAL_POLL_MS = 100;
+const FORWARD_RECOVERY_MAX_POLL_MS = 500;
+const FORWARD_RECOVERY_BACKOFF_FACTOR = 1.5;
 
 export type ForwardStopRunner = (
   args: string[],
   opts: { ignoreError?: boolean; suppressOutput?: boolean },
 ) => unknown;
 
+/**
+ * Returns the serialized forward list on success. An empty string means the
+ * list query succeeded with no entries; `null` means ownership is unknown
+ * because the query did not return a result.
+ */
 export type ForwardListRunner = (
   args: string[],
   opts: { ignoreError?: boolean; timeout?: number },
-) => string;
+) => string | null;
+
+/**
+ * Wait for a stopped forward's host listener to retire before its fixed port
+ * is reused. OpenShell can remove forward metadata before the underlying SSH
+ * process releases the listener, so both onboarding and runtime teardown use
+ * this single bounded release policy.
+ */
+export function waitForStoppedForwardPortRelease(
+  port: number,
+  isPortBound: (port: number) => boolean,
+  options: { sleep?: (milliseconds: number) => void } = {},
+): boolean {
+  return waitUntil(() => !isPortBound(port), {
+    initialIntervalMs: FORWARD_RELEASE_POLL_MS,
+    maxIntervalMs: FORWARD_RELEASE_POLL_MS,
+    backoffFactor: 1,
+    maxAttempts: Math.ceil(FORWARD_RELEASE_TIMEOUT_MS / FORWARD_RELEASE_POLL_MS) + 1,
+    sleep: options.sleep,
+  });
+}
+
+/** Poll a forward ownership/readiness condition within its configured recovery budget. */
+export function waitForForwardRecoveryState(condition: () => boolean, budgetMs: number): boolean {
+  return waitUntil(condition, {
+    deadlineMs: Date.now() + budgetMs,
+    initialIntervalMs: FORWARD_RECOVERY_INITIAL_POLL_MS,
+    maxIntervalMs: FORWARD_RECOVERY_MAX_POLL_MS,
+    backoffFactor: FORWARD_RECOVERY_BACKOFF_FACTOR,
+  });
+}
 
 /**
  * `openshell forward stop <port>` — port-scoped, kills whatever forward is
@@ -63,13 +105,16 @@ export function bestEffortForwardStopForSandbox(
   runCaptureOpenshell: ForwardListRunner,
   port: string | number,
   sandboxName: string,
+  beforeStop?: () => void,
 ): "stopped" | "owned-other" | "no-entry" | "list-failed" {
-  // Let runCaptureOpenshell throw on failure/timeout so the catch branch
-  // returns "list-failed". With ignoreError: true the runner would swallow
-  // the error and return "", which getOccupiedPorts parses as an empty map
-  // and the "no-entry" branch below would still run the stop — exactly the
-  // collateral-damage case this helper exists to avoid.
-  let listOutput = "";
+  // A runner reports failure either by throwing or by returning null; both
+  // mean "list-failed" here. Do not pass either result to getOccupiedPorts,
+  // which parses an empty string into an empty map, so the "no-entry" branch
+  // below would still run the stop against this sandbox's own live forward
+  // without any ownership evidence. A runner that ignores the command failure
+  // itself must convert it to null, never to an empty string, which is
+  // indistinguishable from a genuinely empty forward list.
+  let listOutput: string | null = null;
   try {
     listOutput = runCaptureOpenshell(["forward", "list"], {
       timeout: OPENSHELL_PROBE_TIMEOUT_MS,
@@ -77,10 +122,14 @@ export function bestEffortForwardStopForSandbox(
   } catch {
     return "list-failed";
   }
+  if (listOutput === null) {
+    return "list-failed";
+  }
   const owner = getOccupiedPorts(listOutput).get(String(port)) ?? null;
   if (owner && owner !== sandboxName) {
     return "owned-other";
   }
+  beforeStop?.();
   runOpenshell(["forward", "stop", String(port), sandboxName], {
     ignoreError: true,
     suppressOutput: true,

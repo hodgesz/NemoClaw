@@ -19,11 +19,11 @@ export const REMOTE_MODEL_OPTIONS: Record<string, string[]> = {
   openai: ["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro-2026-03-05"],
   anthropic: ["claude-sonnet-4-6", "claude-haiku-4-5", "claude-opus-4-6"],
   gemini: [
+    "gemini-3.6-flash",
     "gemini-3.1-pro-preview",
     "gemini-3.1-flash-lite-preview",
     "gemini-3-flash-preview",
     "gemini-2.5-pro",
-    "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
   ],
   hermesProvider: [...HERMES_PROVIDER_MODEL_OPTIONS],
@@ -43,11 +43,18 @@ export interface ModelPromptOptions {
   getNavigationChoiceFn?: (value?: string) => "back" | "exit" | null;
   getCredentialFn?: (envName: string) => string | null;
   validateNvidiaEndpointModelFn?: (model: string, apiKey: string) => PromptValidationResult;
+  validateCloudModelFn?: (model: string, apiKey: string) => PromptValidationResult;
+  cloudModelMenuLabel?: string;
   cloudModelOptions?: Array<{ id: string; label: string }>;
+  manualCredentialEnv?: string;
+  manualCredentialMissingMessage?: string;
+  manualModelLabel?: string;
   remoteModelOptions?: Record<string, string[]>;
   backToSelection?: BackToSelection;
   /** Pre-fill this model ID as the default in interactive prompts. */
   defaultModelId?: string;
+  /** Candidate model ID to pre-fill for Other; validated before display. */
+  manualDefaultModelId?: string;
   /** Show only this many remote models in the first menu before offering Other. */
   topLevelModelLimit?: number;
   /** When true, Other opens the full model list before falling back to manual entry. */
@@ -142,7 +149,8 @@ export async function promptCloudModel(
   const defaultListChoice = defaultCuratedIdx >= 0 ? defaultCuratedIdx + 1 : 1;
 
   deps.writeLine("");
-  deps.writeLine("  Cloud models:");
+  const cloudModelMenuLabel = options.cloudModelMenuLabel ?? "Cloud models";
+  deps.writeLine(`  ${cloudModelMenuLabel}:`);
   deps.cloudModelOptions.forEach((option, index) => {
     deps.writeLine(`    ${index + 1}) ${option.label} (${option.id})`);
   });
@@ -162,24 +170,35 @@ export async function promptCloudModel(
     return deps.cloudModelOptions[index].id;
   }
 
-  const nvidiaApiKey = deps.getCredentialFn("NVIDIA_INFERENCE_API_KEY");
-  if (!nvidiaApiKey) {
+  const manualCredentialEnv = options.manualCredentialEnv ?? "NVIDIA_INFERENCE_API_KEY";
+  const apiKey = deps.getCredentialFn(manualCredentialEnv);
+  if (!apiKey) {
     deps.errorLine(
-      "  NVIDIA_INFERENCE_API_KEY is required before validating a custom NVIDIA Endpoints model.",
+      options.manualCredentialMissingMessage ??
+        "  NVIDIA_INFERENCE_API_KEY is required before validating a custom NVIDIA Endpoints model.",
     );
     return deps.backToSelection;
   }
 
-  // If default is a custom (non-curated) model ID, pre-fill it in the manual prompt
+  // Preserve a custom configured model for Other even when the live catalog uses a different
+  // effective menu default. Callers that only provide defaultModelId retain the legacy behavior.
+  const manualDefaultModelId = options.manualDefaultModelId ?? defaultModelId;
+  const manualDefaultIsCurated = deps.cloudModelOptions.some(
+    (option) => option.id === manualDefaultModelId,
+  );
   const manualDefault =
-    defaultCuratedIdx < 0 && defaultModelId && isSafeModelId(defaultModelId) ? defaultModelId : "";
+    !manualDefaultIsCurated && manualDefaultModelId && isSafeModelId(manualDefaultModelId)
+      ? manualDefaultModelId
+      : "";
+  const manualModelLabel = options.manualModelLabel ?? "NVIDIA Endpoints";
   const manualLabel = manualDefault
-    ? `  NVIDIA Endpoints model id [${manualDefault}]: `
-    : "  NVIDIA Endpoints model id: ";
+    ? `  ${manualModelLabel} model id [${manualDefault}]: `
+    : `  ${manualModelLabel} model id: `;
+  const validateCloudModelFn = options.validateCloudModelFn ?? deps.validateNvidiaEndpointModelFn;
   return promptManualModelId(
     manualLabel,
-    "NVIDIA Endpoints",
-    (model) => deps.validateNvidiaEndpointModelFn(model, nvidiaApiKey),
+    manualModelLabel,
+    (model) => validateCloudModelFn(model, apiKey),
     { ...deps, promptFn: async (q) => (await deps.promptFn(q)) || manualDefault },
   );
 }

@@ -13,7 +13,7 @@
 #
 # See: https://docs.gha-runners.nvidia.com/platform/onboarding/pull-request-testing/
 
-name: CI / Self-Hosted PR
+name: E2E / Self-Hosted PR Qualification
 
 on:
   push:
@@ -28,26 +28,179 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  get-pr-info:
+  select-llama-cpp-generic-gpu:
     runs-on: ubuntu-latest
+    timeout-minutes: 55
+    permissions:
+      actions: read
+      contents: read
     outputs:
-      pr-info: ${{ steps.get-pr-info.outputs.pr-info }}
+      base_sha: ${{ steps.changed.outputs.base_sha }}
+      managed_image_revision: ${{ steps.publication.outputs.head_sha }}
+      selected: ${{ steps.changed.outputs.selected }}
     steps:
-      - id: get-pr-info
-        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+      - id: changed
+        name: Select llama.cpp generic GPU E2E from PR files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^pull-request/([0-9]+)$ ]] || {
+            echo "::error::Copied branch name does not identify a PR" >&2
+            exit 1
+          }
+          pr_number="${BASH_REMATCH[1]}"
+          pr_json="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number")"
+          head_sha="$(jq -er '.head.sha | select(test("^[a-f0-9]{40}$"))' <<<"$pr_json")"
+          base_sha="$(jq -er '.base.sha | select(test("^[a-f0-9]{40}$"))' <<<"$pr_json")"
+          [[ "$head_sha" == "$GITHUB_SHA" ]] || {
+            echo "::error::Copied PR branch SHA does not match the current PR head" >&2
+            exit 1
+          }
+          if gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/pulls/$pr_number/files?per_page=100" \
+            | jq -e '
+              flatten
+              | any(
+                  .filename == ".github/workflows/e2e.yaml"
+                  or .filename == ".github/workflows/pr-self-hosted.yaml"
+                  or .filename == "scripts/install.sh"
+                  or .filename == "test/e2e/live/llama-cpp-generic-gpu.test.ts"
+                  or .filename == "test/e2e/live/gpu-e2e-helpers.ts"
+                  or .filename == "test/e2e/mock-parity.json"
+                  or .filename == "tools/e2e/cli-artifact-workflow-boundary.mts"
+                  or .filename == "tools/e2e/workflow-boundary.mts"
+                  or (.filename | startswith("managed-inference/presets/llama-cpp."))
+                  or (.filename | startswith("managed-inference/recipes/llama-cpp."))
+                  or (.filename | startswith("src/lib/inference/llama-cpp/"))
+                  or (.filename | startswith("src/lib/readiness/"))
+                  or .filename == "src/lib/onboard/fatal-runtime-preflight.ts"
+                  or .filename == "src/lib/onboard/overlayfs-auto-fix.ts"
+                  or .filename == "src/lib/onboard/preflight.ts"
+                  or (.filename | startswith("src/lib/onboard/runtime-provider/docker-llama-cpp"))
+                )
+            ' >/dev/null; then
+            selected=true
+          else
+            selected=false
+          fi
+          {
+            printf 'base_sha=%s\n' "$base_sha"
+            printf 'selected=%s\n' "$selected"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Check out trusted publication gate
+        if: ${{ steps.changed.outputs.selected == 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ steps.changed.outputs.base_sha }}
+
+      - name: Set up Node for publication verification
+        if: ${{ steps.changed.outputs.selected == 'true' }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Install trusted publication gate dependencies
+        if: ${{ steps.changed.outputs.selected == 'true' }}
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - id: publication
+        name: Verify applicable base-image publication
+        if: ${{ steps.changed.outputs.selected == 'true' }}
+        env:
+          EXPECTED_SHA: ${{ steps.changed.outputs.base_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REQUIRE_MANAGED_IMAGE_PUBLICATION: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GITHUB_REF=refs/heads/main
+          export GITHUB_SHA="$EXPECTED_SHA"
+          node --experimental-strip-types --no-warnings tools/e2e/base-image-publication.mts --wait-seconds 3000 --poll-seconds 30
+
+  llama-cpp-generic-gpu:
+    name: llama.cpp on generic NVIDIA GPU
+    needs: select-llama-cpp-generic-gpu
+    if: ${{ needs.select-llama-cpp-generic-gpu.outputs.selected == 'true' }}
+    runs-on: linux-amd64-gpu-rtxpro6000-latest-1
+    timeout-minutes: 120
+    env:
+      E2E_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/live/llama-cpp-generic-gpu
+      E2E_JOB: "1"
+      E2E_MANAGED_IMAGE_REVISION: ${{ needs.select-llama-cpp-generic-gpu.outputs.managed_image_revision }}
+      E2E_TARGET_ID: llama-cpp-generic-gpu
+      NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE: "1"
+      NEMOCLAW_CLI_BIN: ${{ github.workspace }}/bin/nemoclaw.js
+      NEMOCLAW_E2E_EXPECTED_SHA: ${{ github.sha }}
+      NEMOCLAW_E2E_SHARD: default
+      NEMOCLAW_LLAMA_CPP_QUALIFICATION_HEAD_SHA: ${{ github.sha }}
+      NEMOCLAW_LLAMACPP_RECIPE: llama-cpp.nemotron-3-nano-30b-a3b.spark-single.v1
+      NEMOCLAW_NON_INTERACTIVE: "1"
+      NEMOCLAW_PROVIDER: install-llama-cpp
+      NEMOCLAW_RUN_LIVE_E2E: "1"
+      NEMOCLAW_SANDBOX_NAME: e2e-llamacpp-gpu
+      OPENSHELL_GATEWAY: nemoclaw
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Prepare E2E workspace
+        uses: NVIDIA/NemoClaw/.github/actions/prepare-e2e@f6304bc25fc35bfaa441c8c2fbfee38f72805a75
+
+      - name: Bind E2E correlation identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          correlation_id="$(node --input-type=module -e \
+            'import { randomUUID } from "node:crypto"; console.log(randomUUID())')"
+          [[ "$correlation_id" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$ ]]
+          printf 'NEMOCLAW_E2E_CORRELATION_ID=%s\n' "$correlation_id" >>"$GITHUB_ENV"
+
+      - name: Install OpenShell CLI
+        run: bash scripts/install-openshell.sh
+
+      - name: Run llama.cpp generic NVIDIA GPU live test
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+          OPENSHELL_BIN="$(command -v openshell)"
+          export OPENSHELL_BIN
+          "$OPENSHELL_BIN" --version
+          npx tsx tools/e2e/live-vitest-invocation.mts run \
+            --test-path test/e2e/live/llama-cpp-generic-gpu.test.ts
+
+      - name: Upload llama.cpp generic NVIDIA GPU artifacts
+        if: always()
+        uses: NVIDIA/NemoClaw/.github/actions/upload-e2e-artifacts@7768e15eb90d3ee2d33432f481dfe8747e4f6d57
 
   build-sandbox-images:
     runs-on: linux-amd64-cpu4
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Resolve sandbox base image
         uses: ./.github/actions/resolve-sandbox-base-image
 
       - name: Build production image
-        run: docker build --build-arg BASE_IMAGE=${{ env.BASE_IMAGE }} -t nemoclaw-production .
+        env:
+          BASE_IMAGE: ${{ env.BASE_IMAGE }}
+        run: |
+          set -euo pipefail
+          build_args=(--build-arg "BASE_IMAGE=${BASE_IMAGE}")
+          scripts/check-production-build-args.sh "${build_args[@]}"
+          docker build "${build_args[@]}" -t nemoclaw-production .
 
       - name: Build sandbox test image (fixtures layered on production)
         run: docker build -f test/Dockerfile.sandbox --build-arg BASE_IMAGE=nemoclaw-production -t nemoclaw-sandbox-test .
@@ -63,6 +216,7 @@ jobs:
           name: sandbox-test-image
           path: /tmp/sandbox-test-image.tar.gz
           retention-days: 1
+          if-no-files-found: error
 
       - name: Upload isolation image
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -70,19 +224,28 @@ jobs:
           name: isolation-image
           path: /tmp/isolation-image.tar.gz
           retention-days: 1
+          if-no-files-found: error
 
   build-sandbox-images-arm64:
     runs-on: linux-arm64-cpu4
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Resolve sandbox base image
         uses: ./.github/actions/resolve-sandbox-base-image
 
       - name: Build production image on arm64
-        run: docker build --build-arg BASE_IMAGE=${{ env.BASE_IMAGE }} -t nemoclaw-production-arm64 .
+        env:
+          BASE_IMAGE: ${{ env.BASE_IMAGE }}
+        run: |
+          set -euo pipefail
+          build_args=(--build-arg "BASE_IMAGE=${BASE_IMAGE}")
+          scripts/check-production-build-args.sh "${build_args[@]}"
+          docker build "${build_args[@]}" -t nemoclaw-production-arm64 .
 
       - name: Build sandbox test image on arm64
         run: docker build -f test/Dockerfile.sandbox --build-arg BASE_IMAGE=nemoclaw-production-arm64 -t nemoclaw-sandbox-test-arm64 .
@@ -93,7 +256,9 @@ jobs:
     needs: build-sandbox-images
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download image artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -113,7 +278,18 @@ jobs:
     needs: build-sandbox-images
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.19.0
+          cache: npm
+
+      - name: Install root dependencies
+        run: npm ci --ignore-scripts
 
       - name: Download image artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -122,7 +298,15 @@ jobs:
           path: /tmp
 
       - name: Load image
-        run: gunzip -c /tmp/isolation-image.tar.gz | docker load
+        run: |
+          gunzip -c /tmp/isolation-image.tar.gz | docker load
+          docker image inspect nemoclaw-production >/dev/null
+
+      - name: Run glibc probe lifecycle regression
+        env:
+          NEMOCLAW_RUN_GLIBC_PROBE_DOCKER_E2E: "1"
+          NEMOCLAW_TEST_IMAGE: nemoclaw-production
+        run: npx vitest run --project integration test/e2e-runtime/image-compatibility-docker-lifecycle.test.ts --silent=false --reporter=default
 
       - name: Run gateway isolation E2E tests
         run: NEMOCLAW_TEST_IMAGE=nemoclaw-production bash test/e2e-gateway-isolation.sh
@@ -133,7 +317,9 @@ jobs:
     needs: build-sandbox-images
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download image artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -153,7 +339,9 @@ jobs:
     needs: build-sandbox-images
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download image artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

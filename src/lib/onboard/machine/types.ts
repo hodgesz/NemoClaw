@@ -43,6 +43,7 @@ export const ONBOARD_MACHINE_EVENT_TYPES = [
   "state.repair.started",
   "state.repair.completed",
   "state.repair.failed",
+  "state.result.invalidated",
   "state.result.skipped",
   "context.updated",
   "resume.conflict",
@@ -77,6 +78,7 @@ export interface OnboardMachineContext {
   endpointOrigin?: string | null;
   credentialEnv?: string | null;
   preferredInferenceApi?: string | null;
+  reasoningEffort?: "low" | "medium" | "high" | "endpoint-default" | null;
   hermesAuthMethod?: "oauth" | "api_key" | null;
   hermesToolGateways?: string[] | null;
   policyPresets?: string[] | null;

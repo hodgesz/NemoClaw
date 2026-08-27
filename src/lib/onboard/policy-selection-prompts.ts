@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import type { SandboxCancelRollback } from "./cancel-rollback";
 import type { TierDefinition } from "../policy/tiers";
+import type { SandboxCancelRollback } from "./cancel-rollback";
+import { OnboardDeferredExitError } from "./session-bootstrap";
 
 type PresetWithDescription = { name: string; description?: string };
 type PresetWithAccess = { name: string; access: string };
@@ -41,6 +42,7 @@ export interface PolicySelectionPromptDeps {
   makeOnboardCancelExit(
     rollback: Pick<SandboxCancelRollback, "markCancelled">,
     cleanup: () => void,
+    exit?: (code: number) => void,
   ): () => void;
   sandboxCancelRollback: Pick<SandboxCancelRollback, "markCancelled">;
   useColor: boolean;
@@ -54,7 +56,7 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
   selectTierPresetsAndAccess(
     tierName: string,
     allPresets: PresetWithDescription[],
-    extraSelected?: string[],
+    initialSelected?: string[],
   ): Promise<PresetWithAccess[]>;
   presetsCheckboxSelector(
     allPresets: Array<{ name: string; description: string }>,
@@ -77,7 +79,7 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
   const processEvents = deps.processEvents ?? process;
 
   /**
-   * Prompt the user to select a policy tier (restricted / balanced / open).
+   * Prompt the user to select a policy tier (restricted / balanced / open / personal).
    * Uses the same radio-style TUI as presetsCheckboxSelector (single-select).
    * In non-interactive mode reads NEMOCLAW_POLICY_TIER (default: balanced).
    * Returns the tier name string.
@@ -164,7 +166,7 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
     stdin.resume();
     stdin.setEncoding("utf8");
 
-    return new Promise<string>((resolve) => {
+    return new Promise<string>((resolve, reject) => {
       const cleanup = () => {
         stdin.setRawMode(false);
         stdin.pause();
@@ -175,7 +177,9 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
         processEvents.removeListener("SIGTERM", onSigterm);
       };
 
-      const onSigterm = makeOnboardCancelExit(sandboxCancelRollback, cleanup);
+      const onSigterm = makeOnboardCancelExit(sandboxCancelRollback, cleanup, (code) =>
+        reject(new OnboardDeferredExitError(code)),
+      );
       processEvents.once("SIGTERM", onSigterm);
 
       const onData = (key: string) => {
@@ -187,7 +191,7 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
           selectedIdx = cursor;
           redraw();
         } else if (key === "\x03") {
-          makeOnboardCancelExit(sandboxCancelRollback, cleanup)();
+          onSigterm();
         } else if (key === "\x1b[A" || key === "k") {
           cursor = (cursor - 1 + n) % n;
           redraw();
@@ -207,12 +211,13 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
    * per-preset access (read vs read-write).
    *
    * Tier presets are listed first (in tier order), then remaining presets
-   * alphabetically. Tier presets are pre-checked; others start unchecked.
+   * alphabetically. Callers can supply the exact initial checked set after
+   * filtering tier defaults for the selected agent and integrations.
    */
   async function selectTierPresetsAndAccess(
     tierName: string,
     allPresets: PresetWithDescription[],
-    extraSelected: string[] = [],
+    initialSelected?: string[],
   ): Promise<PresetWithAccess[]> {
     const tierDef = tiers.getTier(tierName);
     const tierPresetMap: Record<string, string> = {};
@@ -232,11 +237,14 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
       ...allPresets.filter((preset) => !tierSet.has(preset.name)),
     ];
 
-    // Initial inclusion: tier presets + any already-applied extras.
-    const included = new Set([
-      ...tierNames,
-      ...extraSelected.filter((name) => ordered.find((preset) => preset.name === name)),
-    ]);
+    // When the caller has already reconciled tier defaults with the selected
+    // agent and integrations, preserve that exact initial choice. Direct
+    // callers that omit it retain the tier defaults.
+    const included = new Set(
+      (initialSelected ?? tierNames).filter((name) =>
+        ordered.some((preset) => preset.name === name),
+      ),
+    );
 
     // Access levels: tier defaults for tier presets, read-write default for others.
     const accessModes: Record<string, string> = {};
@@ -340,7 +348,7 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
     stdin.resume();
     stdin.setEncoding("utf8");
 
-    return new Promise<PresetWithAccess[]>((resolve) => {
+    return new Promise<PresetWithAccess[]>((resolve, reject) => {
       const cleanup = () => {
         stdin.setRawMode(false);
         stdin.pause();
@@ -351,7 +359,9 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
         processEvents.removeListener("SIGTERM", onSigterm);
       };
 
-      const onSigterm = makeOnboardCancelExit(sandboxCancelRollback, cleanup);
+      const onSigterm = makeOnboardCancelExit(sandboxCancelRollback, cleanup, (code) =>
+        reject(new OnboardDeferredExitError(code)),
+      );
       processEvents.once("SIGTERM", onSigterm);
 
       const onData = (key: string) => {
@@ -364,7 +374,7 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
               .map((preset) => ({ name: preset.name, access: accessModes[preset.name] })),
           );
         } else if (key === "\x03") {
-          makeOnboardCancelExit(sandboxCancelRollback, cleanup)();
+          onSigterm();
         } else if (key === "\x1b[A" || key === "k") {
           cursor = (cursor - 1 + n) % n;
           redraw();
@@ -486,7 +496,7 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
     stdin.resume();
     stdin.setEncoding("utf8");
 
-    return new Promise<string[]>((resolve) => {
+    return new Promise<string[]>((resolve, reject) => {
       const cleanup = () => {
         stdin.setRawMode(false);
         stdin.pause();
@@ -497,7 +507,9 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
         processEvents.removeListener("SIGTERM", onSigterm);
       };
 
-      const onSigterm = makeOnboardCancelExit(sandboxCancelRollback, cleanup);
+      const onSigterm = makeOnboardCancelExit(sandboxCancelRollback, cleanup, (code) =>
+        reject(new OnboardDeferredExitError(code)),
+      );
       processEvents.once("SIGTERM", onSigterm);
 
       const onData = (key: string) => {
@@ -506,7 +518,7 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
           stdout.write("\n");
           resolve([...selected]);
         } else if (key === "\x03") {
-          makeOnboardCancelExit(sandboxCancelRollback, cleanup)();
+          onSigterm();
         } else if (key === "\x1b[A" || key === "k") {
           cursor = (cursor - 1 + n) % n;
           redraw();

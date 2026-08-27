@@ -6,13 +6,29 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const authority = vi.hoisted(() => ({ digests: [] as string[] }));
+
+vi.mock("./candidate-authority", () => ({
+  CANDIDATE_QUALIFICATION_RECEIPT_DIGESTS: { pi: authority.digests },
+  acceptedCandidateReceiptDigests: () => authority.digests,
+}));
+
+import {
+  type CandidateQualificationFixture,
+  candidateQualificationEnvironment,
+} from "./candidate-test-fixture";
+import YAML from "yaml";
+
 import {
   AGENTS_DIR,
   getAgentChoices,
+  listAgents,
   loadAgent,
+  requireAgentPolicyAdditionsPath,
   resolveAgentName,
   resolveAgentNameAlias,
-} from "../../../dist/lib/agent/defs";
+} from "./defs";
+import { resolveAgent } from "./onboard";
 
 const tempAgentDirs: string[] = [];
 
@@ -23,9 +39,14 @@ function writeTempAgentManifest(name: string, contents: string): void {
   fs.writeFileSync(path.join(agentDir, "manifest.yaml"), contents);
 }
 
+const qualificationFixtures: CandidateQualificationFixture[] = [];
+
 afterEach(() => {
   vi.restoreAllMocks();
   delete process.env.NEMOCLAW_AGENT;
+  delete process.env.NEMOCLAW_CUA_ENABLED;
+  authority.digests.splice(0, authority.digests.length);
+  while (qualificationFixtures.length > 0) qualificationFixtures.pop()?.cleanup();
   while (tempAgentDirs.length > 0) {
     const agentDir = tempAgentDirs.pop();
     if (agentDir) {
@@ -35,99 +56,145 @@ afterEach(() => {
 });
 
 describe("agent definitions", () => {
-  it("loads computed OpenClaw manifest properties", () => {
-    const openclaw = loadAgent("openclaw");
+  it("exposes NemoCUA only behind the exact experimental feature flag (#9649)", () => {
+    expect(fs.existsSync(path.join(AGENTS_DIR, "nemocua", "manifest.yaml"))).toBe(true);
+    expect(listAgents({})).not.toContain("nemocua");
+    expect(listAgents({ NEMOCLAW_CUA_ENABLED: "true" })).not.toContain("nemocua");
+    expect(() => loadAgent("nemocua", {})).toThrow("NemoCUA is disabled");
 
-    expect(openclaw.name).toBe("openclaw");
-    expect(openclaw.displayName).toBe("OpenClaw");
-    expect(openclaw.runtime).toEqual({ kind: "gateway" });
-    expect(openclaw.healthProbe?.port).toBe(18789);
-    expect(openclaw.forwardPort).toBe(18789);
-    expect(openclaw.configPaths).toEqual({
-      dir: "/sandbox/.openclaw",
-      configFile: "openclaw.json",
-      envFile: null,
-      format: "json",
+    const enabledEnv = { NEMOCLAW_CUA_ENABLED: "1" };
+    expect(listAgents(enabledEnv)).toContain("nemocua");
+    expect(loadAgent("nemocua", enabledEnv)).toMatchObject({
+      name: "nemocua",
+      runtime: {
+        kind: "terminal",
+        headless_command: "python3 /app/run_with_harness.py",
+      },
     });
-    expect(openclaw.inferenceProviderOptions).toEqual([]);
-    // OpenClaw uses device_pairing web auth — no fetchable bearer token.
-    expect(openclaw.webAuth).toEqual({ method: "none", env: null });
-    // #5027: openclaw.json must be declared as a durable state file so
-    // backup-all/rebuild preserve core settings (model/provider, MCP, agents).
-    expect(openclaw.stateFiles).toEqual([{ path: "openclaw.json", strategy: "copy" }]);
-    expect(openclaw.userManagedFiles).toEqual([".env", ".mcp.json"]);
-    expect(openclaw.legacyPaths?.startScript).toContain("scripts/nemoclaw-start.sh");
   });
 
-  it("loads Hermes manifest properties without falling back to OpenClaw defaults", () => {
-    const hermes = loadAgent("hermes");
+  it("keeps NemoCUA out of choices and direct resolution until enabled (#9649)", () => {
+    expect(getAgentChoices().map((choice) => choice.name)).not.toContain("nemocua");
+    expect(() => resolveAgent({ agentFlag: "nemocua" })).toThrow("Unknown agent 'nemocua'");
 
-    expect(hermes.name).toBe("hermes");
-    expect(hermes.displayName).toBe("Hermes Agent");
-    expect(hermes.runtime).toEqual({ kind: "gateway" });
-    expect(hermes.hasDevicePairing).toBe(false);
-    expect(hermes.configPaths).toEqual({
-      dir: "/sandbox/.hermes",
-      configFile: "config.yaml",
-      envFile: ".env",
-      format: "yaml",
-    });
-    expect(hermes.inferenceProviderOptions).toEqual(["hermesProvider"]);
-    expect(hermes.healthProbe?.url).toBe("http://localhost:8642/health");
-    expect(hermes.forwardPort).toBe(18789);
-    expect(hermes.forward_ports).toEqual([18789, 8642]);
-    expect(hermes.dashboard).toEqual({
-      kind: "ui",
-      label: "Dashboard",
-      path: "/",
-      healthPath: "/api/status",
-      auth: "session",
-    });
-    expect(hermes.dashboardUi).toBeNull();
-    // Hermes' OpenAI-compatible API uses a bearer token read from API_SERVER_KEY.
-    expect(hermes.webAuth).toEqual({ method: "bearer_token", env: "API_SERVER_KEY" });
-    expect(hermes.userManagedFiles).toEqual([".hermes/.env"]);
+    vi.stubEnv("NEMOCLAW_CUA_ENABLED", "1");
+
+    expect(getAgentChoices().map((choice) => choice.name)).toContain("nemocua");
+    expect(resolveAgent({ agentFlag: "nemocua" })?.name).toBe("nemocua");
   });
 
-  it("loads the LangChain Deep Agents Code terminal acceptance contract", () => {
-    const deepAgentsCode = loadAgent("langchain-deepagents-code");
+  it("keeps the Pi candidate manifest out of agent selection by default (#7925)", () => {
+    expect(fs.existsSync(path.join(AGENTS_DIR, "pi", "manifest.yaml"))).toBe(true);
 
-    expect(deepAgentsCode.name).toBe("langchain-deepagents-code");
-    expect(deepAgentsCode.displayName).toBe("LangChain Deep Agents Code");
-    expect(deepAgentsCode.runtime).toEqual({
-      kind: "terminal",
-      interactive_command: "dcode",
-      headless_command: "dcode -n",
-      smoke_commands: [
-        "dcode --version",
-        "test -s /sandbox/.deepagents/config.toml && echo NEMOCLAW_DEEPAGENTS_CONFIG_OK",
-      ],
-    });
-    expect(deepAgentsCode.binary_path).toBe("/usr/local/bin/dcode");
-    expect(deepAgentsCode.versionCommand).toBe("dcode --version");
-    expect(deepAgentsCode.expectedVersion).toBe("0.1.12");
-    expect(deepAgentsCode.healthProbe).toBeNull();
-    expect(deepAgentsCode.forwardPort).toBe(0);
-    expect(deepAgentsCode.configPaths).toEqual({
-      dir: "/sandbox/.deepagents",
-      configFile: "config.toml",
-      envFile: ".env",
-      format: "toml",
-    });
-    expect(deepAgentsCode.inference?.provider_type).toBe("openai_compatible");
-    expect(deepAgentsCode.stateDirs).toEqual([".state", "skills", "agent/skills"]);
-    expect(deepAgentsCode.stateFiles).toEqual([
-      { path: "config.toml", strategy: "copy" },
-      { path: "hooks.json", strategy: "copy" },
+    expect(listAgents({})).not.toContain("pi");
+    expect(getAgentChoices().map((choice) => choice.name)).not.toContain("pi");
+    expect(resolveAgentNameAlias("pi", listAgents({}))).toBeNull();
+    expect(() => loadAgent("pi", {})).toThrow(
+      "Agent 'pi' is a release candidate and is not selectable in this release",
+    );
+  });
+
+  it("does not let an ordinary environment setting expose Pi (#7925)", () => {
+    const ordinaryEnv = { NEMOCLAW_PI_QUALIFICATION: "1" };
+
+    expect(listAgents(ordinaryEnv)).not.toContain("pi");
+    expect(resolveAgentNameAlias("pi", listAgents(ordinaryEnv))).toBeNull();
+    expect(() => loadAgent("pi", ordinaryEnv)).toThrow(
+      "Agent 'pi' is a release candidate and is not selectable in this release",
+    );
+  });
+
+  it("selects Pi only with protected candidate qualification authority (#7927)", () => {
+    const fixture = candidateQualificationEnvironment();
+    qualificationFixtures.push(fixture);
+    authority.digests.push(fixture.receiptDigest);
+
+    expect(listAgents(fixture.env)).toContain("pi");
+    expect(resolveAgentNameAlias("pi", listAgents(fixture.env))).toBe("pi");
+    expect(loadAgent("pi", fixture.env).name).toBe("pi");
+  });
+
+  it("withholds Pi from a receipt the repository has not published (#7927)", () => {
+    const fixture = candidateQualificationEnvironment();
+    qualificationFixtures.push(fixture);
+
+    expect(listAgents(fixture.env)).not.toContain("pi");
+    expect(() => loadAgent("pi", fixture.env)).toThrow("is not selectable in this release");
+  });
+
+  it("does not expose Pi from the protected flag alone (#7927)", () => {
+    expect(listAgents({ NEMOCLAW_CANDIDATE_AGENTS: "1" })).not.toContain("pi");
+    expect(listAgents({ NEMOCLAW_CANDIDATE_AGENTS: "0" })).not.toContain("pi");
+    expect(listAgents({ NEMOCLAW_CANDIDATE_AGENTS: "true" })).not.toContain("pi");
+  });
+
+  it("keeps the Pi candidate manifest readable without public resolution (#7925)", () => {
+    const manifest = YAML.parse(
+      fs.readFileSync(path.join(AGENTS_DIR, "pi", "manifest.yaml"), "utf8"),
+    ) as {
+      name: string;
+      expected_version: string;
+      runtime: { kind: string };
+      config: { dir: string };
+      state_dirs: { path: string; backup?: boolean }[];
+      state_files: { path: string; restore: Record<string, unknown> }[];
+    };
+
+    expect(manifest.name).toBe("pi");
+    expect(manifest.expected_version).toBe("0.84.1");
+    expect(manifest.runtime.kind).toBe("terminal");
+    expect(manifest.config.dir).toBe("/sandbox/.pi/agent");
+    expect(
+      manifest.state_dirs.filter(({ backup }) => backup !== false).map(({ path }) => path),
+    ).toEqual(["sessions", "prompts", "themes"]);
+    expect(
+      manifest.state_dirs.filter(({ backup }) => backup === false).map(({ path }) => path),
+    ).toEqual(["tools", "bin"]);
+    expect(manifest.state_files.map((file) => file.path)).toEqual(["settings.json"]);
+    const restore = manifest.state_files[0]?.restore as {
+      merge?: string;
+      user_keys?: unknown[];
+    };
+    expect(restore?.merge).toBe("key-allowlist");
+    expect(restore?.user_keys).toEqual([
+      { key: "theme", type: "string", max_length: 128 },
+      { key: "hideThinkingBlock", type: "boolean" },
+      { key: "showCacheMissNotices", type: "boolean" },
+      { key: "quietStartup", type: "boolean" },
+      { key: "steeringMode", type: "enum", values: ["all", "one-at-a-time"] },
+      { key: "followUpMode", type: "enum", values: ["all", "one-at-a-time"] },
+      {
+        key: "defaultThinkingLevel",
+        type: "enum",
+        values: ["off", "minimal", "low", "medium", "high", "xhigh"],
+      },
     ]);
-    expect(deepAgentsCode.stateFiles.map((entry) => entry.path)).not.toContain(".env");
-    expect(deepAgentsCode.userManagedFiles).toEqual([".env", ".mcp.json"]);
   });
 
   it("orders OpenClaw first in interactive choices", () => {
     const choices = getAgentChoices();
     expect(choices[0]?.name).toBe("openclaw");
     expect(choices.map((choice) => choice.name)).toContain("hermes");
+  });
+
+  it("requires a readable regular policy-additions file for non-OpenClaw baselines (#7194)", () => {
+    const agentName = `missing-baseline-${String(Date.now())}`;
+    writeTempAgentManifest(agentName, `name: ${agentName}\ndisplay_name: Missing Baseline\n`);
+    const agent = loadAgent(agentName);
+    const policyPath = path.join(AGENTS_DIR, agentName, "policy-additions.yaml");
+
+    expect(() => requireAgentPolicyAdditionsPath(agent)).toThrow(
+      "Refusing to substitute the OpenClaw baseline",
+    );
+
+    fs.mkdirSync(policyPath);
+    expect(() => requireAgentPolicyAdditionsPath(agent)).toThrow(
+      "Refusing to substitute the OpenClaw baseline",
+    );
+    fs.rmSync(policyPath, { recursive: true });
+    fs.writeFileSync(policyPath, "version: 1\nnetwork_policies: {}\n");
+
+    expect(requireAgentPolicyAdditionsPath(agent)).toBe(policyPath);
   });
 
   it("falls back to openclaw when session references an unknown agent", () => {
@@ -173,11 +240,70 @@ describe("agent definitions", () => {
     expect(() => loadAgent(agentName)).toThrow(/YAML object/);
   });
 
-  it("rejects invalid forward_ports values in manifests", () => {
-    const agentName = `invalid-forward-port-${String(Date.now())}`;
+  it("rejects the superseded runtime auth directory inventory (#8006)", () => {
+    const agentName = `runtime-auth-inventory-${String(Date.now())}`;
     writeTempAgentManifest(
       agentName,
-      [`name: ${agentName}`, "display_name: Broken Ports", "forward_ports:", "  - 70000"].join(
+      [
+        `name: ${agentName}`,
+        "display_name: Runtime Auth Inventory",
+        "state_dirs:",
+        "  - identity",
+        "runtime_auth_state_dirs:",
+        "  - identity",
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/replaced.*backup: false/);
+  });
+
+  it("derives protected configuration files from each agent manifest (#8006)", () => {
+    expect(loadAgent("hermes").configPaths.shieldsFiles).toEqual([".env"]);
+    expect(loadAgent("openclaw").configPaths.shieldsFiles).toEqual([]);
+    expect(loadAgent("langchain-deepagents-code").configPaths.shieldsFiles).toEqual([]);
+  });
+
+  it("derives image state-lock-plan support from each agent manifest (#8006)", () => {
+    expect(loadAgent("openclaw").stateLockPlanInImage).toBe(true);
+    expect(loadAgent("hermes").stateLockPlanInImage).toBe(true);
+    expect(loadAgent("langchain-deepagents-code").stateLockPlanInImage).toBe(false);
+  });
+
+  it("rejects a non-boolean image state-lock-plan declaration (#8006)", () => {
+    const agentName = `invalid-image-plan-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [`name: ${agentName}`, "state_lock_plan_in_image: yes-please"].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/state_lock_plan_in_image.*boolean/);
+  });
+
+  it.each([
+    ["a scalar", "  shields_files: .env"],
+    ["a non-string entry", "  shields_files:\n    - 42"],
+  ])("rejects config.shields_files with %s", (_case, declaration) => {
+    const agentName = `invalid-shields-files-${String(Date.now())}-${_case.replaceAll(" ", "-")}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Invalid Shields Files",
+        "config:",
+        "  dir: /sandbox/.invalid",
+        "  config_file: config.json",
+        declaration,
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/config\.shields_files/);
+  });
+
+  it.each([1023, 70000])("rejects invalid forward_ports value %s in manifests", (port) => {
+    const agentName = `invalid-forward-port-${String(port)}-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [`name: ${agentName}`, "display_name: Broken Ports", "forward_ports:", `  - ${port}`].join(
         "\n",
       ),
     );
@@ -282,6 +408,52 @@ describe("agent definitions", () => {
     );
 
     expect(() => loadAgent(agentName)).toThrow(/inference\.provider_type/);
+  });
+
+  it.each(["42", '"bad model"'])(
+    "rejects invalid inference default models in manifests (%s)",
+    (defaultModel) => {
+      const agentName = `invalid-inference-default-model-${String(Date.now())}-${defaultModel.length}`;
+      writeTempAgentManifest(
+        agentName,
+        [
+          `name: ${agentName}`,
+          "display_name: Broken Inference Default",
+          "inference:",
+          `  default_model: ${defaultModel}`,
+        ].join("\n"),
+      );
+
+      expect(() => loadAgent(agentName)).toThrow(/inference\.default_model/);
+    },
+  );
+
+  it("rejects invalid MCP bridge adapter declarations in manifests", () => {
+    const agentName = `invalid-mcp-adapter-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken MCP",
+        "mcp:",
+        "  support: bridge",
+        "  adapter: unsupported-adapter",
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/mcp\.adapter/);
+  });
+
+  it("requires an MCP adapter when bridge support is declared", () => {
+    const agentName = `missing-mcp-adapter-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [`name: ${agentName}`, "display_name: Missing MCP Adapter", "mcp:", "  support: bridge"].join(
+        "\n",
+      ),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/mcp\.adapter/);
   });
 
   it("loads terminal runtime manifests without OpenClaw gateway defaults", () => {

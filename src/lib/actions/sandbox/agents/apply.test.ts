@@ -12,6 +12,7 @@ import {
   buildOpenclawAgentAddArgs,
   buildOpenclawAgentDeleteArgs,
   computeAgentsApplyDiff,
+  parseOpenClawAgentsList,
   runAgentsApply,
   validateAgentsManifestForApply,
 } from "./apply";
@@ -101,29 +102,55 @@ describe("buildAgentsApplyDiff", () => {
   });
 });
 
+describe("parseOpenClawAgentsList", () => {
+  it("parses the bare array returned by current OpenClaw", () => {
+    expect(
+      parseOpenClawAgentsList(
+        JSON.stringify([{ id: "main" }, { id: "alpha" }, { name: "missing-id" }]),
+      ),
+    ).toEqual([{ id: "main" }, { id: "alpha" }]);
+  });
+
+  it("accepts an object wrapper with an agents array", () => {
+    expect(parseOpenClawAgentsList(JSON.stringify({ agents: [{ id: "main" }] }))).toEqual([
+      { id: "main" },
+    ]);
+  });
+
+  it("strips leading warning text before the JSON payload", () => {
+    expect(
+      parseOpenClawAgentsList(
+        [
+          "[plugins] warning: deprecated config key ignored",
+          "OpenClaw warning: falling back to default workspace",
+          JSON.stringify([{ id: "main" }, { id: "logs-reader" }]),
+        ].join("\n"),
+      ),
+    ).toEqual([{ id: "main" }, { id: "logs-reader" }]);
+  });
+});
+
 describe("validateAgentsManifestForApply", () => {
-  it("rejects ids that do not match the AGENT_ID regex", () => {
-    for (const id of [
-      "--help",
-      "-h",
-      "Alpha",
-      "ALPHA",
-      "1leading",
-      "alpha space",
-      "../escape",
-      "alpha/sub",
-      "a".repeat(33),
-    ]) {
-      expect(() =>
-        validateAgentsManifestForApply([
-          {
-            id,
-            workspace: `/sandbox/.openclaw/workspace-${id}`,
-            agentDir: `/sandbox/.openclaw/agents/${id}`,
-          },
-        ]),
-      ).toThrow(/must match/);
-    }
+  it.each([
+    "--help",
+    "-h",
+    "Alpha",
+    "ALPHA",
+    "1leading",
+    "alpha space",
+    "../escape",
+    "alpha/sub",
+    "a".repeat(33),
+  ])("rejects ids that do not match the AGENT_ID regex [case %#]", (id) => {
+    expect(() =>
+      validateAgentsManifestForApply([
+        {
+          id,
+          workspace: `/sandbox/.openclaw/workspace-${id}`,
+          agentDir: `/sandbox/.openclaw/agents/${id}`,
+        },
+      ]),
+    ).toThrow(/must match/);
   });
 
   it("rejects the reserved `main` id", () => {

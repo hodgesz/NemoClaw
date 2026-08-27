@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { Args, Flags } from "@oclif/core";
-import { NemoClawCommand } from "../../../lib/cli/nemoclaw-oclif-command";
+import {
+  assertHermesPortableCommandUnavailable,
+  NemoClawCommand,
+  withSandboxCommandLifecycleLock,
+} from "../../../lib/cli/nemoclaw-oclif-command";
 
 import * as sandboxConfig from "../../../lib/sandbox/config";
 
@@ -19,8 +23,8 @@ export default class SandboxConfigSetCommand extends NemoClawCommand {
   static description = "Set sandbox agent configuration with new-path and SSRF validation.";
   static usage = ["<name> --key <dotpath> --value <value> [--restart] [--config-accept-new-path]"];
   static examples = [
-    "<%= config.bin %> alpha config set --key model --value nvidia/nemotron",
-    "<%= config.bin %> alpha config set --key web_search --value true --restart",
+    "<%= config.bin %> alpha config set --key agents.defaults.model.primary --value nvidia/nemotron",
+    "<%= config.bin %> alpha config set --key agents.defaults.timeoutSeconds --value 600 --restart",
   ];
   static args = {
     sandboxName: sandboxNameArg,
@@ -32,7 +36,7 @@ export default class SandboxConfigSetCommand extends NemoClawCommand {
       required: true,
     }),
     restart: Flags.boolean({
-      description: "Signal the sandbox agent process to reload after writing",
+      description: "Restart a supported OpenClaw or Hermes gateway after writing",
     }),
     "config-accept-new-path": Flags.boolean({
       description: "Allow creating a config key that does not already exist",
@@ -42,11 +46,14 @@ export default class SandboxConfigSetCommand extends NemoClawCommand {
   public async run(): Promise<void> {
     const { args, flags } = await this.parse(SandboxConfigSetCommand);
     try {
-      await sandboxConfig.configSet(args.sandboxName, {
-        key: flags.key ?? null,
-        value: flags.value ?? null,
-        restart: flags.restart ?? false,
-        acceptNewPath: flags["config-accept-new-path"] ?? false,
+      await withSandboxCommandLifecycleLock(args.sandboxName, () => {
+        assertHermesPortableCommandUnavailable(args.sandboxName, "sandbox:config:set");
+        return sandboxConfig.configSet(args.sandboxName, {
+          key: flags.key ?? null,
+          value: flags.value ?? null,
+          restart: flags.restart ?? false,
+          acceptNewPath: flags["config-accept-new-path"] ?? false,
+        });
       });
     } catch (error) {
       if (error instanceof sandboxConfig.SandboxConfigError) {

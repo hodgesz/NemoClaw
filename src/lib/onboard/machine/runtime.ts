@@ -2,20 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { JsonObject } from "../../core/json-types";
-import type { Session, SessionUpdates } from "../../state/onboard-session";
+import type { CompleteSessionOptions, Session, SessionUpdates } from "../../state/onboard-session";
 import * as onboardSession from "../../state/onboard-session";
-import {
-  RECORD_ONLY_STEP_MUTATION_OPTIONS,
-  type StepMutationOptions,
-} from "../../state/onboard-step-mutation";
 import type { ResumeConfigConflict } from "../resume-config";
 import {
   createOnboardMachineEvent,
   emitOnboardMachineEvent,
+  machineStateFromOnboardSessionStep,
   type OnboardMachineEvent,
 } from "./events";
 import type { OnboardStateResult } from "./result";
 import {
+  buildResultInvalidatedEvent,
+  buildResultSkippedEvent,
+  type ResultInvalidatedInputs,
+  type ResultSkippedInputs,
+} from "./result-events";
+import {
+  assertOnboardNotInterrupted,
   assertValidOnboardMachineTransition,
   canTransitionOnboardMachineState,
   isTerminalOnboardMachineState,
@@ -27,17 +31,12 @@ export interface OnboardRuntimeDeps {
   createSession(overrides?: Partial<Session>): Session;
   saveSession(session: Session): Session;
   updateSession(mutator: (session: Session) => Session | void): Session;
-  markStepStarted(stepName: string, options?: StepMutationOptions): Session;
-  markStepComplete(
-    stepName: string,
-    updates?: SessionUpdates,
-    options?: StepMutationOptions,
-  ): Session;
-  markStepCompleteRecordOnly(stepName: string, updates?: SessionUpdates): Session;
+  markStepStarted(stepName: string): Session;
+  markStepComplete(stepName: string, updates?: SessionUpdates): Session;
   markStepSkipped(stepName: string): Session;
-  markStepFailed(stepName: string, message?: string | null, options?: StepMutationOptions): Session;
-  markStepFailedRecordOnly(stepName: string, message?: string | null): Session;
-  completeSession(updates?: SessionUpdates): Session;
+  markStepRejected?(stepName: string): Session;
+  markStepFailed(stepName: string, message?: string | null): Session;
+  completeSession(updates?: SessionUpdates, options?: CompleteSessionOptions): Session;
   filterSafeUpdates(updates: SessionUpdates): Partial<Session>;
   emitEvent(event: OnboardMachineEvent): void;
   now(): string;
@@ -77,10 +76,9 @@ function defaultDeps(): OnboardRuntimeDeps {
     updateSession: onboardSession.updateSession,
     markStepStarted: onboardSession.markStepStarted,
     markStepComplete: onboardSession.markStepComplete,
-    markStepCompleteRecordOnly: onboardSession.markStepCompleteRecordOnly,
     markStepSkipped: onboardSession.markStepSkipped,
+    markStepRejected: onboardSession.markStepRejected,
     markStepFailed: onboardSession.markStepFailed,
-    markStepFailedRecordOnly: onboardSession.markStepFailedRecordOnly,
     completeSession: onboardSession.completeSession,
     filterSafeUpdates: onboardSession.filterSafeUpdates,
     emitEvent: emitOnboardMachineEvent,
@@ -129,45 +127,71 @@ export class OnboardRuntime {
     return session;
   }
 
-  async markStepStarted(
-    stepName: string,
-    options: StepMutationOptions = RECORD_ONLY_STEP_MUTATION_OPTIONS,
-  ): Promise<Session> {
-    return this.deps.markStepStarted(stepName, options);
+  /**
+   * Attempts observer dispatch for a durable recovery receipt.
+   *
+   * The receipt stays on the snapshot until the next machine transition, so a
+   * process restart before that transition retries the same deterministic ID.
+   * Observer delivery remains best-effort by design.
+   */
+  async emitPendingSessionRecovery(): Promise<Session> {
+    const session = this.ensureSession();
+    const receipt = session.machine.recoveryReceipt;
+    if (!receipt) return session;
+    this.emit("state.repair.completed", session, {
+      state: receipt.entry,
+      metadata: {
+        reason: receipt.reason,
+        entry: receipt.entry,
+        receiptId: receipt.id,
+        appliedAt: receipt.appliedAt,
+        revision: receipt.revision,
+      },
+    });
+    return session;
   }
 
-  async markStepComplete(
-    stepName: string,
-    updates: SessionUpdates = {},
-    options: StepMutationOptions = RECORD_ONLY_STEP_MUTATION_OPTIONS,
-  ): Promise<Session> {
-    return this.deps.markStepComplete(stepName, updates, options);
+  async markStepStarted(stepName: string): Promise<Session> {
+    return this.deps.markStepStarted(stepName);
   }
 
-  async markStepCompleteRecordOnly(
-    stepName: string,
-    updates: SessionUpdates = {},
-  ): Promise<Session> {
-    return this.deps.markStepCompleteRecordOnly(stepName, updates);
+  async markStepComplete(stepName: string, updates: SessionUpdates = {}): Promise<Session> {
+    const safeUpdates = this.deps.filterSafeUpdates(updates);
+    const fields = Object.keys(safeUpdates);
+    const updated = this.deps.markStepComplete(stepName, {
+      ...(safeUpdates as SessionUpdates),
+      stationExpressModelIdentity: updates.stationExpressModelIdentity,
+    });
+    if (fields.length > 0) {
+      this.emit("context.updated", updated, {
+        step: stepName,
+        metadata: { fields },
+      });
+    }
+    return updated;
+  }
+
+  async markStepRejected(stepName: string): Promise<Session> {
+    return this.deps.markStepRejected?.(stepName) ?? this.deps.markStepSkipped(stepName);
   }
 
   async markStepSkipped(stepName: string): Promise<Session> {
-    return this.deps.markStepSkipped(stepName);
+    const current = this.ensureSession();
+    const state = machineStateFromOnboardSessionStep(stepName);
+    const previousStatus = state ? current.steps[stepName]?.status : null;
+    const updated = this.deps.markStepSkipped(stepName);
+    if (
+      state &&
+      (previousStatus === "pending" || previousStatus === "in_progress") &&
+      updated.steps[stepName]?.status === "skipped"
+    ) {
+      this.emit("state.skipped", updated, { state, step: stepName });
+    }
+    return updated;
   }
 
-  async markStepFailed(
-    stepName: string,
-    message: string | null = null,
-    options: StepMutationOptions = RECORD_ONLY_STEP_MUTATION_OPTIONS,
-  ): Promise<Session> {
-    return this.deps.markStepFailed(stepName, message, options);
-  }
-
-  async markStepFailedRecordOnly(
-    stepName: string,
-    message: string | null = null,
-  ): Promise<Session> {
-    return this.deps.markStepFailedRecordOnly(stepName, message);
+  async markStepFailed(stepName: string, message: string | null = null): Promise<Session> {
+    return this.deps.markStepFailed(stepName, message);
   }
 
   async completeSession(updates: SessionUpdates = {}): Promise<Session> {
@@ -185,6 +209,7 @@ export class OnboardRuntime {
     const enteredAt = this.deps.now();
     const updated = this.deps.updateSession((session) => {
       session.machine = snapshotFor(to, enteredAt, session.machine.revision + 1);
+      onboardSession.syncCheckpointMachineState(session, to, enteredAt);
       if (to === "failed") {
         session.status = "failed";
       } else if (to === "complete") {
@@ -227,19 +252,24 @@ export class OnboardRuntime {
   ): Promise<Session> {
     const current = this.ensureSession();
     const from = current.machine.state;
+    assertOnboardNotInterrupted(from, "complete", current.failure);
     assertValidOnboardMachineTransition(from, "complete");
 
     const safeUpdates = this.deps.filterSafeUpdates(updates);
     const fields = Object.keys(safeUpdates);
-    const enteredAt = this.deps.now();
-    const updated = this.deps.updateSession((session) => {
-      Object.assign(session, safeUpdates);
-      session.status = "complete";
-      session.resumable = false;
-      session.failure = null;
-      session.machine = snapshotFor("complete", enteredAt, session.machine.revision + 1);
-      return session;
-    });
+    let updated = this.deps.completeSession(updates, { emitEvents: false });
+    if (updated.machine.state !== "complete") {
+      const enteredAt = this.deps.now();
+      updated = this.deps.updateSession((session) => {
+        Object.assign(session, safeUpdates);
+        session.status = "complete";
+        session.resumable = false;
+        session.failure = null;
+        session.machine = snapshotFor("complete", enteredAt, session.machine.revision + 1);
+        onboardSession.syncCheckpointMachineState(session, "complete", enteredAt);
+        return session;
+      });
+    }
 
     if (fields.length > 0) {
       this.emit("context.updated", updated, {
@@ -256,7 +286,62 @@ export class OnboardRuntime {
     return updated;
   }
 
+  async assertResultWillApply(result: OnboardStateResult): Promise<void> {
+    const current = this.ensureSession();
+    if (result.type === "failed") {
+      assertValidOnboardMachineTransition(current.machine.state, "failed");
+      return;
+    }
+    if (result.type === "complete") {
+      assertOnboardNotInterrupted(current.machine.state, "complete", current.failure);
+      assertValidOnboardMachineTransition(current.machine.state, "complete");
+      return;
+    }
+    const sourceState =
+      result.metadata && typeof result.metadata.state === "string" ? result.metadata.state : null;
+    if (result.type === "pause") {
+      if (sourceState && current.machine.state !== sourceState) {
+        throw new Error(
+          `Onboarding state result source mismatch: ${sourceState} != ${current.machine.state}`,
+        );
+      }
+      return;
+    }
+    assertOnboardNotInterrupted(current.machine.state, result.next, current.failure);
+    if (isTerminalOnboardMachineState(current.machine.state)) {
+      assertValidOnboardMachineTransition(current.machine.state, result.next);
+    }
+    if (current.machine.state === result.next) {
+      throw new Error(`Onboarding state result already reached target state: ${result.next}`);
+    }
+    if (sourceState && current.machine.state !== sourceState) {
+      throw new Error(
+        `Onboarding state result source mismatch: ${sourceState} != ${current.machine.state}`,
+      );
+    }
+    const transition = assertValidOnboardMachineTransition(current.machine.state, result.next);
+    if (result.transitionKind && transition.kind !== result.transitionKind) {
+      throw new Error(
+        `Invalid onboarding machine transition kind: ${current.machine.state} -> ${result.next} expected ${result.transitionKind}, got ${transition.kind}`,
+      );
+    }
+  }
+
   async applyResult(result: OnboardStateResult): Promise<Session> {
+    await this.assertResultWillApply(result);
+    if (result.type === "pause") {
+      const current = this.ensureSession();
+      if (isTerminalOnboardMachineState(current.machine.state)) {
+        throw new Error(`Cannot pause terminal onboarding state: ${current.machine.state}`);
+      }
+      if (result.updates && Object.keys(this.deps.filterSafeUpdates(result.updates)).length > 0) {
+        return this.updateContext(result.updates, {
+          state: current.machine.state,
+          metadata: result.metadata,
+        });
+      }
+      return current;
+    }
     if (result.type === "complete") {
       return this.complete(result.updates ?? {}, { metadata: result.metadata });
     }
@@ -268,6 +353,7 @@ export class OnboardRuntime {
     }
 
     const current = this.ensureSession();
+    assertOnboardNotInterrupted(current.machine.state, result.next, current.failure);
     const transition = assertValidOnboardMachineTransition(current.machine.state, result.next);
     if (result.transitionKind && transition.kind !== result.transitionKind) {
       throw new Error(
@@ -299,6 +385,7 @@ export class OnboardRuntime {
         recordedAt,
       });
       session.machine = snapshotFor("failed", recordedAt, session.machine.revision + 1);
+      onboardSession.syncCheckpointMachineState(session, "failed", recordedAt);
       return session;
     });
 
@@ -329,22 +416,15 @@ export class OnboardRuntime {
     return session;
   }
 
-  async emitResultSkipped(options: {
-    reason: "already_at_target" | "source_state_mismatch";
-    currentState: OnboardMachineState;
-    targetState: OnboardMachineState;
-    metadata?: Record<string, unknown> | null;
-  }): Promise<Session> {
+  async emitResultSkipped(options: ResultSkippedInputs): Promise<Session> {
     const session = this.ensureSession();
-    this.emit("state.result.skipped", session, {
-      state: session.machine.state,
-      metadata: {
-        ...eventMetadata(options.metadata),
-        reason: options.reason,
-        currentState: options.currentState,
-        targetState: options.targetState,
-      },
-    });
+    this.deps.emitEvent(buildResultSkippedEvent(session, options));
+    return session;
+  }
+
+  async emitResultInvalidated(options: ResultInvalidatedInputs): Promise<Session> {
+    const session = this.ensureSession();
+    this.deps.emitEvent(buildResultInvalidatedEvent(session, options));
     return session;
   }
 

@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import os from "node:os";
-
 import type { SandboxLogsOptions } from "./log-options";
 import { DEFAULT_SANDBOX_LOG_LINES } from "./log-options";
 
@@ -39,12 +37,6 @@ export function describeLogProbeResult(result: LogProbeResult): string {
   return `exit ${result.status ?? "unknown"}`;
 }
 
-export function exitCodeFromSignal(signal: NodeJS.Signals | null): number {
-  if (!signal) return 1;
-  const signalNumber = os.constants.signals[signal];
-  return signalNumber ? 128 + signalNumber : 1;
-}
-
 export function normalizeSandboxLogsOptions(
   options: SandboxLogsOptions | boolean,
 ): SandboxLogsOptions {
@@ -58,8 +50,14 @@ export function normalizeSandboxLogsOptions(
   };
 }
 
-export function buildEnableSandboxAuditLogsArgs(sandboxName: string): string[] {
-  return ["settings", "set", sandboxName, "--key", "ocsf_json_enabled", "--value", "true"];
+export function buildEnableSandboxAuditLogsArgs(
+  sandboxName: string,
+  gatewayName?: string,
+): string[] {
+  const args = ["settings", "set"];
+  if (gatewayName) args.push("-g", gatewayName);
+  args.push(sandboxName, "--key", "ocsf_json_enabled", "--value", "true");
+  return args;
 }
 
 export function buildSandboxOpenclawGatewayLogsArgs(
@@ -74,8 +72,14 @@ export function buildSandboxOpenclawGatewayLogsArgs(
   return args;
 }
 
-export function buildSandboxLogsArgs(sandboxName: string, options: SandboxLogsOptions): string[] {
-  const args = ["logs", sandboxName, "-n", options.lines, "--source", "all"];
+export function buildSandboxLogsArgs(
+  sandboxName: string,
+  options: SandboxLogsOptions,
+  gatewayName?: string,
+): string[] {
+  const args = ["logs"];
+  if (gatewayName) args.push("-g", gatewayName);
+  args.push(sandboxName, "-n", options.lines, "--source", "all");
   if (options.since) {
     args.push("--since", options.since);
   }

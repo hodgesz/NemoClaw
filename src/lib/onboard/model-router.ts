@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { spawn, spawnSync } from "node:child_process";
-import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { GATEWAY_PORT } from "../core/ports";
 import { requireValue } from "../core/require-value";
+import { compactText } from "../core/url-utils";
 import {
   normalizeCredentialValue,
   resolveProviderCredential,
@@ -14,8 +15,11 @@ import {
 } from "../credentials/store";
 import { ROOT, run, runCapture } from "../runner";
 import { hashCredential } from "../security/credential-hash";
+import { redact, redactFull, redactSensitiveText } from "../security/redact";
+import { rejectSymlinksOnPath } from "../state/config-io";
 import type { Session } from "../state/onboard-session";
 import * as onboardSession from "../state/onboard-session";
+import { nemoclawStateRoot } from "../state/state-root";
 import { buildSubprocessEnv } from "../subprocess-env";
 import { hydrateCredentialEnv } from "./credential-env";
 import {
@@ -23,32 +27,53 @@ import {
   probeHostServiceSandboxReachability,
 } from "./host-service-reachability";
 import {
+  formatStorageBytes,
+  measureReclaimableDirectorySizeBytes,
+  probeHostStorage,
+} from "../inference/vllm-storage";
+import {
+  createModelRouterCommandProvisioner,
+  type ModelRouterCommandDeps,
+} from "./model-router-command";
+import {
   doesModelRouterProcessOwnPort,
-  findModelRouterPidForPort,
+  getRouterHealthSnapshot,
+  inspectModelRouterProcessForPort,
   isRouterHealthy,
+  ROUTER_HEALTH_TIMEOUT_MS as ROUTER_HEALTH_REQUEST_TIMEOUT_MS,
+  type RouterHealthSnapshot,
   stopModelRouterProcess,
 } from "./model-router-process";
 import { prepareModelRouterVenv } from "./model-router-python";
 
-const ROUTER_HEALTH_RETRIES = 15;
+export {
+  createModelRouterCommandProvisioner,
+  type ModelRouterCommandDeps,
+  type ModelRouterCommandPaths,
+  type ModelRouterCommandProvisioner,
+} from "./model-router-command";
+
+// The prefill router downloads and loads its routing model before it serves
+// /health. Allow a cold host to finish while bounding both elapsed time and
+// the number of health checks.
+const ROUTER_HEALTH_RETRIES = 300;
 const ROUTER_HEALTH_INTERVAL_MS = 2000;
+const ROUTER_STARTUP_TIMEOUT_MS = 10 * 60_000;
+// LiteLLM's /health live-probes every upstream endpoint per request, so it
+// can need far longer than the 3-second liveness budget to answer (#8962).
+// The startup poll keeps the 3-second budget and reads the body, so it
+// never accepts a fast 200 that names zero healthy endpoints; recovery for
+// a router whose /health outruns that budget runs through the body-checked
+// final snapshot after the poll exhausts its retries.
+const ROUTER_FINAL_HEALTH_SNAPSHOT_TIMEOUT_MS = 30_000;
+const ROUTER_LOG_TAIL_LINES = 20;
+const ROUTER_LOG_TAIL_MAX_BYTES = 64 * 1024;
+const ROUTER_LOG_TAIL_LINE_MAX_CHARS = 300;
 const MODEL_ROUTER_RELATIVE_DIR = path.join("nemoclaw-blueprint", "router", "llm-router");
-const MODEL_ROUTER_VENV_DIR = path.join(os.homedir(), ".nemoclaw", "model-router-venv");
-const MODEL_ROUTER_FINGERPRINT_FILE = ".nemoclaw-source-fingerprint";
-const MODEL_ROUTER_FINGERPRINT_IGNORED_NAMES = new Set([
-  ".git",
-  ".hg",
-  ".mypy_cache",
-  ".pytest_cache",
-  ".ruff_cache",
-  ".svn",
-  ".venv",
-  "__pycache__",
-  "build",
-  "dist",
-  "node_modules",
-  "venv",
-]);
+const MODEL_ROUTER_VENV_DIR = path.join(
+  nemoclawStateRoot(os.homedir(), GATEWAY_PORT),
+  "model-router-venv",
+);
 export const DEFAULT_MODEL_ROUTER_CREDENTIAL_ENV = "NVIDIA_INFERENCE_API_KEY";
 
 export type BlueprintRouterConfig = {
@@ -65,6 +90,57 @@ export type BlueprintInferenceProfile = {
   credential_env?: string;
   credential_default?: string;
   router: BlueprintRouterConfig;
+};
+
+type ModelRouterProxyConfigResult = {
+  status: number | null;
+  stderr?: string | Buffer;
+  error?: Error;
+};
+
+type ModelRouterSpawnedProcess = {
+  pid: number | undefined;
+  onError(listener: (error: Error) => void): void;
+  onExit(listener: (code: number | null, signal: string | null) => void): void;
+  unref(): void;
+};
+
+export type StartModelRouterDeps = {
+  rootDir: string;
+  homeDir: string;
+  ensureModelRouterCommand: () => string;
+  mkdirSync: (directory: string) => void;
+  runProxyConfig: (
+    command: string,
+    args: string[],
+    options: { encoding: "utf8"; timeout: number; cwd: string },
+  ) => ModelRouterProxyConfigResult;
+  spawnProxy: (
+    command: string,
+    args: string[],
+    options: {
+      detached: true;
+      stdio: "ignore" | ["ignore", number, number];
+      cwd: string;
+      env: Record<string, string>;
+    },
+  ) => ModelRouterSpawnedProcess;
+  /** Open the router log for append; null degrades the spawn to stdio "ignore". */
+  openRouterLog: (logPath: string) => { fd: number; startOffset: number } | null;
+  closeRouterLog: (fd: number) => void;
+  /** Read this run's redacted log tail, starting at the offset the run began at. */
+  readRouterLogTail: (logPath: string, startOffset: number) => string;
+  /** Read the router pool config; null when unreadable. */
+  readPoolConfig: (poolConfigPath: string) => string | null;
+  resolveProviderCredential: (name: string) => string | null;
+  buildSubprocessEnv: (extra: Record<string, string>) => Record<string, string>;
+  isRouterHealthy: (port: number, timeoutMs?: number) => Promise<boolean>;
+  getRouterHealthSnapshot: (port: number, timeoutMs?: number) => Promise<RouterHealthSnapshot>;
+  sleep: (milliseconds: number) => Promise<void>;
+  now: () => number;
+  isProcessAlive: (pid: number) => boolean;
+  terminateProcess: (pid: number) => void;
+  getProviderKey: () => string;
 };
 
 /**
@@ -93,13 +169,6 @@ export function loadBlueprintProfile(
   }
 }
 
-function resolveHostCommandPath(commandName: string): string | null {
-  const result = runCapture(["sh", "-c", 'command -v "$1"', "--", commandName], {
-    ignoreError: true,
-  }).trim();
-  return result || null;
-}
-
 function modelRouterPackageDir(): string {
   return path.join(ROOT, MODEL_ROUTER_RELATIVE_DIR);
 }
@@ -108,204 +177,44 @@ function modelRouterVenvDir(): string {
   return process.env.NEMOCLAW_MODEL_ROUTER_VENV || MODEL_ROUTER_VENV_DIR;
 }
 
-function modelRouterCommandPath(venvDir = modelRouterVenvDir()): string {
-  return path.join(venvDir, "bin", "model-router");
-}
-
-function modelRouterFingerprintPath(venvDir = modelRouterVenvDir()): string {
-  return path.join(venvDir, MODEL_ROUTER_FINGERPRINT_FILE);
-}
-
-function isExecutableFile(filePath: string): boolean {
-  try {
-    fs.accessSync(filePath, fs.constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function isModelRouterPackageReady(routerDir = modelRouterPackageDir()): boolean {
-  return (
-    fs.existsSync(path.join(routerDir, "pyproject.toml")) ||
-    fs.existsSync(path.join(routerDir, "setup.py"))
-  );
-}
-
-function shouldSkipModelRouterFingerprintEntry(name: string): boolean {
-  return MODEL_ROUTER_FINGERPRINT_IGNORED_NAMES.has(name) || name.endsWith(".egg-info");
-}
-
-function hashModelRouterSourceTree(routerDir = modelRouterPackageDir()): string | null {
-  const sourceHash = crypto.createHash("sha256");
-
-  const hashDirectory = (currentDir: string): boolean => {
-    let entries: fs.Dirent[];
-    try {
-      entries = fs
-        .readdirSync(currentDir, { withFileTypes: true })
-        .sort((left: fs.Dirent, right: fs.Dirent) => left.name.localeCompare(right.name));
-    } catch {
-      return false;
-    }
-
-    let hashedSourceFile = false;
-    for (const entry of entries) {
-      if (shouldSkipModelRouterFingerprintEntry(entry.name)) continue;
-      if (entry.name.endsWith(".pyc") || entry.name.endsWith(".pyo")) continue;
-
-      const entryPath = path.join(currentDir, entry.name);
-      const relativePath = path.relative(routerDir, entryPath).split(path.sep).join("/");
-      if (entry.isDirectory()) {
-        hashedSourceFile = hashDirectory(entryPath) || hashedSourceFile;
-        continue;
-      }
-      if (entry.isSymbolicLink()) {
-        try {
-          sourceHash.update(`link:${relativePath}\0`);
-          sourceHash.update(fs.readlinkSync(entryPath));
-          sourceHash.update("\0");
-          hashedSourceFile = true;
-        } catch {
-          // Ignore unreadable links; the install step will fail if they are required.
-        }
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      sourceHash.update(`file:${relativePath}\0`);
-      sourceHash.update(fs.readFileSync(entryPath));
-      sourceHash.update("\0");
-      hashedSourceFile = true;
-    }
-    return hashedSourceFile;
-  };
-
-  return hashDirectory(routerDir) ? `files:${sourceHash.digest("hex")}` : null;
-}
-
-function getModelRouterSourceFingerprint(routerDir = modelRouterPackageDir()): string | null {
-  const gitHead = runCapture(["git", "-C", routerDir, "rev-parse", "HEAD"], {
-    ignoreError: true,
-  }).trim();
-  if (/^[0-9a-f]{40}$/i.test(gitHead)) return `git:${gitHead}`;
-
-  const gitLink = runCapture(
-    ["git", "-C", ROOT, "rev-parse", `HEAD:${MODEL_ROUTER_RELATIVE_DIR}`],
-    {
-      ignoreError: true,
-    },
-  ).trim();
-  if (/^[0-9a-f]{40}$/i.test(gitLink)) return `gitlink:${gitLink}`;
-
-  return hashModelRouterSourceTree(routerDir);
-}
-
-function readModelRouterInstalledFingerprint(venvDir = modelRouterVenvDir()): string | null {
-  try {
-    const fingerprint = fs.readFileSync(modelRouterFingerprintPath(venvDir), "utf8").trim();
-    return fingerprint || null;
-  } catch {
-    return null;
-  }
-}
-
-function writeModelRouterInstalledFingerprint(
-  fingerprint: string | null,
+export function createProductionModelRouterCommandProvisioner(
+  routerDir = modelRouterPackageDir(),
   venvDir = modelRouterVenvDir(),
-): void {
-  if (!fingerprint) return;
-  fs.writeFileSync(modelRouterFingerprintPath(venvDir), `${fingerprint}\n`, { mode: 0o600 });
+  overrides: Partial<Pick<ModelRouterCommandDeps, "probeStorage" | "measureDirectorySize">> = {},
+) {
+  return createModelRouterCommandProvisioner(
+    {
+      rootDir: ROOT,
+      routerDir,
+      venvDir,
+      defaultVenvDir: MODEL_ROUTER_VENV_DIR,
+    },
+    {
+      run,
+      runCapture,
+      prepareModelRouterVenv,
+      packageVersion: () =>
+        JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version ?? "unknown",
+      probeStorage: probeHostStorage,
+      measureDirectorySize: measureReclaimableDirectorySizeBytes,
+      formatStorageBytes,
+      ...overrides,
+    },
+  );
 }
 
 export function isManagedModelRouterCurrent(
   routerDir = modelRouterPackageDir(),
   venvDir = modelRouterVenvDir(),
 ): boolean {
-  if (!isExecutableFile(modelRouterCommandPath(venvDir))) return false;
-  const sourceFingerprint = getModelRouterSourceFingerprint(routerDir);
-  if (sourceFingerprint) {
-    return readModelRouterInstalledFingerprint(venvDir) === sourceFingerprint;
-  }
-  // When source fingerprint is unavailable (no git), accept an existing
-  // install-prefixed fingerprint to avoid reinstalling on every onboard.
-  const installed = readModelRouterInstalledFingerprint(venvDir);
-  return installed !== null && installed.startsWith("install:");
-}
-
-function initializeModelRouterSubmodule(routerDir = modelRouterPackageDir()): void {
-  if (isModelRouterPackageReady(routerDir)) return;
-  if (!fs.existsSync(path.join(ROOT, ".gitmodules")) || !fs.existsSync(path.join(ROOT, ".git"))) {
-    return;
-  }
-  console.log("  Initializing Model Router source...");
-  run(
-    ["git", "-C", ROOT, "submodule", "update", "--init", "--depth", "1", MODEL_ROUTER_RELATIVE_DIR],
-    {
-      ignoreError: true,
-    },
-  );
-}
-
-function installModelRouterCommand(routerDir = modelRouterPackageDir()): string {
-  initializeModelRouterSubmodule(routerDir);
-  if (!isModelRouterPackageReady(routerDir)) {
-    throw new Error(
-      `Model Router source is not initialized at ${routerDir}. ` +
-        `Run: git -C ${ROOT} submodule update --init --depth 1 ${MODEL_ROUTER_RELATIVE_DIR}`,
-    );
-  }
-
-  const venvDir = modelRouterVenvDir();
-  const routerCommand = modelRouterCommandPath(venvDir);
-  const sourceFingerprint = getModelRouterSourceFingerprint(routerDir);
-  const allowReplaceExistingVenv =
-    path.resolve(venvDir) === path.resolve(MODEL_ROUTER_VENV_DIR) ||
-    readModelRouterInstalledFingerprint(venvDir) !== null;
-  const venvPython = prepareModelRouterVenv({
+  return createProductionModelRouterCommandProvisioner(
+    routerDir,
     venvDir,
-    allowReplaceExisting: allowReplaceExistingVenv,
-  });
-
-  const installResult = run(
-    [venvPython, "-m", "pip", "install", "--quiet", "--upgrade", `${routerDir}[prefill,proxy]`],
-    {
-      ignoreError: true,
-      timeout: 600_000,
-    },
-  );
-  if (installResult.status !== 0) {
-    throw new Error("Failed to install Model Router dependencies.");
-  }
-  if (!isExecutableFile(routerCommand)) {
-    throw new Error("Model Router install did not produce the model-router command.");
-  }
-  const version =
-    JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version ?? "unknown";
-  const effectiveFingerprint = sourceFingerprint ?? `install:${version}`;
-  writeModelRouterInstalledFingerprint(effectiveFingerprint, venvDir);
-  return routerCommand;
+  ).isManagedModelRouterCurrent();
 }
 
 function ensureModelRouterCommand(): string {
-  const routerDir = modelRouterPackageDir();
-  const venvDir = modelRouterVenvDir();
-  const managedCommand = modelRouterCommandPath(venvDir);
-
-  if (isModelRouterPackageReady(routerDir) && isManagedModelRouterCurrent(routerDir, venvDir)) {
-    return managedCommand;
-  }
-
-  if (!isModelRouterPackageReady(routerDir)) {
-    initializeModelRouterSubmodule(routerDir);
-  }
-
-  if (isModelRouterPackageReady(routerDir)) {
-    if (isManagedModelRouterCurrent(routerDir, venvDir)) return managedCommand;
-    return installModelRouterCommand(routerDir);
-  }
-
-  if (isExecutableFile(managedCommand)) return managedCommand;
-  return resolveHostCommandPath("model-router") || installModelRouterCommand();
+  return createProductionModelRouterCommandProvisioner().ensureModelRouterCommand();
 }
 
 /**
@@ -313,20 +222,138 @@ function ensureModelRouterCommand(): string {
  * Follows the same pattern as Ollama startup (spawn detached, poll health).
  * Returns the PID of the child process.
  */
-async function startModelRouter(routerCfg: BlueprintRouterConfig): Promise<number> {
-  const routerCommand = ensureModelRouterCommand();
+function createStartModelRouterDeps(): StartModelRouterDeps {
+  return {
+    rootDir: ROOT,
+    homeDir: os.homedir(),
+    ensureModelRouterCommand,
+    mkdirSync: (directory) => fs.mkdirSync(directory, { recursive: true }),
+    runProxyConfig: (command, args, options) => spawnSync(command, args, options),
+    spawnProxy: (command, args, options) => {
+      const child = spawn(command, args, options);
+      return {
+        pid: child.pid,
+        onError: (listener) => {
+          child.once("error", listener);
+        },
+        onExit: (listener) => {
+          child.once("exit", listener);
+        },
+        unref: () => child.unref(),
+      };
+    },
+    openRouterLog: (logPath) => {
+      // O_NONBLOCK plus the fstat isFile check refuse a planted FIFO the way
+      // openRegularFileNoFollow does; O_NOFOLLOW refuses a planted symlink.
+      // Writes to a regular file ignore O_NONBLOCK, so the flag only affects
+      // the open itself.
+      const flags =
+        fs.constants.O_APPEND |
+        fs.constants.O_CREAT |
+        fs.constants.O_WRONLY |
+        fs.constants.O_NOFOLLOW |
+        (typeof fs.constants.O_NONBLOCK === "number" ? fs.constants.O_NONBLOCK : 0);
+      let fd: number | null = null;
+      try {
+        fd = fs.openSync(logPath, flags, 0o600);
+        const stats = fs.fstatSync(fd);
+        if (!stats.isFile()) throw new Error("not a regular file");
+        // O_CREAT does not change the mode of an existing file; enforce the
+        // documented owner-only permission on every open.
+        fs.fchmodSync(fd, 0o600);
+        return { fd, startOffset: stats.size };
+      } catch (error) {
+        try {
+          if (fd !== null) fs.closeSync(fd);
+        } catch {
+          // The descriptor is already closed or invalid.
+        }
+        // Router output capture is diagnostic; report and never block startup.
+        console.error(`  Failed to open Model Router log '${logPath}': ${String(error)}`);
+        return null;
+      }
+    },
+    closeRouterLog: (fd) => fs.closeSync(fd),
+    readRouterLogTail: (logPath, startOffset) => {
+      // Bounded read of this run's bytes only: an append-only log carries
+      // earlier runs' output, and an unbounded readFileSync fails outright
+      // past the V8 string limit. Redact before splitting so multi-line
+      // secret blocks still match their patterns. The tail lands in the
+      // thrown startup error, so it takes full redaction, not the partial
+      // form that keeps a four-character secret prefix.
+      try {
+        const flags =
+          fs.constants.O_RDONLY |
+          fs.constants.O_NOFOLLOW |
+          (typeof fs.constants.O_NONBLOCK === "number" ? fs.constants.O_NONBLOCK : 0);
+        const fd = fs.openSync(logPath, flags);
+        try {
+          const stats = fs.fstatSync(fd);
+          if (!stats.isFile()) return "";
+          const from = Math.max(startOffset, stats.size - ROUTER_LOG_TAIL_MAX_BYTES);
+          const length = stats.size - from;
+          if (length <= 0) return "";
+          const buffer = Buffer.alloc(length);
+          fs.readSync(fd, buffer, 0, length, from);
+          return redactFull(redact(buffer.toString("utf8")))
+            .split(/\r?\n|\r/)
+            .filter(Boolean)
+            .slice(-ROUTER_LOG_TAIL_LINES)
+            .map((line) => line.slice(0, ROUTER_LOG_TAIL_LINE_MAX_CHARS))
+            .join("\n");
+        } finally {
+          fs.closeSync(fd);
+        }
+      } catch {
+        return "";
+      }
+    },
+    readPoolConfig: (poolConfigPath) => {
+      try {
+        return fs.readFileSync(poolConfigPath, "utf8");
+      } catch {
+        return null;
+      }
+    },
+    resolveProviderCredential,
+    buildSubprocessEnv,
+    isRouterHealthy,
+    getRouterHealthSnapshot,
+    sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    now: () => performance.now(),
+    isProcessAlive: (pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    terminateProcess: (pid) => process.kill(pid, "SIGTERM"),
+    getProviderKey: () => (process.env.NEMOCLAW_PROVIDER_KEY || "").trim(),
+  };
+}
+
+export async function startModelRouter(
+  routerCfg: BlueprintRouterConfig,
+  overrides: Partial<StartModelRouterDeps> = {},
+): Promise<number> {
+  const deps: StartModelRouterDeps = { ...createStartModelRouterDeps(), ...overrides };
+  const routerCommand = deps.ensureModelRouterCommand();
   const port = routerCfg.port || 4000;
-  const blueprintDir = path.join(ROOT, "nemoclaw-blueprint");
+  const blueprintDir = path.join(deps.rootDir, "nemoclaw-blueprint");
   const poolConfigPath = path.join(
     blueprintDir,
     routerCfg.pool_config_path || "router/pool-config.yaml",
   );
-  const stateDir = path.join(os.homedir(), ".nemoclaw", "state");
+  const stateDir = path.join(nemoclawStateRoot(deps.homeDir, GATEWAY_PORT), "state");
   const litellmConfigPath = path.join(stateDir, "litellm-proxy.yaml");
 
-  fs.mkdirSync(stateDir, { recursive: true });
+  rejectSymlinksOnPath(stateDir);
+  deps.mkdirSync(stateDir);
+  rejectSymlinksOnPath(stateDir);
 
-  const proxyConfigResult = spawnSync(
+  const proxyConfigResult = deps.runProxyConfig(
     routerCommand,
     ["proxy-config", "--config", poolConfigPath, "--output", litellmConfigPath],
     { encoding: "utf8", timeout: 30_000, cwd: blueprintDir },
@@ -339,52 +366,77 @@ async function startModelRouter(routerCfg: BlueprintRouterConfig): Promise<numbe
 
   const credEnvVars: Record<string, string> = {};
   const credName = routerCfg.credential_env || DEFAULT_MODEL_ROUTER_CREDENTIAL_ENV;
-  const routedCredential = resolveProviderCredential(credName);
-  const openAiCredential = resolveProviderCredential("OPENAI_API_KEY");
+  const routedCredential = deps.resolveProviderCredential(credName);
   if (routedCredential) {
     credEnvVars[credName] = routedCredential;
-    if (!openAiCredential) credEnvVars.OPENAI_API_KEY = routedCredential;
+    // #8962: the generated LiteLLM proxy config authenticates every pool
+    // endpoint through OPENAI_API_KEY, so for the shipped NVIDIA pool the
+    // validated routed credential must own that variable. An ambient or
+    // legacy-staged OPENAI_API_KEY is not valid for the default NVIDIA pool
+    // endpoints, and onboarding then reported only a startup timeout. A
+    // custom or unproven pool preserves the existing credential precedence.
+    // #8962 does not define a credential contract for those pools. Resolving
+    // OPENAI_API_KEY only on that path also avoids restaging a stale legacy
+    // value into process.env for the shipped pool.
+    if (poolTargetsOnlyNvidiaEndpoints(deps.readPoolConfig(poolConfigPath))) {
+      credEnvVars.OPENAI_API_KEY = routedCredential;
+    } else {
+      const ambientOpenAiCredential = deps.resolveProviderCredential("OPENAI_API_KEY");
+      credEnvVars.OPENAI_API_KEY = ambientOpenAiCredential || routedCredential;
+    }
+  } else {
+    const openAiCredential = deps.resolveProviderCredential("OPENAI_API_KEY");
+    if (openAiCredential) credEnvVars.OPENAI_API_KEY = openAiCredential;
   }
-  if (openAiCredential) credEnvVars.OPENAI_API_KEY = openAiCredential;
-  const _providerKey = (process.env.NEMOCLAW_PROVIDER_KEY || "").trim();
+  const _providerKey = deps.getProviderKey();
   if (_providerKey) {
     if (!credEnvVars[credName]) credEnvVars[credName] = _providerKey;
     if (!credEnvVars.OPENAI_API_KEY) credEnvVars.OPENAI_API_KEY = _providerKey;
   }
 
-  if (await isRouterHealthy(port)) {
+  if (await deps.isRouterHealthy(port)) {
     throw new Error(
       `Port ${port} already has a healthy router endpoint; refusing to start a second router.`,
     );
   }
 
-  const child = spawn(
-    routerCommand,
-    [
-      "proxy",
-      "--litellm-config",
-      litellmConfigPath,
-      "--router-config",
-      poolConfigPath,
-      "--host",
-      "0.0.0.0",
-      "--port",
-      String(port),
-    ],
-    {
-      detached: true,
-      stdio: "ignore",
-      cwd: blueprintDir,
-      env: buildSubprocessEnv(credEnvVars),
-    },
-  );
+  // #8962: capture the router's own output; with stdio "ignore" the actual
+  // startup error (for example an endpoint authentication failure) was
+  // unreadable.
+  const logPath = path.join(stateDir, "model-router.log");
+  const routerLog = deps.openRouterLog(logPath);
+  let child: ModelRouterSpawnedProcess;
+  try {
+    child = deps.spawnProxy(
+      routerCommand,
+      [
+        "proxy",
+        "--litellm-config",
+        litellmConfigPath,
+        "--router-config",
+        poolConfigPath,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        String(port),
+      ],
+      {
+        detached: true,
+        stdio: routerLog === null ? "ignore" : ["ignore", routerLog.fd, routerLog.fd],
+        cwd: blueprintDir,
+        env: deps.buildSubprocessEnv(credEnvVars),
+      },
+    );
+  } finally {
+    if (routerLog !== null) deps.closeRouterLog(routerLog.fd);
+  }
   let childExited = false;
   let childExitDetail = "";
-  child.once("error", (err: Error) => {
+  child.onError((err: Error) => {
     childExited = true;
     childExitDetail = `child failed to start: ${err.message}`;
   });
-  child.once("exit", (code: number | null, signal: string | null) => {
+  child.onExit((code: number | null, signal: string | null) => {
     childExited = true;
     if (!childExitDetail) {
       childExitDetail = `child exited with code ${code ?? "null"}${signal ? ` signal ${signal}` : ""}`;
@@ -400,16 +452,25 @@ async function startModelRouter(routerCfg: BlueprintRouterConfig): Promise<numbe
     );
   }
 
-  for (let attempt = 0; attempt < ROUTER_HEALTH_RETRIES; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, ROUTER_HEALTH_INTERVAL_MS));
+  // Reserve the final-snapshot window inside the startup budget so a failed
+  // startup never exceeds the 600 seconds the error message reports.
+  const startupDeadline =
+    deps.now() + ROUTER_STARTUP_TIMEOUT_MS - ROUTER_FINAL_HEALTH_SNAPSHOT_TIMEOUT_MS;
+  let healthAttempts = 0;
+  while (healthAttempts < ROUTER_HEALTH_RETRIES && deps.now() < startupDeadline) {
+    const delayMs = Math.min(ROUTER_HEALTH_INTERVAL_MS, startupDeadline - deps.now());
+    await deps.sleep(delayMs);
     if (childExited) break;
-    const healthy = await isRouterHealthy(port);
-    let processAlive = true;
-    try {
-      process.kill(pid, 0);
-    } catch {
-      processAlive = false;
-    }
+    const remainingMs = startupDeadline - deps.now();
+    if (remainingMs <= 0) break;
+    const healthTimeoutMs = Math.max(
+      1,
+      Math.min(ROUTER_HEALTH_REQUEST_TIMEOUT_MS, Math.ceil(remainingMs)),
+    );
+    healthAttempts += 1;
+    const pollSnapshot = await deps.getRouterHealthSnapshot(port, healthTimeoutMs);
+    const healthy = isRouterSnapshotReady(pollSnapshot);
+    const processAlive = deps.isProcessAlive(pid);
     if (healthy && processAlive) return pid;
     if (!processAlive) {
       childExited = true;
@@ -417,15 +478,96 @@ async function startModelRouter(routerCfg: BlueprintRouterConfig): Promise<numbe
       break;
     }
   }
+  // One 30-second body read after the poll exhausts its retries. When the
+  // router process is still running, this snapshot is the only source of
+  // the endpoint error — and a healthy body is proof of recovery: kill only
+  // a router that did not prove itself healthy.
+  const finalSnapshot: RouterHealthSnapshot = childExited
+    ? { healthy: false, body: null }
+    : await deps.getRouterHealthSnapshot(port, ROUTER_FINAL_HEALTH_SNAPSHOT_TIMEOUT_MS);
+  if (isRouterSnapshotReady(finalSnapshot) && deps.isProcessAlive(pid)) {
+    return pid;
+  }
   try {
-    process.kill(pid, "SIGTERM");
+    deps.terminateProcess(pid);
   } catch {
     // already dead
   }
+  const lastHealthError = firstUnhealthyEndpointError(finalSnapshot.body);
+  const logTail = routerLog === null ? "" : deps.readRouterLogTail(logPath, routerLog.startOffset);
   throw new Error(
-    `Model router failed to become healthy on port ${port} after ${ROUTER_HEALTH_RETRIES} attempts` +
-      (childExitDetail ? ` (${childExitDetail})` : ""),
+    `Model Router failed to become healthy on port ${port} within ${ROUTER_STARTUP_TIMEOUT_MS / 1000} seconds (completed health checks: ${healthAttempts})` +
+      (childExitDetail ? ` (${childExitDetail})` : "") +
+      (lastHealthError ? ` (last health error: ${lastHealthError})` : "") +
+      (routerLog === null ? "" : `. Router log: ${logPath}`) +
+      (logTail ? `\n  Last router log lines:\n${logTail}` : ""),
   );
+}
+
+/** Router readiness: /health answered 2xx and names at least one healthy endpoint. */
+function isRouterSnapshotReady(snapshot: RouterHealthSnapshot): boolean {
+  if (!snapshot.healthy || !snapshot.body) return false;
+  try {
+    const parsed = JSON.parse(snapshot.body) as { healthy_endpoints?: readonly unknown[] };
+    return Array.isArray(parsed?.healthy_endpoints) && parsed.healthy_endpoints.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when a nonempty pool proves that every endpoint uses HTTPS on
+ * nvidia.com or one of its subdomains.
+ */
+export function poolTargetsOnlyNvidiaEndpoints(poolConfigText: string | null): boolean {
+  if (!poolConfigText) return false;
+  try {
+    const YAML = require("yaml");
+    const parsed = YAML.parse(poolConfigText) as {
+      models?: readonly { api_base?: unknown }[];
+    };
+    if (!Array.isArray(parsed?.models) || parsed.models.length === 0) return false;
+    const models = parsed.models;
+    return models.every((model) => {
+      if (typeof model?.api_base !== "string" || !model.api_base.trim()) return false;
+      const endpoint = new URL(model.api_base);
+      if (endpoint.protocol !== "https:") return false;
+      const hostname = endpoint.hostname.replace(/\.$/, "");
+      return hostname === "nvidia.com" || hostname.endsWith(".nvidia.com");
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Redact and cap the first unhealthy-endpoint error so a startup failure
+ * cannot print a credential or an unbounded /health body.
+ */
+function firstUnhealthyEndpointError(body: string | null): string | null {
+  if (!body) return null;
+  let error: string | null = null;
+  try {
+    const parsed = JSON.parse(body) as {
+      unhealthy_endpoints?: readonly { error?: unknown }[];
+    };
+    for (const endpoint of parsed?.unhealthy_endpoints ?? []) {
+      if (typeof endpoint?.error === "string" && endpoint.error.length > 0) {
+        error = endpoint.error;
+        break;
+      }
+    }
+  } catch {
+    // A body cut off at the capture cap is not parseable JSON; fall through
+    // to the textual match so the diagnostic survives truncation.
+  }
+  if (!error) {
+    const match = body.match(/"error"\s*:\s*"((?:[^"\\]|\\.)+)"/);
+    error = match ? match[1] : null;
+  }
+  if (!error) return null;
+  const redacted = redactSensitiveText(error);
+  return redacted ? compactText(redacted) || null : null;
 }
 
 function getRoutedProfile(): BlueprintInferenceProfile {
@@ -434,6 +576,12 @@ function getRoutedProfile(): BlueprintInferenceProfile {
     throw new Error("Router is not enabled in nemoclaw-blueprint/blueprint.yaml.");
   }
   return bp;
+}
+
+export const DEFAULT_MODEL_ROUTER_PORT = 4000;
+
+export function resolveModelRouterPort(): number {
+  return getRoutedProfile().router?.port || DEFAULT_MODEL_ROUTER_PORT;
 }
 
 export function isRoutedInferenceProvider(provider: string | null | undefined): boolean {
@@ -448,7 +596,7 @@ const MODEL_ROUTER_SERVICE_LABEL = "Model Router";
 /**
  * Verify the host Model Router is reachable from the OpenShell Docker network.
  *
- * `isRouterHealthy()` only proves the router answers on the host loopback. On
+ * A healthy /health answer only proves the router responds on the host loopback. On
  * Linux Docker-driver hosts with UFW default-deny, a sandbox container can
  * still fail to reach `host.openshell.internal:<routerPort>` even though the
  * host curl succeeds (#4564). This mirrors the Ollama auth-proxy probe: on a
@@ -474,7 +622,7 @@ async function verifyModelRouterSandboxReachability(routerPort: number): Promise
 
 export async function reconcileModelRouter(): Promise<void> {
   const bp = getRoutedProfile();
-  const routerPort = bp.router.port || 4000;
+  const routerPort = resolveModelRouterPort();
   const routerCredentialEnv =
     bp.router.credential_env || bp.credential_env || DEFAULT_MODEL_ROUTER_CREDENTIAL_ENV;
   const routerCredential =
@@ -489,19 +637,29 @@ export async function reconcileModelRouter(): Promise<void> {
   const recordedPid = session?.routerPid ?? null;
   const recordedCredentialHash = session?.routerCredentialHash ?? null;
 
-  if (await isRouterHealthy(routerPort)) {
+  // One snapshot answers both questions: `healthy` is the occupied-port check,
+  // and `isRouterSnapshotReady` is the single authority for declaring the
+  // router usable, exactly as it is for the startup poll. Budget the body read,
+  // because /health probes every upstream endpoint and can answer well after
+  // the 3-second liveness budget.
+  const snapshot = await getRouterHealthSnapshot(
+    routerPort,
+    ROUTER_FINAL_HEALTH_SNAPSHOT_TIMEOUT_MS,
+  );
+  if (snapshot.healthy) {
     const recordedProcessOwnsRouter = doesModelRouterProcessOwnPort(recordedPid, routerPort);
     if (
       routerCredentialHash &&
       recordedCredentialHash === routerCredentialHash &&
-      recordedProcessOwnsRouter
+      recordedProcessOwnsRouter &&
+      isRouterSnapshotReady(snapshot)
     ) {
       console.log(`  ✓ Model router is already healthy on port ${routerPort}`);
       await verifyModelRouterSandboxReachability(routerPort);
       return;
     }
     if (recordedProcessOwnsRouter) {
-      console.log("  Restarting model router with updated credentials...");
+      console.log("  Restarting model router...");
       await stopModelRouterProcess(
         requireValue(recordedPid, "Expected recorded router PID"),
         routerPort,
@@ -512,13 +670,15 @@ export async function reconcileModelRouter(): Promise<void> {
       // requiring a manual stop-and-retry. Only stop it if the cmdline
       // confirms it is actually model-router proxy — never kill an unrelated
       // service that happens to occupy the port. See issue #5169.
-      const orphanPid = findModelRouterPidForPort(routerPort);
-      if (orphanPid !== null) {
-        console.log(`  Stopping orphaned model router (PID ${orphanPid})...`);
-        await stopModelRouterProcess(orphanPid, routerPort);
+      const orphan = inspectModelRouterProcessForPort(routerPort);
+      if (orphan.status === "found") {
+        console.log(`  Stopping orphaned model router (PID ${orphan.pid})...`);
+        await stopModelRouterProcess(orphan.pid, routerPort);
       } else {
+        const inventoryDetail =
+          orphan.status === "unavailable" ? " The host process inventory is unavailable." : "";
         throw new Error(
-          `Port ${routerPort} already has a healthy router endpoint, but its credential state is unknown. Stop the existing model-router process and rerun onboarding.`,
+          `Port ${routerPort} already has a healthy router endpoint, but its credential state is unknown.${inventoryDetail} Stop the existing model-router process and rerun onboarding.`,
         );
       }
     }

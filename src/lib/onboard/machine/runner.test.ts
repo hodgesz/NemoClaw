@@ -4,15 +4,13 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  createSession,
-  filterSafeUpdates,
-  MACHINE_SNAPSHOT_VERSION,
-  normalizeSession,
-  type Session,
-  type SessionUpdates,
-  sanitizeFailure,
-} from "../../state/onboard-session";
-import { advanceTo, branchTo, completeOnboardMachine, failOnboardMachine, retryTo } from "./result";
+  advanceTo,
+  branchTo,
+  completeOnboardMachine,
+  failOnboardMachine,
+  pauseOnboardMachine,
+  retryTo,
+} from "./result";
 import {
   MissingOnboardStateHandlerError,
   OnboardMachineTransitionLimitError,
@@ -20,62 +18,18 @@ import {
   runOnboardMachine,
 } from "./runner";
 import { OnboardRuntime, type OnboardRuntimeDeps } from "./runtime";
+import {
+  MACHINE_SNAPSHOT_VERSION,
+  type Session,
+  type SessionUpdates,
+  cloneSession,
+  createSession,
+  createTestRuntime as createRuntime,
+} from "../../../../test/helpers/onboard-machine-runtime-fixture";
 
 interface RunnerContext {
   attempts: number;
   visited: string[];
-}
-
-function cloneSession(session: Session): Session {
-  return normalizeSession(JSON.parse(JSON.stringify(session))) ?? session;
-}
-
-function createRuntime(initialSession: Session = createSession()) {
-  let session = cloneSession(initialSession);
-  const updateSession = (mutator: (value: Session) => Session | void): Session => {
-    const next = mutator(cloneSession(session)) ?? session;
-    session = cloneSession(next);
-    return cloneSession(session);
-  };
-  const deps: OnboardRuntimeDeps = {
-    loadSession: () => cloneSession(session),
-    createSession,
-    saveSession: (next) => {
-      session = cloneSession(next);
-      return cloneSession(session);
-    },
-    updateSession,
-    markStepStarted: () => cloneSession(session),
-    markStepComplete: (_stepName, updates: SessionUpdates = {}) =>
-      updateSession((current) => {
-        Object.assign(current, filterSafeUpdates(updates));
-        return current;
-      }),
-    markStepCompleteRecordOnly: (_stepName, updates: SessionUpdates = {}) =>
-      updateSession((current) => {
-        Object.assign(current, filterSafeUpdates(updates));
-        return current;
-      }),
-    markStepSkipped: () => cloneSession(session),
-    markStepFailed: (_stepName, message) =>
-      updateSession((current) => {
-        current.status = "failed";
-        current.failure = sanitizeFailure({ step: _stepName, message, recordedAt: "now" });
-        return current;
-      }),
-    markStepFailedRecordOnly: () => cloneSession(session),
-    completeSession: (updates: SessionUpdates = {}) =>
-      updateSession((current) => {
-        Object.assign(current, filterSafeUpdates(updates));
-        current.status = "complete";
-        current.resumable = false;
-        return current;
-      }),
-    filterSafeUpdates,
-    emitEvent: () => undefined,
-    now: () => "2026-05-28T00:00:00.000Z",
-  };
-  return new OnboardRuntime(deps);
 }
 
 describe("runOnboardMachine", () => {
@@ -150,6 +104,35 @@ describe("runOnboardMachine", () => {
       machine: { state: "failed" },
     });
     expect(policies).not.toHaveBeenCalled();
+  });
+
+  it("stops on a pause result without leaving the current retryable state", async () => {
+    const session = createSession({
+      machine: {
+        version: MACHINE_SNAPSHOT_VERSION,
+        state: "post_verify",
+        stateEnteredAt: "2026-05-28T00:00:00.000Z",
+        revision: 4,
+      },
+    });
+    const runtime = createRuntime(session);
+    const postVerify = vi.fn(() =>
+      pauseOnboardMachine({ sandboxName: "my-assistant" }, { reason: "not-ready" }),
+    );
+
+    const result = await runOnboardMachine({
+      context: { attempts: 0, visited: [] } as RunnerContext,
+      runtime,
+      handlers: { post_verify: postVerify },
+    });
+
+    expect(postVerify).toHaveBeenCalledOnce();
+    expect(result.session).toMatchObject({
+      status: "in_progress",
+      resumable: true,
+      sandboxName: "my-assistant",
+      machine: { state: "post_verify", revision: 4 },
+    });
   });
 
   it("returns immediately for terminal sessions", async () => {
@@ -261,8 +244,9 @@ describe("runOnboardMachine", () => {
     ).rejects.toThrow(OnboardMachineTransitionLimitError);
   });
 
-  it("uses the default transition limit for non-finite maxTransitions values", async () => {
-    for (const maxTransitions of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    "uses the default transition limit for non-finite maxTransitions values [case %#]",
+    async (maxTransitions) => {
       const runtime = createRuntime();
 
       await expect(
@@ -279,6 +263,6 @@ describe("runOnboardMachine", () => {
           maxTransitions,
         }),
       ).rejects.toMatchObject({ maxTransitions: 100 });
-    }
-  });
+    },
+  );
 });

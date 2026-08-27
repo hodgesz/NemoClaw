@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { normalizeCredentialValue, saveCredential } from "../credentials/store";
+import { getCredentialPromptIntent, saveCredential } from "../credentials/store";
 import type { ProbeRecovery } from "../validation-recovery";
 
 export interface ValidationRecoveryPromptDeps {
@@ -12,18 +12,24 @@ export interface ValidationRecoveryPromptDeps {
   exitOnboardFromPrompt(): never;
 }
 
+export type ValidationRecoveryCredentialResult =
+  | { kind: "credential"; value: string }
+  | { kind: "selection" };
+
 export interface ValidationRecoveryPromptHelpers {
   replaceNamedCredential(
     envName: string,
     label: string,
     helpUrl?: string | null,
     validator?: ((value: string) => string | null) | null,
-  ): Promise<string>;
+    revalidatePolicyRequirements?: (operation: string) => void,
+  ): Promise<ValidationRecoveryCredentialResult>;
   promptValidationRecovery(
     label: string,
     recovery: ProbeRecovery,
     credentialEnv?: string | null,
     helpUrl?: string | null,
+    revalidatePolicyRequirements?: (operation: string) => void,
   ): Promise<"credential" | "selection" | "retry" | "model">;
 }
 
@@ -35,7 +41,8 @@ export function createValidationRecoveryPromptHelpers(
     label: string,
     helpUrl: string | null = null,
     validator: ((value: string) => string | null) | null = null,
-  ): Promise<string> {
+    revalidatePolicyRequirements?: (operation: string) => void,
+  ): Promise<ValidationRecoveryCredentialResult> {
     if (helpUrl) {
       console.log("");
       console.log(`  Get your ${label} from: ${helpUrl}`);
@@ -43,7 +50,14 @@ export function createValidationRecoveryPromptHelpers(
     }
 
     while (true) {
-      const key = normalizeCredentialValue(await deps.prompt(`  ${label}: `, { secret: true }));
+      const intent = getCredentialPromptIntent(await deps.prompt(`  ${label}: `, { secret: true }));
+      if (intent.kind === "back") return { kind: "selection" };
+      if (intent.kind === "exit") deps.exitOnboardFromPrompt();
+      if (intent.kind === "help") {
+        console.log("  Type back to choose a different provider, or exit to quit.");
+        continue;
+      }
+      const key = intent.value;
       if (!key) {
         console.error(`  ${label} is required.`);
         continue;
@@ -53,12 +67,13 @@ export function createValidationRecoveryPromptHelpers(
         console.error(validationError);
         continue;
       }
+      revalidatePolicyRequirements?.(`save ${label}`);
       saveCredential(envName, key);
       process.env[envName] = key;
       console.log("");
       console.log("  Credential staged. Onboarding will register it with the OpenShell gateway.");
       console.log("");
-      return key;
+      return { kind: "credential", value: key };
     }
   }
 
@@ -67,6 +82,7 @@ export function createValidationRecoveryPromptHelpers(
     recovery: ProbeRecovery,
     credentialEnv: string | null = null,
     helpUrl: string | null = null,
+    revalidatePolicyRequirements?: (operation: string) => void,
   ): Promise<"credential" | "selection" | "retry" | "model"> {
     if (deps.isNonInteractive()) {
       process.exit(1);
@@ -103,7 +119,18 @@ export function createValidationRecoveryPromptHelpers(
       if (looksLikeToken) {
         console.log("  ⚠️  That looks like an API key — do not paste credentials here.");
         console.log("  Treating as 'retry'. You will be prompted to enter the key securely.");
-        await replaceNamedCredential(credentialEnv, `${label} API key`, helpUrl, validator);
+        const result = await replaceNamedCredential(
+          credentialEnv,
+          `${label} API key`,
+          helpUrl,
+          validator,
+          revalidatePolicyRequirements,
+        );
+        if (result.kind === "selection") {
+          console.log("  Returning to provider selection.");
+          console.log("");
+          return "selection";
+        }
         return "credential";
       }
       if (choice === "back") {
@@ -115,7 +142,18 @@ export function createValidationRecoveryPromptHelpers(
         deps.exitOnboardFromPrompt();
       }
       if (choice === "" || choice === "retry") {
-        await replaceNamedCredential(credentialEnv, `${label} API key`, helpUrl, validator);
+        const result = await replaceNamedCredential(
+          credentialEnv,
+          `${label} API key`,
+          helpUrl,
+          validator,
+          revalidatePolicyRequirements,
+        );
+        if (result.kind === "selection") {
+          console.log("  Returning to provider selection.");
+          console.log("");
+          return "selection";
+        }
         return "credential";
       }
       console.log("  Please choose a provider/model again.");

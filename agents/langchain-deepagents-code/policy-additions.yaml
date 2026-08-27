@@ -18,11 +18,15 @@ filesystem_policy:
     - /proc
     - /dev/urandom
     - /app
+    - /run/nemoclaw/managed-startup-ca-bundle.pem
+    - /run/nemoclaw/managed-startup-runtime.env
     - /etc
     - /var/log
+    - /var/lib/dpkg                  # Allow package-version inspection without package mutation.
   read_write:
     - /sandbox
     - /sandbox/.deepagents
+    - /run/nemoclaw-dcode-mcp
     - /tmp
     - /dev/null
 
@@ -65,6 +69,17 @@ network_policies:
       - host: api.github.com
         port: 443
         access: full
+      # GitHub's API and HTML pages link repository file bodies through this
+      # separate host. A general coding agent must follow repository, ref, and
+      # file paths that vary by task, so the host-wide path is intentional while
+      # methods remain read-only. The broader endpoints above support git work.
+      - host: raw.githubusercontent.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: HEAD, path: "/**" }
     binaries:
       - { path: /usr/bin/git }
       - { path: /usr/local/bin/dcode }

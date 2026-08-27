@@ -7,12 +7,23 @@ import { dockerInfo } from "../../adapters/docker/info";
 import { dockerCapture } from "../../adapters/docker/run";
 import { CLI_NAME } from "../../cli/branding";
 import { GATEWAY_PORT } from "../../core/ports";
+import { resolveSandboxContainerOwner } from "../../domain/sandbox/container-owner";
+import { resolveGatewayPortFromName } from "../../onboard/gateway-binding";
+import type { PortablePodmanReadinessResult } from "../../onboard/experimental/portable-runtime-readiness";
+import {
+  inspectPortableRuntimeReceiptReadiness,
+  type PortableRuntimeReceiptReadinessDeps,
+} from "../../onboard/experimental/portable-runtime-receipt-readiness";
 import * as registry from "../../state/registry";
-import { resolveSandboxContainerOwner } from "./sandbox-container-owner";
+import { getSandboxTargetGatewayName } from "./gateway-target";
 
-const DEFAULT_CONTAINER = "openshell-cluster-nemoclaw";
 const DOCKER_TIMEOUT_MS = 3000;
 const PORT_PROBE_TIMEOUT_MS = 2000;
+
+const portableRuntimeFailures = new Map<
+  string,
+  Extract<PortablePodmanReadinessResult, { ok: false }>
+>();
 
 export type GatewayFailureLayer =
   | "docker_unreachable"
@@ -100,7 +111,7 @@ const defaultRunners: GatewayFailureRunners = {
 };
 
 export async function classifyGatewayFailure(
-  _sandboxName: string,
+  sandboxName: string,
   opts?: { runners?: GatewayFailureRunners },
 ): Promise<GatewayFailureResult> {
   const runners = opts?.runners ?? defaultRunners;
@@ -112,10 +123,19 @@ export async function classifyGatewayFailure(
     };
   }
 
-  if (runners.dockerIsRunning(DEFAULT_CONTAINER)) {
+  // Probe the gateway container and port that the sandbox actually belongs
+  // to: a sandbox onboarded with a non-default NEMOCLAW_GATEWAY_PORT runs as
+  // `openshell-cluster-nemoclaw-<port>`, and classifying against the bare
+  // default container reports container_missing for a gateway that merely
+  // exited (or blames an unrelated default gateway).
+  const gatewayName = getSandboxTargetGatewayName(sandboxName);
+  const gatewayContainer = `openshell-cluster-${gatewayName}`;
+  const gatewayPort = resolveGatewayPortFromName(gatewayName) ?? GATEWAY_PORT;
+
+  if (runners.dockerIsRunning(gatewayContainer)) {
     return {
       layer: "gateway_unreachable",
-      detail: `Container '${DEFAULT_CONTAINER}' is running but the gateway API is not responding.`,
+      detail: `Container '${gatewayContainer}' is running but the gateway API is not responding.`,
     };
   }
 
@@ -123,23 +143,23 @@ export async function classifyGatewayFailure(
   // "removed/never created" — only the former can hit container_exited*. Per
   // issue #3271 AC: container_exited_port_conflict requires `docker ps -a` to
   // confirm the container exited rather than being absent.
-  if (!runners.dockerExists(DEFAULT_CONTAINER)) {
+  if (!runners.dockerExists(gatewayContainer)) {
     return {
       layer: "container_missing",
-      detail: `Container '${DEFAULT_CONTAINER}' is not present (never created or removed).`,
+      detail: `Container '${gatewayContainer}' is not present (never created or removed).`,
     };
   }
 
-  const portInUse = await runners.portProbe(GATEWAY_PORT);
+  const portInUse = await runners.portProbe(gatewayPort);
   if (portInUse) {
     return {
       layer: "container_exited_port_conflict",
-      detail: `Container '${DEFAULT_CONTAINER}' exited, and port ${GATEWAY_PORT} is held by another process.`,
+      detail: `Container '${gatewayContainer}' exited, and port ${gatewayPort} is held by another process.`,
     };
   }
   return {
     layer: "container_exited",
-    detail: `Container '${DEFAULT_CONTAINER}' exited.`,
+    detail: `Container '${gatewayContainer}' exited.`,
   };
 }
 
@@ -232,8 +252,8 @@ export async function classifySandboxContainerFailure(
 type SandboxDriverLookup = (name: string) => { openshellDriver?: string | null } | null | undefined;
 
 // Drivers whose sandbox runtime does NOT live in the local Docker daemon. Only
-// `vm` qualifies: the NemoClaw gateway always runs as the local Docker
-// container `openshell-cluster-nemoclaw` (see classifyGatewayFailure), so the
+// `vm` qualifies: the NemoClaw gateway always runs as a local Docker
+// `openshell-cluster-<gateway>` container (see classifyGatewayFailure), so the
 // `docker` driver and the `kubernetes`/k3s driver (k3s-in-Docker, or Docker
 // Desktop's Kubernetes — selected by `isLinuxDockerDriverGatewayEnabled()` for
 // non-Linux/non-arm64 hosts) both depend on a reachable local Docker daemon. A
@@ -271,8 +291,22 @@ export function isDockerRuntimeDown(
   opts?: {
     runners?: Pick<GatewayFailureRunners, "dockerInfo">;
     getSandbox?: SandboxDriverLookup;
+    portableLifecycle?: PortableRuntimeReceiptReadinessDeps;
   },
 ): boolean {
+  const portable = inspectPortableRuntimeReceiptReadiness(sandboxName, opts?.portableLifecycle);
+  if (portable) {
+    if (portable.ok) {
+      portableRuntimeFailures.delete(sandboxName);
+      console.log(
+        `  Portable Podman readiness: ${portable.timing.mode}; activation ${String(portable.timing.activationMs)} ms; API ${String(portable.timing.apiMs)} ms; total ${String(portable.timing.totalMs)} ms.`,
+      );
+      return false;
+    }
+    portableRuntimeFailures.set(sandboxName, portable);
+    return true;
+  }
+  portableRuntimeFailures.delete(sandboxName);
   const getSandbox = opts?.getSandbox ?? registry.getSandbox;
   if (!isDockerBackedSandbox(sandboxName, getSandbox)) return false;
   const probe = opts?.runners?.dockerInfo ?? defaultRunners.dockerInfo;
@@ -292,6 +326,38 @@ export function printDockerRuntimeDownGuidance(
 ): void {
   const writer = opts.writer ?? console.error;
   const retryCommand = opts.retryCommand ?? "status";
+  const portable = portableRuntimeFailures.get(sandboxName);
+  portableRuntimeFailures.delete(sandboxName);
+  if (portable) {
+    writer(`  Failure stage: ${portable.stage} — ${portable.detail}`);
+    if (portable.socketPath) writer(`  Recorded socket: ${portable.socketPath}`);
+    writer(
+      `  Portable Podman readiness (${portable.timing.mode}): activation ${String(portable.timing.activationMs)} ms; API ${String(portable.timing.apiMs)} ms; total ${String(portable.timing.totalMs)} ms.`,
+    );
+    writer(
+      `  The receipt-owned Podman endpoint for sandbox '${sandboxName}' is not ready; no Docker or named-connection fallback was used.`,
+    );
+    writer("  Recovery:");
+    if (!portable.socketPath) {
+      if (portable.recovery === "current-user-authority") {
+        writer(
+          "    1. Run NemoClaw as the user who created the portable state, or rerun portable onboarding as the current user.",
+        );
+      } else {
+        writer(
+          `    1. Rerun portable onboarding: ${CLI_NAME} onboard --experimental-profile portable`,
+        );
+      }
+      writer(`    2. Retry: ${CLI_NAME} ${sandboxName} ${retryCommand}`);
+      return;
+    }
+    writer(
+      "    1. Check the reported readiness stage and the current user's Podman socket service.",
+    );
+    writer("    2. Confirm the recorded endpoint returns a real Podman server version.");
+    writer(`    3. Retry: ${CLI_NAME} ${sandboxName} ${retryCommand}`);
+    return;
+  }
   writer(`  ${getLayerHeader("docker_unreachable")}`);
   writer(
     `  The Docker daemon is not reachable, so sandbox '${sandboxName}' cannot be verified or started.`,

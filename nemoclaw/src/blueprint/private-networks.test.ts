@@ -13,8 +13,6 @@ let existsCalls: string[] = [];
 let statCalls: string[] = [];
 let nowMs = 1_000;
 
-vi.spyOn(Date, "now").mockImplementation(() => nowMs);
-
 vi.mock("node:fs", async (importOriginal) => {
   const original = await importOriginal<typeof fs>();
   return {
@@ -82,6 +80,7 @@ function advanceStatInterval(): void {
 
 describe("private-networks loader", () => {
   beforeEach(() => {
+    vi.spyOn(Date, "now").mockImplementation(() => nowMs);
     store.clear();
     mtimes.clear();
     sizes.clear();
@@ -274,6 +273,22 @@ describe("private-networks loader", () => {
         "ipv4: []\nipv6: []\nnames:\n  - purpose: orphan\n",
       );
       expect(() => getNetworkEntries()).toThrow(/missing or empty 'name'/);
+    });
+
+    it.each([" localhost", "localhost ", "."])("rejects non-canonical name %j", (name) => {
+      seedYaml(
+        "/blueprint/private-networks.yaml",
+        `ipv4: []\nipv6: []\nnames:\n  - name: ${JSON.stringify(name)}\n    purpose: malformed\n`,
+      );
+      expect(() => getNetworkEntries()).toThrow(/'name' must be canonical/);
+    });
+
+    it("accepts a canonical name with a terminal dot", () => {
+      seedYaml(
+        "/blueprint/private-networks.yaml",
+        "ipv4: []\nipv6: []\nnames:\n  - name: localhost.\n    purpose: canonical FQDN\n",
+      );
+      expect(isPrivateHostname("localhost")).toBe(true);
     });
 
     it("rejects a names entry with empty purpose", () => {

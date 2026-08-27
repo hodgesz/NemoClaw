@@ -17,10 +17,20 @@
  * "Health Offline" in the dashboard.
  */
 
-import type { DashboardDeliveryChain } from "./dashboard/contract";
+import { parseVersionFromText } from "./adapters/openshell/client";
 import { compareChannelSets, type RuntimeChannelStatus } from "./channel-runtime-status";
+import type { DashboardDeliveryChain } from "./dashboard/contract";
 import { listMessagingChannelsWithoutCredentials } from "./messaging/channels";
+
+import { retryUntilAsync } from "./core/retry";
+import {
+  buildCustomOpenClawRuntimeFailureHints,
+  classifyOpenClawRuntimeFailure,
+  type SandboxCommandExecutor,
+} from "./onboard/custom-openclaw-runtime-diagnosis";
 import { getMessagingProviderNamesForChannel } from "./onboard/messaging-reuse";
+
+export { shouldDiagnoseCustomOpenClawRuntime } from "./onboard/custom-openclaw-runtime-diagnosis";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -31,6 +41,14 @@ export interface DeploymentVerification {
   gatewayVersion: string | null;
   inferenceRouteWorking: boolean;
   dashboardReachable: boolean;
+  /**
+   * Host reachability of the agent's OpenAI-compatible API forward, or null
+   * when the agent publishes no API port separate from the dashboard (every
+   * agent but Hermes today). Distinct from `gatewayReachable`, which only
+   * proves the API answers *inside* the sandbox: the host forward can be down
+   * while the in-sandbox listener is perfectly healthy (#9290).
+   */
+  agentApiReachable: boolean | null;
   messagingBridgesHealthy: boolean;
   /**
    * Channels recorded in the registry that the in-sandbox agent config
@@ -72,10 +90,7 @@ export interface VerifyDeploymentResult {
 
 export interface VerifyDeploymentDeps {
   /** Execute a command inside the sandbox via SSH. Returns null if sandbox unreachable. */
-  executeSandboxCommand: (
-    name: string,
-    script: string,
-  ) => { status: number; stdout: string; stderr: string } | null;
+  executeSandboxCommand: SandboxCommandExecutor;
 
   /** Probe an HTTP endpoint on the host. Returns the HTTP status code or 0 on failure. */
   probeHostPort: (port: number, path: string) => number;
@@ -111,16 +126,27 @@ export interface VerifyDeploymentOptions {
    * returns from createSandbox before the gateway process or the host port
    * forward have finished coming up. Each entry below adds one extra attempt
    * after the initial try, scheduled at the given delay from the previous
-   * attempt. The defaults give roughly a 25 s budget per probe before the
+   * attempt. The defaults give a 90 s budget per probe before the
    * wizard surfaces a ✗ marker.
    * Tests pass `[]` to disable retry.
    */
   retryDelaysMs?: number[];
   /** Sleep helper, injectable for tests. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Inspect a failed custom OpenClaw image for the managed runtime contract.
+   * Keep this disabled for stock images and other agents, whose config and
+   * startup paths intentionally differ.
+   */
+  diagnoseCustomOpenClawRuntime?: boolean;
 }
 
-const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [1000, 2000, 5000, 7000, 10000];
+const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [
+  1000, 2000, 5000, 7000, 10000, 15000, 20000, 30000,
+];
+// OpenClaw cron stops its provider preflight after 2.5 seconds. Require a
+// response within 2 seconds so onboarding leaves time for client overhead.
+const INFERENCE_ROUTE_REACHABILITY_MAX_SECONDS = 2;
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -137,7 +163,8 @@ const CREDENTIALLESS_MESSAGING_CHANNELS = new Set(listMessagingChannelsWithoutCr
 // sandbox log is the first thing to check. If the sandbox itself never
 // came up, the host-side OpenShell gateway log is the right place to
 // look — see gatewayLogCandidates() in onboard/sandbox-create-failure.ts.
-function buildGatewayLogHint(sandboxName: string): string {
+function buildGatewayLogHint(sandboxName: string, customRuntimeHint: string | null): string {
+  if (customRuntimeHint) return customRuntimeHint;
   return (
     `The gateway probe failed after retrying. Inspect the in-sandbox gateway log with ` +
     `\`nemoclaw ${sandboxName} logs\` (the gateway writes to /tmp/gateway.log inside the sandbox when it starts). ` +
@@ -181,51 +208,63 @@ async function verifyGatewayInSandbox(
   retryDelaysMs: readonly number[],
   sleep: (ms: number) => Promise<void>,
 ): Promise<{ reachable: boolean; httpCode: number; detail: string }> {
-  let last = probeGatewayInSandboxOnce(sandboxName, chain, deps);
-  if (last.reachable) return last;
-  for (const delayMs of retryDelaysMs) {
-    await sleep(delayMs);
-    last = probeGatewayInSandboxOnce(sandboxName, chain, deps);
-    if (last.reachable) return last;
-  }
-  return last;
+  return retryUntilAsync(() => probeGatewayInSandboxOnce(sandboxName, chain, deps), {
+    accept: (result) => result.reachable,
+    retryDelaysMs,
+    sleep,
+  });
 }
 
 /**
  * Retrieve the gateway version from inside the sandbox.
  */
 function fetchGatewayVersion(sandboxName: string, deps: VerifyDeploymentDeps): string | null {
-  const script = `openclaw --version 2>/dev/null | awk '{print $2}' || echo ''`;
+  const script = "openclaw --version 2>/dev/null";
   const result = deps.executeSandboxCommand(sandboxName, script);
-  if (!result || !result.stdout.trim()) return null;
-  const version = result.stdout.trim();
-  return version && version !== "" ? version : null;
+  if (!result || result.status !== 0 || !result.stdout.trim()) return null;
+  return parseVersionFromText(result.stdout, "openclaw --version");
 }
 
-/**
- * Probe the inference route from inside the sandbox.
- * Sends a minimal request to inference.local to verify the proxy is working.
- */
-function verifyInferenceRoute(
+type InferenceRouteStatus = "ok" | "unreachable" | "unhealthy";
+
+function probeInferenceRouteOnce(
   sandboxName: string,
   deps: VerifyDeploymentDeps,
-): { working: boolean; detail: string } {
-  // Just check that inference.local resolves and the proxy responds.
-  // We don't send a real completion request — just hit /v1/models to confirm routing.
+): { status: InferenceRouteStatus; detail: string } {
   const script =
-    `HTTP_CODE=$(curl -so /dev/null -w '%{http_code}' --max-time 5 ` +
+    `HTTP_CODE=$(curl -so /dev/null -w '%{http_code}' --max-time ${INFERENCE_ROUTE_REACHABILITY_MAX_SECONDS} ` +
     `https://inference.local/v1/models 2>/dev/null || echo 000); echo $HTTP_CODE`;
   const result = deps.executeSandboxCommand(sandboxName, script);
   if (!result) {
-    return { working: false, detail: "sandbox unreachable" };
+    return { status: "unreachable", detail: "sandbox unreachable" };
   }
   const code = parseInt(result.stdout.trim(), 10) || 0;
-  // Any HTTP response (even 401/403) means the proxy is routing.
-  // 000 means DNS failed or connection refused.
-  if (code > 0) {
-    return { working: true, detail: `inference.local responded HTTP ${code}` };
+  if (code === 0) {
+    return {
+      status: "unreachable",
+      detail: "inference.local unreachable (DNS or proxy not running)",
+    };
   }
-  return { working: false, detail: "inference.local unreachable (DNS or proxy not running)" };
+  if (code >= 500) {
+    return {
+      status: "unhealthy",
+      detail: `inference.local returned HTTP ${code} (route reachable but endpoint unhealthy)`,
+    };
+  }
+  return { status: "ok", detail: `inference.local responded HTTP ${code}` };
+}
+
+async function verifyInferenceRoute(
+  sandboxName: string,
+  deps: VerifyDeploymentDeps,
+  retryDelaysMs: readonly number[],
+  sleep: (ms: number) => Promise<void>,
+): Promise<{ status: InferenceRouteStatus; detail: string }> {
+  return retryUntilAsync(() => probeInferenceRouteOnce(sandboxName, deps), {
+    accept: (result) => result.status === "ok",
+    retryDelaysMs,
+    sleep,
+  });
 }
 
 /**
@@ -254,14 +293,64 @@ async function verifyDashboardFromHost(
   retryDelaysMs: readonly number[],
   sleep: (ms: number) => Promise<void>,
 ): Promise<{ reachable: boolean; detail: string }> {
-  let last = probeDashboardFromHostOnce(chain, deps);
-  if (last.reachable) return last;
-  for (const delayMs of retryDelaysMs) {
-    await sleep(delayMs);
-    last = probeDashboardFromHostOnce(chain, deps);
-    if (last.reachable) return last;
+  return retryUntilAsync(() => probeDashboardFromHostOnce(chain, deps), {
+    accept: (result) => result.reachable,
+    retryDelaysMs,
+    sleep,
+  });
+}
+
+/**
+ * Does this agent publish an OpenAI-compatible API on its own host forward?
+ *
+ * `buildChain` falls back to the dashboard port when the agent declares no
+ * separate gateway port, so a distinct `gatewayPort` is precisely the signal
+ * that onboarding forwarded a second host port for the API (Hermes:
+ * `forward_ports: [18789, 8642]`). Agents without one (OpenClaw) keep the
+ * single dashboard probe and are unaffected.
+ */
+function hasSeparateAgentApiPort(chain: DashboardDeliveryChain): boolean {
+  return Number.isInteger(chain.gatewayPort) && chain.gatewayPort !== chain.port;
+}
+
+/**
+ * Verify the agent's OpenAI-compatible API port is reachable from the host.
+ *
+ * The in-sandbox gateway probe only proves the API listens inside the sandbox;
+ * it says nothing about the host forward operators actually connect through.
+ * Onboarding advertises that host URL on the success screen, so it has to be
+ * probed from the host too. Otherwise, a failed API forward leaves onboarding
+ * reporting a healthy deployment while the documented endpoint refuses every
+ * connection (#9290).
+ */
+function probeAgentApiFromHostOnce(
+  chain: DashboardDeliveryChain,
+  deps: VerifyDeploymentDeps,
+): { reachable: boolean; detail: string } {
+  const code = deps.probeHostPort(
+    chain.gatewayPort,
+    chain.gatewayHealthEndpoint ?? chain.healthEndpoint,
+  );
+  if (GATEWAY_ALIVE_CODES.has(code)) {
+    return { reachable: true, detail: `host probe HTTP ${code}` };
   }
-  return last;
+  if (code > 0) {
+    return { reachable: false, detail: `host probe HTTP ${code} (unexpected)` };
+  }
+  return { reachable: false, detail: "port forward not working (connection refused)" };
+}
+
+async function verifyAgentApiFromHost(
+  chain: DashboardDeliveryChain,
+  deps: VerifyDeploymentDeps,
+  retryDelaysMs: readonly number[],
+  sleep: (ms: number) => Promise<void>,
+): Promise<{ reachable: boolean; detail: string }> {
+  return retryUntilAsync(() => probeAgentApiFromHostOnce(chain, deps), {
+    accept: (result) => result.reachable,
+    retryDelaysMs,
+    sleep,
+  });
 }
 
 /**
@@ -466,36 +555,81 @@ export async function verifyDeployment(
 
   // 1. Gateway reachable inside sandbox
   const gateway = await verifyGatewayInSandbox(sandboxName, chain, deps, retryDelaysMs, sleep);
+  // Diagnose only after the normal startup budget. A slow custom runtime should
+  // get the same recovery window as the stock image, and an early unreachable
+  // exec cannot safely prove that image artifacts are absent.
+  const runtimeDiagnosis =
+    !gateway.reachable && options.diagnoseCustomOpenClawRuntime
+      ? classifyOpenClawRuntimeFailure(sandboxName, deps.executeSandboxCommand)
+      : null;
+  const customRuntimeHints = runtimeDiagnosis
+    ? buildCustomOpenClawRuntimeFailureHints(runtimeDiagnosis)
+    : null;
   diagnostics.push({
     link: "gateway",
     status: gateway.reachable ? "ok" : "fail",
     detail: gateway.detail,
-    hint: gateway.reachable ? "" : buildGatewayLogHint(sandboxName),
+    hint: gateway.reachable
+      ? ""
+      : buildGatewayLogHint(sandboxName, customRuntimeHints?.gateway ?? null),
   });
 
   // 2. Gateway version (cosmetic — not a health signal)
   const gatewayVersion = gateway.reachable ? fetchGatewayVersion(sandboxName, deps) : null;
 
   // 3. Dashboard reachable from host (port forward)
-  const dashboard = await verifyDashboardFromHost(chain, deps, retryDelaysMs, sleep);
+  // A port forward cannot repair an image that has no managed gateway runtime,
+  // so avoid spending a second retry budget on the dependent dashboard probe.
+  const dashboardRetryDelays = customRuntimeHints ? [] : retryDelaysMs;
+  const dashboard = await verifyDashboardFromHost(chain, deps, dashboardRetryDelays, sleep);
   diagnostics.push({
     link: "dashboard",
     status: dashboard.reachable ? "ok" : "fail",
     detail: dashboard.detail,
     hint: dashboard.reachable
       ? ""
-      : `Port forward on ${chain.port} is not working. Run: openshell forward start ${chain.forwardTarget} ${sandboxName}`,
+      : (customRuntimeHints?.dashboard ??
+        `Port forward on ${chain.port} is not working. Run: openshell forward start ${chain.forwardTarget} ${sandboxName}`),
   });
 
+  // 3b. Agent OpenAI-compatible API reachable from the host (second port
+  // forward). Skipped for agents that publish no separate API port, so the
+  // OpenClaw path keeps exactly one host probe. A dead host forward cannot be
+  // repaired by retrying when the sandbox gateway itself never came up, so it
+  // shares the dashboard's collapsed retry budget in that case.
+  const agentApi = hasSeparateAgentApiPort(chain)
+    ? await verifyAgentApiFromHost(chain, deps, dashboardRetryDelays, sleep)
+    : null;
+  if (agentApi) {
+    diagnostics.push({
+      link: "api",
+      status: agentApi.reachable ? "ok" : "fail",
+      detail: agentApi.detail,
+      hint: agentApi.reachable
+        ? ""
+        : `The OpenAI-compatible API on port ${chain.gatewayPort} is not reachable from the host. ` +
+          `Run: openshell forward start --background ${chain.gatewayPort} ${sandboxName}`,
+    });
+  }
+
   // 4. Inference route
-  const inference = verifyInferenceRoute(sandboxName, deps);
+  const inference = await verifyInferenceRoute(
+    sandboxName,
+    deps,
+    gateway.reachable ? retryDelaysMs : [],
+    sleep,
+  );
+  const inferenceRouteWorking = inference.status === "ok";
   diagnostics.push({
     link: "inference",
-    status: inference.working ? "ok" : "warn",
+    status: inference.status === "ok" ? "ok" : "fail",
     detail: inference.detail,
-    hint: inference.working
-      ? ""
-      : "The inference proxy may not be ready yet. Try: nemoclaw <sandbox> status (it may take a few seconds after creation).",
+    hint:
+      inference.status === "ok"
+        ? ""
+        : inference.status === "unhealthy"
+          ? "The inference route is reachable but the endpoint returned a server error (HTTP 5xx). If the endpoint runs on the host, configure it to listen on a host address reachable through host.openshell.internal and restrict access with the host firewall or equivalent controls; a 127.0.0.1/localhost-only bind is not reachable from the sandbox. Then re-run: nemoclaw <sandbox> status."
+          : "The inference proxy is unreachable. Confirm the configured endpoint is running and reachable from the sandbox, then re-run: nemoclaw <sandbox> status.",
   });
 
   // 5. Messaging bridges (providers attached AND runtime config exposes
@@ -515,17 +649,22 @@ export async function verifyDeployment(
   const verification: DeploymentVerification = {
     gatewayReachable: gateway.reachable,
     gatewayVersion,
-    inferenceRouteWorking: inference.working,
+    inferenceRouteWorking,
     dashboardReachable: dashboard.reachable,
+    agentApiReachable: agentApi ? agentApi.reachable : null,
     messagingBridgesHealthy: messaging.healthy,
     messagingRuntimeChannelsMissing: messaging.runtimeMissing,
     messagingConfigChannelsMissing: messaging.configMissing,
     accessMethod,
   };
 
-  // Healthy = gateway reachable AND dashboard reachable from host.
-  // Inference and messaging are warn-level (non-blocking).
-  const healthy = gateway.reachable && dashboard.reachable;
+  // An unreachable agent API forward is a failed deployment, not a warning:
+  // onboarding prints that endpoint as the way to use the sandbox (#9290).
+  const healthy =
+    gateway.reachable &&
+    dashboard.reachable &&
+    (agentApi?.reachable ?? true) &&
+    inference.status === "ok";
 
   return { healthy, verification, diagnostics };
 }
@@ -545,7 +684,9 @@ export function formatVerificationDiagnostics(result: VerifyDeploymentResult): s
   const RESET = "\x1b[0m";
 
   if (result.healthy) {
-    lines.push(`  ${G}✓${RESET} Deployment verified — gateway and dashboard are healthy.`);
+    lines.push(
+      `  ${G}✓${RESET} Deployment verified — gateway, dashboard, and inference route are healthy.`,
+    );
     if (result.verification.gatewayVersion) {
       lines.push(`    OpenClaw version: ${result.verification.gatewayVersion}`);
     }

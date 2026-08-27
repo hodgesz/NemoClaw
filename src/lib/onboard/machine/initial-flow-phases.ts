@@ -3,8 +3,10 @@
 
 import { spawnSync } from "node:child_process";
 import type { GatewayReuseState } from "../../state/gateway";
+import { type GatewayOwner, isExternallySupervised } from "../gateway-ownership";
 import { formatSandboxGpuPassthroughNote } from "../sandbox-gpu-notes";
 import type { OnboardFlowContext } from "./flow-context";
+import { UnexpectedOnboardFlowSliceStateError } from "./flow-slice-error";
 import { runInitialOnboardFlowSequence } from "./flow-slices";
 import { type GatewayStateOptions, handleGatewayState } from "./handlers/gateway";
 import {
@@ -13,10 +15,13 @@ import {
   type PreflightSandboxGpuFlag,
   type PreflightStateOptions,
 } from "./handlers/preflight";
-import { runLiveOnboardFlowSlice } from "./live-flow-slice";
-import type { OnboardStateResult } from "./result";
+import {
+  type OnboardPrerequisiteRepairEventRecorder,
+  runOnboardPrerequisiteRepair,
+} from "./prerequisite-repair";
 import type { OnboardMachineRunnerResult, OnboardMachineRunnerRuntime } from "./runner";
 import type { OnboardSequencePhase } from "./sequence-runner";
+import type { OnboardMachineState } from "./types";
 
 export type InitialOnboardFlowContext<
   Agent,
@@ -28,6 +33,13 @@ export type InitialOnboardFlowContext<
 };
 
 type SpawnSync = typeof spawnSync;
+
+export function getInitialGatewayReuseStateForOwner(
+  owner: GatewayOwner,
+  getManagedReuseState: () => GatewayReuseState,
+): GatewayReuseState {
+  return isExternallySupervised(owner) ? "missing" : getManagedReuseState();
+}
 
 export interface InitialOnboardFlowPhaseOptions<
   Context extends InitialOnboardFlowContext<Agent, Gpu, Config>,
@@ -41,14 +53,26 @@ export interface InitialOnboardFlowPhaseOptions<
   sandboxGpuDevice?: string | null;
   gpuRequested: boolean;
   noGpu: boolean;
+  allowDeferredN1xManagedVllm?: boolean;
   env: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   recordedGpuPassthroughBeforePreflight: boolean;
+  /** Commit any provider lifecycle transition only after preflight admission. */
+  commitSelectedAgentTransition?(): Promise<import("../../state/onboard-session").Session>;
   ensureResumePreflightDashboardPortAvailable(): void;
-  preflightDeps: PreflightStateOptions<Gpu, SandboxEntry, Host, Config>["deps"];
+  preflightDeps: Omit<
+    PreflightStateOptions<Gpu, SandboxEntry, Host, Config>["deps"],
+    "assertGatewayReadiness"
+  >;
   getInitialGatewayReuseState(): GatewayReuseState;
+  assertGatewayReadiness(): Promise<void>;
   gatewayName: string;
+  bindPolicyAuthority(
+    gatewayName: string,
+    session: import("../../state/onboard-session").Session | null,
+  ): Promise<import("../../state/onboard-session").Session | null>;
   recreateSandbox(): boolean;
+  requiresBindMounts?: boolean;
   gatewayDeps: GatewayStateOptions<Gpu>["deps"];
   note(message: string): void;
   spawnSync?: SpawnSync;
@@ -125,10 +149,17 @@ export function createInitialOnboardFlowPhases<
         sandboxGpuDevice: options.sandboxGpuDevice ?? null,
         gpuRequested: options.gpuRequested,
         noGpu: options.noGpu,
+        allowDeferredN1xManagedVllm: options.allowDeferredN1xManagedVllm,
         env: options.env,
-        deps: options.preflightDeps,
+        deps: {
+          ...options.preflightDeps,
+          assertGatewayReadiness: options.assertGatewayReadiness,
+        },
       });
       if (context.resume) options.ensureResumePreflightDashboardPortAvailable();
+      const transitionedSession = options.commitSelectedAgentTransition
+        ? await options.commitSelectedAgentTransition()
+        : preflightResult.session;
 
       const preflightGpu = preflightResult.gpu ?? null;
       emitPreflightGpuNote({
@@ -146,7 +177,7 @@ export function createInitialOnboardFlowPhases<
       return {
         context: {
           ...context,
-          session: preflightResult.session,
+          session: transitionedSession,
           gpu: preflightGpu,
           sandboxGpuConfig: preflightResult.sandboxGpuConfig,
           gpuPassthrough: preflightResult.gpuPassthrough,
@@ -161,20 +192,33 @@ export function createInitialOnboardFlowPhases<
   const gatewayPhase: OnboardSequencePhase<Context> = {
     state: "gateway",
     async run(context) {
+      // Resolve authority before the managed-only reuse helper can select a
+      // gateway or mutate OPENSHELL_GATEWAY. External attachment revalidates
+      // the same owner again at the effect edge.
+      const owner = options.gatewayDeps.resolveGatewayOwner();
+      await options.assertGatewayReadiness();
       const gatewayResult = await handleGatewayState({
         resume: context.resume,
         session: context.session,
-        initialGatewayReuseState: options.getInitialGatewayReuseState(),
+        initialGatewayReuseState: getInitialGatewayReuseStateForOwner(
+          owner,
+          options.getInitialGatewayReuseState,
+        ),
         gpu: context.gpu as Gpu,
         gpuPassthrough: context.gpuPassthrough,
         gatewayName: options.gatewayName,
         recordedSandboxName: context.recordedSandboxName,
         requestedSandboxName: context.requestedSandboxName,
         recreateSandbox: options.recreateSandbox(),
+        requiresBindMounts: options.requiresBindMounts === true,
         deps: options.gatewayDeps,
       });
+      const policySession = await options.bindPolicyAuthority(
+        options.gatewayName,
+        gatewayResult.session,
+      );
       return {
-        context: { ...context, session: gatewayResult.session },
+        context: { ...context, session: policySession },
         result: gatewayResult.stateResult,
       };
     },
@@ -188,42 +232,64 @@ export async function runInitialOnboardFlowSlice<Context extends OnboardFlowCont
   runtime: OnboardMachineRunnerRuntime;
   phases: readonly OnboardSequencePhase<Context>[];
   resume: boolean;
-  recordStateResult(result: OnboardStateResult): Promise<unknown>;
+  recordRepairEvent: OnboardPrerequisiteRepairEventRecorder;
 }): Promise<OnboardMachineRunnerResult<Context>> {
-  // Compatibility bridge for live resume repair when durable machine snapshots
-  // are already downstream of this slice even though preflight/gateway host
-  // backstops must still re-run. Those ahead-state snapshots can come from
-  // legacy/test step mutation that explicitly opts into `updateMachine === true`
-  // or from repaired-resume replay of persisted sessions. This slice cannot
-  // eliminate that source locally because the host backstop checks are still
-  // modeled as imperative resume work rather than strict FSM recovery states.
-  // The tolerated downstream family is every nonterminal state after the initial
-  // slice: inference, sandbox, openclaw/agent_setup, policies, finalizing, and
-  // post_verify. Phase tests cover ahead-state resume and terminal-state
-  // rejection; remove this fallback once those repair/backstop checks are
-  // modeled as strict FSM recovery states and legacy machine step mutation is
-  // gone.
-  return runLiveOnboardFlowSlice({
+  const durableEntry = await options.runtime.session();
+  const state = durableEntry.machine.state;
+  const resumeAheadStates: readonly OnboardMachineState[] = [
+    "gateway",
+    "provider_selection",
+    "inference",
+    "sandbox",
+    "openclaw",
+    "agent_setup",
+    "policies",
+    "finalizing",
+    "post_verify",
+  ];
+  const allowedStates: readonly OnboardMachineState[] = options.resume
+    ? ["init", "preflight", ...resumeAheadStates]
+    : ["init", "preflight", "gateway", "provider_selection"];
+  if (!allowedStates.includes(state)) {
+    throw new UnexpectedOnboardFlowSliceStateError(
+      state,
+      ["init", "preflight"],
+      allowedStates.filter((candidate) => candidate !== "init" && candidate !== "preflight"),
+    );
+  }
+  if (state === "init" || state === "preflight") {
+    return runInitialOnboardFlowSequence(options);
+  }
+
+  const preflight = options.phases.find((phase) => phase.state === "preflight");
+  const gateway = options.phases.find((phase) => phase.state === "gateway");
+  if (!preflight || !gateway || options.phases.length !== 2) {
+    throw new Error("Expected one preflight phase and one gateway phase");
+  }
+  const preflightRepair = await runOnboardPrerequisiteRepair({
     context: options.context,
+    durableEntryState: state,
+    phase: preflight,
+    expectedFinalStates: ["gateway"],
+    repair: "initial-flow-prerequisite",
     runtime: options.runtime,
-    phases: options.phases,
-    runWhenState: ["init", "preflight"],
-    compatibilityWhenState: options.resume
-      ? [
-          "init",
-          "preflight",
-          "gateway",
-          "provider_selection",
-          "inference",
-          "sandbox",
-          "openclaw",
-          "agent_setup",
-          "policies",
-          "finalizing",
-          "post_verify",
-        ]
-      : ["gateway", "provider_selection"],
-    runSlice: runInitialOnboardFlowSequence,
-    applyCompatibleResult: options.recordStateResult,
+    recordRepairEvent: options.recordRepairEvent,
   });
+  if (state === "gateway") {
+    return runInitialOnboardFlowSequence({
+      context: preflightRepair.context,
+      runtime: options.runtime,
+      phases: options.phases,
+    });
+  }
+  const gatewayRepair = await runOnboardPrerequisiteRepair({
+    context: preflightRepair.context,
+    durableEntryState: state,
+    phase: gateway,
+    expectedFinalStates: ["provider_selection"],
+    repair: "initial-flow-prerequisite",
+    runtime: options.runtime,
+    recordRepairEvent: options.recordRepairEvent,
+  });
+  return { context: gatewayRepair.context, session: await options.runtime.session() };
 }

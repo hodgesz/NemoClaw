@@ -13,9 +13,10 @@
     "changedFiles",
     "summary",
     "findings",
+    "terminologyReview",
     "acceptanceCoverage",
-    "securityCategories",
     "sourceOfTruthReview",
+    "e2e",
     "testDepth",
     "positives",
     "reviewCompleteness"
@@ -34,11 +35,10 @@
       "required": ["recommendation", "confidence", "oneLine"],
       "properties": {
         "recommendation": {
+          "description": "Advisor finding-ledger posture only. Use merge_as_is for a completed, non-low-confidence review with no open findings, merge_after_fixes when open findings remain, superseded when competing work replaces this PR, and info_only only for skipped, unavailable, incomplete, or low-confidence review evidence. This field never grants merge authority or replaces human review.",
           "enum": [
             "merge_as_is",
             "merge_after_fixes",
-            "needs_rework",
-            "blocked",
             "superseded",
             "info_only"
           ]
@@ -63,6 +63,25 @@
       "type": "array",
       "items": { "$ref": "#/$defs/finding" }
     },
+    "terminologyReview": {
+      "description": "Canonical semantic terminology receipt. It is advisory and does not change the merge recommendation by itself.",
+      "type": "object",
+      "required": ["status", "decisions", "noChangesReason"],
+      "properties": {
+        "status": { "enum": ["clear", "candidates", "limited"] },
+        "decisions": {
+          "type": "array",
+          "maxItems": 20,
+          "items": { "$ref": "#/$defs/terminologyDecision" }
+        },
+        "noChangesReason": {
+          "type": ["string", "null"],
+          "maxLength": 2000,
+          "pattern": "^[^\\r\\n]*$"
+        }
+      },
+      "additionalProperties": false
+    },
     "acceptanceCoverage": {
       "type": "array",
       "items": {
@@ -76,19 +95,6 @@
         "additionalProperties": false
       }
     },
-    "securityCategories": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["category", "verdict", "justification"],
-        "properties": {
-          "category": { "type": "string" },
-          "verdict": { "enum": ["pass", "warning", "fail"] },
-          "justification": { "type": "string" }
-        },
-        "additionalProperties": false
-      }
-    },
     "sourceOfTruthReview": {
       "type": "array",
       "items": {
@@ -96,6 +102,7 @@
         "required": [
           "surface",
           "status",
+          "findingId",
           "invalidState",
           "sourceBoundary",
           "whyNotSourceFix",
@@ -106,11 +113,12 @@
         "properties": {
           "surface": { "type": "string" },
           "status": {
-            "enum": [
-              "not_applicable",
-              "satisfied",
-              "needs_followup",
-              "missing"
+            "enum": ["not_applicable", "satisfied", "needs_followup", "missing"]
+          },
+          "findingId": {
+            "anyOf": [
+              { "type": "string", "pattern": "^F-[0-9]+$" },
+              { "type": "null" }
             ]
           },
           "invalidState": { "type": "string" },
@@ -123,12 +131,96 @@
         "additionalProperties": false
       }
     },
+    "e2e": {
+      "type": "object",
+      "required": ["coverage", "targets"],
+      "properties": {
+        "coverage": {
+          "type": "object",
+          "required": [
+            "classifiedDomains",
+            "requiredTests",
+            "optionalTests",
+            "newE2eRecommendations",
+            "noE2eReason",
+            "confidence"
+          ],
+          "properties": {
+            "classifiedDomains": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/e2eDomain" }
+            },
+            "requiredTests": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/e2eTest" }
+            },
+            "optionalTests": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/e2eTest" }
+            },
+            "newE2eRecommendations": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/e2eNewRecommendation" }
+            },
+            "noE2eReason": {
+              "type": ["string", "null"],
+              "maxLength": 2000,
+              "pattern": "^[^\\r\\n]*$"
+            },
+            "confidence": { "enum": ["low", "medium", "high"] }
+          },
+          "additionalProperties": false
+        },
+        "targets": {
+          "type": "object",
+          "required": [
+            "relevantChangedFiles",
+            "changedCredentialFreeTests",
+            "required",
+            "optional",
+            "noTargetE2eReason",
+            "confidence"
+          ],
+          "properties": {
+            "relevantChangedFiles": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "changedCredentialFreeTests": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/e2eChangedCredentialFreeTest" }
+            },
+            "required": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/e2eTargetRecommendation" }
+            },
+            "optional": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/e2eTargetRecommendation" }
+            },
+            "noTargetE2eReason": {
+              "type": ["string", "null"],
+              "maxLength": 2000,
+              "pattern": "^[^\\r\\n]*$"
+            },
+            "confidence": { "enum": ["low", "medium", "high"] }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
     "testDepth": {
       "type": "object",
       "required": ["verdict", "rationale", "suggestedTests"],
       "properties": {
         "verdict": {
-          "enum": ["unit_sufficient", "mocks_recommended", "runtime_validation_recommended", "unknown"]
+          "enum": [
+            "unit_sufficient",
+            "mocks_recommended",
+            "runtime_validation_recommended",
+            "unknown"
+          ]
         },
         "rationale": { "type": "string" },
         "suggestedTests": {
@@ -150,12 +242,165 @@
           "type": "array",
           "items": { "type": "string" }
         },
-        "requiresHumanReview": { "type": "boolean" }
+        "requiresHumanReview": { "type": "boolean", "const": true }
       },
       "additionalProperties": false
     }
   },
   "$defs": {
+    "terminologyDecision": {
+      "type": "object",
+      "required": [
+        "id",
+        "term",
+        "change",
+        "disposition",
+        "meaning",
+        "contrast",
+        "existingTerm",
+        "semanticImpact",
+        "recommendation",
+        "traceId",
+        "source"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^T-[0-9]+$" },
+        "term": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "pattern": "^[^\\r\\n]*$"
+        },
+        "change": { "enum": ["introduced", "expanded", "redefined"] },
+        "disposition": {
+          "enum": ["established", "justified", "define", "replace", "conflict"]
+        },
+        "meaning": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "contrast": { "type": ["string", "null"], "maxLength": 2000 },
+        "existingTerm": { "type": ["string", "null"], "maxLength": 2000 },
+        "semanticImpact": {
+          "enum": ["none", "behavior", "security", "support", "evidence", "test", "release"]
+        },
+        "recommendation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "^[^\\r\\n]*$"
+        },
+        "traceId": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "source": {
+          "type": "object",
+          "required": ["file", "line", "headSha"],
+          "properties": {
+            "file": { "type": "string", "minLength": 1, "maxLength": 500 },
+            "line": { "type": "integer", "minimum": 1 },
+            "headSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "e2eDomain": {
+      "type": "object",
+      "required": ["domain", "reason", "confidence", "matchedFiles"],
+      "properties": {
+        "domain": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "^[^\\r\\n]*$"
+        },
+        "confidence": { "enum": ["low", "medium", "high"] },
+        "matchedFiles": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 500 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "e2eTest": {
+      "type": "object",
+      "required": ["id", "reason"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "maxLength": 120
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "^[^\\r\\n]*$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "e2eNewRecommendation": {
+      "type": "object",
+      "required": ["domain", "reason", "suggestedTest", "priority"],
+      "properties": {
+        "domain": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "^[^\\r\\n]*$"
+        },
+        "suggestedTest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "^[^\\r\\n]*$"
+        },
+        "priority": { "enum": ["low", "medium", "high"] }
+      },
+      "additionalProperties": false
+    },
+    "e2eTargetRecommendation": {
+      "type": "object",
+      "required": ["id", "workflow", "selectorType", "required", "reason"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "maxLength": 120
+        },
+        "workflow": { "type": "string", "const": "e2e.yaml" },
+        "selectorType": { "enum": ["all", "target", "job"] },
+        "required": { "type": "boolean" },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "^[^\\r\\n]*$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "e2eChangedCredentialFreeTest": {
+      "type": "object",
+      "required": ["id", "file", "headSha"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "maxLength": 120
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^test/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+\\.test\\.(?:js|ts)$",
+          "maxLength": 500
+        },
+        "headSha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      },
+      "additionalProperties": false
+    },
     "finding": {
       "type": "object",
       "required": [
@@ -200,7 +445,13 @@
     },
     "simplification": {
       "type": "object",
-      "required": ["tag", "cut", "replacement", "estimatedNetLines", "safetyBoundary"],
+      "required": [
+        "tag",
+        "cut",
+        "replacement",
+        "estimatedNetLines",
+        "safetyBoundary"
+      ],
       "properties": {
         "tag": { "enum": ["delete", "stdlib", "native", "yagni", "shrink"] },
         "cut": { "type": "string" },

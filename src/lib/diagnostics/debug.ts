@@ -7,6 +7,7 @@ import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { dockerExecFileSync } from "../adapters/docker/exec";
+import { openshellSandboxSshHost } from "../adapters/openshell/sandbox-ssh-host";
 import { DASHBOARD_PORT } from "../core/ports";
 import { listSandboxes } from "../state/registry";
 import { createTarball as createDiagnosticsTarball } from "./tarball";
@@ -55,9 +56,15 @@ function section(title: string): void {
 // Secret redaction — delegates to unified redact module (#2381).
 // ---------------------------------------------------------------------------
 
-import { redactFull as redact } from "../security/redact";
+import { redactFullWithUrls } from "../security/redact";
 
-export { redact };
+/**
+ * Redact collected diagnostics before they are written to the bundle or
+ * echoed to the terminal.
+ */
+export function redact(text: string): string {
+  return redactFullWithUrls(text);
+}
 
 // ---------------------------------------------------------------------------
 // Command runner
@@ -399,7 +406,7 @@ function collectSandboxInternals(collectDir: string, sandboxName: string, quick:
     }
     writeFileSync(sshConfigPath, sshResult.stdout ?? "");
 
-    const sshHost = `openshell-${sandboxName}`;
+    const sshHost = openshellSandboxSshHost(sandboxName);
     const sshBase = [
       "-F",
       sshConfigPath,

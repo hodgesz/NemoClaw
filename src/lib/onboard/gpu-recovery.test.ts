@@ -14,12 +14,28 @@ import { describe, expect, it, vi } from "vitest";
 import { gpuPassthroughRecoveryLines, reportGpuPassthroughRecovery } from "./gpu-recovery";
 
 describe("gpuPassthroughRecoveryLines", () => {
-  it("never emits a literal `<name>` placeholder for any input", () => {
-    for (const names of [null, [], ["alpha"], ["alpha", "beta"], ["alpha", "beta", "gamma"]]) {
-      const lines = gpuPassthroughRecoveryLines(names);
-      expect(lines.join("\n")).not.toMatch(/<name>/);
-    }
+  it.each(
+    [null, [], ["alpha"], ["alpha", "beta"], ["alpha", "beta", "gamma"]].map(
+      (names) => [names] as const,
+    ),
+  )("never emits a literal `<name>` placeholder for any input [case %#]", (names) => {
+    const lines = gpuPassthroughRecoveryLines(names);
+    expect(lines.join("\n")).not.toMatch(/<name>/);
   });
+
+  // OpenShell dropped `gateway destroy` before 0.0.44 and now rejects it as an
+  // unrecognized subcommand, so the command fails on every OpenShell version
+  // NemoClaw installs (#8139).
+  it.each(
+    [null, [], ["alpha"], ["alpha", "beta"], ["alpha", "beta", "gamma"]].map(
+      (names) => [names] as const,
+    ),
+  )(
+    "omits openshell gateway destroy for every registered-sandbox count [case %#] (#8139)",
+    (names) => {
+      expect(gpuPassthroughRecoveryLines(names).join("\n")).not.toContain("gateway destroy");
+    },
+  );
 
   it("suggests targeted gateway cleanup when no sandboxes are registered (null input)", () => {
     const lines = gpuPassthroughRecoveryLines(null);
@@ -27,13 +43,13 @@ describe("gpuPassthroughRecoveryLines", () => {
     expect(joined).toContain("Existing gateway was started without GPU passthrough");
     expect(joined).toContain("attempted safe gateway replacement automatically");
     expect(joined).toContain("openshell gateway remove nemoclaw");
-    expect(joined).toContain("openshell gateway destroy -g nemoclaw");
-    expect(joined).toContain("sudo pkill -f openshell-gateway");
+    expect(joined).toContain("do not use a host-wide process match");
+    expect(joined).toContain("PID file, runtime marker, and loaded sandbox namespace");
+    expect(joined).not.toContain("pkill");
     expect(joined).toContain("nemoclaw onboard --gpu");
     expect(joined).not.toContain("nemoclaw uninstall");
     // Must NOT suggest the per-sandbox `nemoclaw <name> destroy` form — there
-    // is nothing to destroy. (`openshell gateway destroy -g` is fine; it's
-    // the legacy gateway-lifecycle verb, not a sandbox destroy.)
+    // is nothing to destroy.
     expect(joined).not.toMatch(/nemoclaw [a-z-]+ destroy/);
   });
 

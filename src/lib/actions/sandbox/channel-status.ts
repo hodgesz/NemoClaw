@@ -15,25 +15,30 @@ import { type AgentDefinition, loadAgent } from "../../agent/defs";
 import { CLI_DISPLAY_NAME, CLI_NAME } from "../../cli/branding";
 import { B, D, G, R, RD, YW } from "../../cli/terminal-style";
 import {
-  collectBuiltInMessagingChannelDiagnostics,
-  type MessagingChannelDiagnosticSpec,
-} from "../../messaging/diagnostics";
-import {
   createBuiltInChannelManifestRegistry,
   getMessagingManifestAvailabilityContext,
 } from "../../messaging";
-import * as policies from "../../policy";
 import {
+  type ChannelHealthReport,
+  type ChannelReadiness,
+  type ChannelReadinessCategory,
+  channelHealthProbeInputs,
+  DEFAULT_CHANNEL_STATUS_HEALTH_TIMEOUT_MS,
   type DiagnosticSeverity,
   type DiagnosticSignal,
-  evaluateWhatsappDiagnostics,
-  parseWhatsappHeartbeat,
-  summarizeWhatsappLogLines,
-  type WhatsappDiagnosticReport,
-  type WhatsappHeartbeat,
-  type WhatsappProbeInput,
-} from "../../sandbox/whatsapp-diagnostics";
+} from "../../messaging/channels/channel-health";
+import {
+  collectBuiltInMessagingChannelDiagnostics,
+  type MessagingChannelDiagnosticSpec,
+} from "../../messaging/diagnostics";
+import { createBuiltInMessagingHookRegistry } from "../../messaging/hooks";
+import {
+  readChannelHealthOutputs,
+  runMessagingStatusHooks,
+} from "../../messaging/hooks/status-runner";
+import * as policies from "../../policy";
 import * as registry from "../../state/registry";
+import { buildConfigStatusSignals } from "./channel-status-config";
 
 // runner.ts (which process-recovery transitively depends on) uses a few CJS
 // `require()` calls that vitest's CLI-test project cannot resolve at import
@@ -42,15 +47,6 @@ import * as registry from "../../state/registry";
 function loadProcessRecovery(): typeof import("./process-recovery") {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   return require("./process-recovery") as typeof import("./process-recovery");
-}
-
-// Inline single-quote shell quoting — the probe script only ever quotes
-// trusted path strings derived from the agent manifest (`configDir/...`),
-// so we don't need the full quoting matrix from `runner.shellQuote`. Keep
-// the implementation tiny and avoid the runner import so the orchestrator
-// stays loadable from unit tests.
-function quotePath(value: string): string {
-  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 type ExecRunner = (
@@ -67,15 +63,20 @@ type StatusDeps = {
   loadAgent?: (name: string) => AgentDefinition;
   getSandbox?: typeof registry.getSandbox;
   getAppliedPresets?: (sandboxName: string) => string[];
-  getGatewayPresets?: (sandboxName: string) => string[] | null;
+  getGatewayPresets?: (sandboxName: string, timeoutMs?: number) => string[] | null;
   execSandbox?: ExecRunner;
   now?: () => Date;
+  nowMs?: () => number;
+  sleep?: (milliseconds: number) => Promise<void>;
   out?: (line: string) => void;
 };
 
 export type ChannelStatusOptions = {
   channel?: string;
   asJson?: boolean;
+  wait?: boolean;
+  timeoutSeconds?: number;
+  pollIntervalMs?: number;
   // When true the action returns the report instead of printing JSON to
   // stdout. The oclif wrapper sets this so the framework's --json handler
   // owns serialization; without it we would print JSON twice.
@@ -83,30 +84,60 @@ export type ChannelStatusOptions = {
   deps?: StatusDeps;
 };
 
-export type ChannelStatusReport =
-  | { schemaVersion: 1; sandbox: string; channel: string; report: WhatsappDiagnosticReport }
+type ChannelStatusDetailedReport = {
+  schemaVersion: 1;
+  sandbox: string;
+  channel: string;
+  report: ChannelHealthReport;
+};
+
+type ChannelStatusBasicReport = {
+  schemaVersion: 1;
+  sandbox: string;
+  channel: string;
+  verdict: "info";
+  signals: DiagnosticSignal[];
+};
+
+type ChannelStatusSingleReport = ChannelStatusDetailedReport | ChannelStatusBasicReport;
+
+type ChannelStatusSnapshotReport =
+  | ChannelStatusSingleReport
   | {
       schemaVersion: 1;
       sandbox: string;
-      channel: string;
-      verdict: "info";
-      signals: DiagnosticSignal[];
+      channels: ChannelStatusSingleReport[];
     };
 
-// Bound how long we are willing to block inside an `openshell sandbox exec`
-// for the inline diagnostic snippet. WhatsApp's bridge sometimes goes
-// unresponsive when the Noise WebSocket is stuck; a fast hard cap keeps
-// channels status from inheriting that hang.
-const WHATSAPP_PROBE_TIMEOUT_MS = 8_000;
+export type ChannelStatusWaitState = "ready" | "terminal" | "timeout";
+
+export type ChannelStatusWaitReport = {
+  schemaVersion: 1;
+  sandbox: string;
+  channel: string;
+  status: ChannelStatusSingleReport;
+  readiness: {
+    state: ChannelStatusWaitState;
+    category: ChannelReadinessCategory | "timeout" | null;
+    reason: string;
+    retryable: boolean;
+    attempts: number;
+    elapsedMs: number;
+    lastTransitionAt: string | null;
+    lastObserved: ChannelReadiness;
+  };
+};
+
+export type ChannelStatusReport = ChannelStatusSnapshotReport | ChannelStatusWaitReport;
+
+const DEFAULT_WAIT_TIMEOUT_SECONDS = 180;
+const DEFAULT_WAIT_POLL_INTERVAL_MS = 5_000;
 const CHANNEL_STATUS_DIAGNOSTICS = collectBuiltInMessagingChannelDiagnostics();
 const channelManifestRegistry = createBuiltInChannelManifestRegistry();
 
-const SHELL_OK = "NEMOCLAW_WA_DIAG_OK";
-const HEARTBEAT_BEGIN = "NEMOCLAW_WA_HEARTBEAT_BEGIN";
-const HEARTBEAT_END = "NEMOCLAW_WA_HEARTBEAT_END";
-const LOG_BEGIN = "NEMOCLAW_WA_LOG_BEGIN";
-const LOG_END = "NEMOCLAW_WA_LOG_END";
-const PROC_DONE = "NEMOCLAW_WA_PROC_DONE";
+function positiveNumber(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
 
 function severityLabel(severity: DiagnosticSeverity): string {
   switch (severity) {
@@ -138,6 +169,10 @@ function defaultDeps(deps: StatusDeps | undefined): Required<StatusDeps> {
     getGatewayPresets: deps?.getGatewayPresets ?? policies.getGatewayPresets,
     execSandbox: deps?.execSandbox ?? defaultExec,
     now: deps?.now ?? (() => new Date()),
+    nowMs: deps?.nowMs ?? Date.now,
+    sleep:
+      deps?.sleep ??
+      ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))),
     out: deps?.out ?? ((line: string) => console.log(line)),
   };
 }
@@ -152,269 +187,6 @@ function diagnosticChannelNames(): string[] {
   return CHANNEL_STATUS_DIAGNOSTICS.map((diagnostic) => diagnostic.channelId);
 }
 
-function selectDefaultChannel(configuredChannels: readonly string[]): string {
-  const preferredConfigured = configuredChannels.find(
-    (channel) => getChannelStatusDiagnostic(channel)?.preferredDefault === true,
-  );
-  if (preferredConfigured) return preferredConfigured;
-  if (configuredChannels.length > 0) return configuredChannels[0];
-  return (
-    CHANNEL_STATUS_DIAGNOSTICS.find((diagnostic) => diagnostic.preferredDefault)?.channelId ??
-    CHANNEL_STATUS_DIAGNOSTICS[0]?.channelId ??
-    ""
-  );
-}
-
-function resolveStateDirs(agent: AgentDefinition): string[] {
-  const configDir = agent.configPaths?.dir;
-  if (!configDir) return [];
-  const stateDirs = new Set(agent.stateDirs ?? []);
-  // The two known WhatsApp bridge layouts:
-  //   OpenClaw: <configDir>/whatsapp
-  //   Hermes:   <configDir>/platforms/whatsapp/session
-  // We probe the session subdirectory for Hermes because the agent manifest
-  // pre-creates the parent `platforms/whatsapp` directory at provisioning
-  // time so the state_dirs backup can preserve it across rebuilds. A fresh
-  // unpaired sandbox therefore already has a non-empty `platforms/whatsapp`
-  // directory — only the `session` subdir is created after a successful
-  // QR pairing.
-  const candidates: string[] = [];
-  if (stateDirs.has("whatsapp")) candidates.push(`${configDir}/whatsapp`);
-  if (stateDirs.has("platforms")) candidates.push(`${configDir}/platforms/whatsapp/session`);
-  if (candidates.length === 0) {
-    // Fallback: probe both shapes even when the manifest does not declare
-    // the dir — best-effort but safe because non-existent paths just yield
-    // "missing" probe output.
-    candidates.push(`${configDir}/whatsapp`, `${configDir}/platforms/whatsapp/session`);
-  }
-  return Array.from(new Set(candidates));
-}
-
-function buildProbeScript(stateDirs: readonly string[]): string {
-  // The script:
-  //  1. Marks success with SHELL_OK so we can disambiguate "exec failed" from
-  //     "exec succeeded but produced nothing".
-  //  2. Lists each candidate state directory and emits a single "POPULATED"
-  //     or "EMPTY" / "MISSING" line per dir.
-  //  3. Cats the first heartbeat-shaped file it finds, wrapped in begin/end
-  //     markers so the parser can extract it without parsing find output.
-  //  4. Tails up to 200 lines of bridge log files and forwards only short
-  //     lines that match the diagnostic regex set. The host parser further
-  //     filters to summary phrases.
-  //  5. Runs pgrep for known bridge process names, then filters out the probe
-  //     shell itself and the pgrep call so the diagnostic does not report a
-  //     bridge as "running" when the only match is our own command line.
-  // The script is joined with newlines so the embedded `for` / `if`
-  // constructs parse as compound statements. Joining the whole thing with
-  // ` && ` corrupts the grammar (e.g. `do && if`), which `/bin/sh` rejects
-  // before the SHELL_OK marker prints and every live probe gets misread as
-  // unreachable. The leading `set +e` makes the probe survive missing log
-  // files and empty pgrep matches without aborting at the first non-zero
-  // exit.
-  const quotedDirs = stateDirs.map(quotePath).join(" ");
-  return [
-    `set +e`,
-    `printf '%s\\n' ${quotePath(SHELL_OK)}`,
-    `for dir in ${quotedDirs}; do`,
-    `  if [ ! -d "$dir" ]; then printf 'DIR %s MISSING\\n' "$dir"; continue; fi`,
-    `  if [ -z "$(ls -A "$dir" 2>/dev/null)" ]; then`,
-    `    printf 'DIR %s EMPTY\\n' "$dir"`,
-    `  else`,
-    `    printf 'DIR %s POPULATED\\n' "$dir"`,
-    `  fi`,
-    `done`,
-    `for dir in ${quotedDirs}; do`,
-    `  for candidate in heartbeat.json status.json health.json bridge-status.json; do`,
-    `    if [ -f "$dir/$candidate" ]; then`,
-    `      printf '%s\\n' ${quotePath(HEARTBEAT_BEGIN)}`,
-    `      cat "$dir/$candidate" 2>/dev/null | head -c 8192`,
-    `      printf '\\n%s\\n' ${quotePath(HEARTBEAT_END)}`,
-    `      break 2`,
-    `    fi`,
-    `  done`,
-    `done`,
-    `printf '%s\\n' ${quotePath(LOG_BEGIN)}`,
-    `for dir in ${quotedDirs}; do`,
-    `  for log in "$dir"/*.log "$dir"/logs/*.log; do`,
-    `    [ -f "$log" ] || continue`,
-    `    tail -n 200 "$log" 2>/dev/null | grep -E 'connection\\.(open|close|update|update.*restart)|ws (open|close)|401|unauthorized|qr.*(expired|timeout)|restartRequired|loggedOut|logged out|getMessage' | tail -n 20`,
-    `  done`,
-    `done`,
-    `printf '%s\\n' ${quotePath(LOG_END)}`,
-    `__nemoclaw_wa_self_pid=$$`,
-    // Match both process-name-with-whatsapp and processes whose argv
-    // mentions the WhatsApp state directory or known plugin paths. A
-    // bridge that runs inside the parent agent process (e.g. an OpenClaw
-    // plugin loaded via a generic `node` entry point) usually carries the
-    // platforms/whatsapp path on its command line via `--state-dir` or
-    // similar.
-    `pgrep -fa 'whatsapp|baileys|platforms/whatsapp|openclaw-whatsapp|hermes.*whatsapp' 2>/dev/null | awk -v self="$__nemoclaw_wa_self_pid" '$1 != self && $0 !~ /pgrep -fa/ && $0 !~ /NEMOCLAW_WA_DIAG_OK/ { print "PROC " $0 }' | head -n 5`,
-    // Always emit PROC_DONE after the pgrep pipeline so the parser can tell
-    // apart "pgrep completed with no matches" (the bridge runs under a
-    // process name that does not contain `whatsapp` or `baileys`, or has
-    // crashed) from "the probe never reached pgrep" (script aborted
-    // mid-flight). Without this marker both cases collapse to `null`.
-    `printf '%s\\n' ${quotePath(PROC_DONE)}`,
-  ].join("\n");
-}
-
-type ParsedProbe = {
-  reachable: boolean;
-  stateDirPopulated: boolean | null;
-  heartbeatRaw: string | null;
-  logLines: string[];
-  bridgeProcessAlive: boolean | null;
-};
-
-function parseProbeOutput(stdout: string): ParsedProbe {
-  const lines = stdout.split(/\r?\n/);
-  if (!lines.includes(SHELL_OK)) {
-    return {
-      reachable: false,
-      stateDirPopulated: null,
-      heartbeatRaw: null,
-      logLines: [],
-      bridgeProcessAlive: null,
-    };
-  }
-  let stateDirPopulated: boolean | null = false;
-  let sawAnyDir = false;
-  let heartbeatRaw: string | null = null;
-  let inHeartbeat = false;
-  let inLogs = false;
-  const heartbeatBuf: string[] = [];
-  const logLines: string[] = [];
-  let sawProcMatch = false;
-  let sawProcDone = false;
-
-  for (const line of lines) {
-    if (line === HEARTBEAT_BEGIN) {
-      inHeartbeat = true;
-      continue;
-    }
-    if (line === HEARTBEAT_END) {
-      inHeartbeat = false;
-      heartbeatRaw = heartbeatBuf.join("\n").trim();
-      continue;
-    }
-    if (line === LOG_BEGIN) {
-      inLogs = true;
-      continue;
-    }
-    if (line === LOG_END) {
-      inLogs = false;
-      continue;
-    }
-    if (inHeartbeat) {
-      heartbeatBuf.push(line);
-      continue;
-    }
-    if (inLogs) {
-      const trimmed = line.trim();
-      if (trimmed.length > 0) logLines.push(trimmed);
-      continue;
-    }
-    const dirMatch = line.match(/^DIR\s+\S+\s+(MISSING|EMPTY|POPULATED)$/);
-    if (dirMatch) {
-      sawAnyDir = true;
-      if (dirMatch[1] === "POPULATED") stateDirPopulated = true;
-      continue;
-    }
-    if (line.startsWith("PROC ")) {
-      sawProcMatch = true;
-      continue;
-    }
-    if (line === PROC_DONE) {
-      sawProcDone = true;
-      continue;
-    }
-  }
-  // Three states:
-  //   true  → pgrep printed at least one matching process
-  //   false → pgrep completed with no matches; either the bridge is dead
-  //           OR it runs inside the parent agent process under a name that
-  //           does not contain `whatsapp`/`baileys`. The evaluator resolves
-  //           that ambiguity using heartbeat freshness.
-  //   null  → the probe aborted before reaching pgrep (timeout, exec
-  //           failure); we cannot infer anything about the bridge state.
-  let bridgeProcessAliveOut: boolean | null;
-  if (sawProcMatch) {
-    bridgeProcessAliveOut = true;
-  } else if (sawProcDone) {
-    bridgeProcessAliveOut = false;
-  } else {
-    bridgeProcessAliveOut = null;
-  }
-  return {
-    reachable: true,
-    stateDirPopulated: sawAnyDir ? stateDirPopulated : null,
-    heartbeatRaw,
-    logLines,
-    bridgeProcessAlive: bridgeProcessAliveOut,
-  };
-}
-
-function buildWhatsappProbeInput(
-  sandboxName: string,
-  agent: AgentDefinition,
-  deps: Required<StatusDeps>,
-): WhatsappProbeInput {
-  const stateDirs = resolveStateDirs(agent);
-  const script = buildProbeScript(stateDirs);
-  const probedAt = deps.now().toISOString();
-  const exec = deps.execSandbox(sandboxName, script, WHATSAPP_PROBE_TIMEOUT_MS);
-  const parsed = exec
-    ? parseProbeOutput(exec.stdout)
-    : {
-        reachable: false,
-        stateDirPopulated: null,
-        heartbeatRaw: null,
-        logLines: [],
-        bridgeProcessAlive: null,
-      };
-
-  let heartbeat: WhatsappHeartbeat | null = null;
-  let heartbeatParseError: string | null = null;
-  if (parsed.heartbeatRaw) {
-    const parseResult = parseWhatsappHeartbeat(parsed.heartbeatRaw);
-    if ("heartbeat" in parseResult) {
-      heartbeat = parseResult.heartbeat;
-    } else {
-      heartbeatParseError = parseResult.parseError;
-    }
-  }
-
-  const entry = deps.getSandbox(sandboxName);
-  const channelEnabledInRegistry = registry
-    .getConfiguredMessagingChannelsFromEntry(entry)
-    .includes("whatsapp");
-
-  const appliedPresets = deps.getAppliedPresets(sandboxName);
-  const presetInRegistry = appliedPresets.includes("whatsapp");
-  let presetOnGateway: boolean | null = null;
-  try {
-    const gatewayPresets = deps.getGatewayPresets(sandboxName);
-    presetOnGateway = gatewayPresets === null ? null : gatewayPresets.includes("whatsapp");
-  } catch {
-    presetOnGateway = null;
-  }
-
-  return {
-    agent: agent.name,
-    stateDirs,
-    stateDirPopulated: parsed.stateDirPopulated,
-    heartbeat,
-    heartbeatParseError,
-    bridgeProcessAlive: parsed.bridgeProcessAlive,
-    recentLogSignals: summarizeWhatsappLogLines(parsed.logLines),
-    probeReachable: parsed.reachable,
-    probedAt,
-    presetInRegistry,
-    presetOnGateway,
-    channelEnabledInRegistry,
-  };
-}
-
 function renderReport(
   report: ChannelStatusReport,
   asJson: boolean,
@@ -424,8 +196,56 @@ function renderReport(
     deps.out(JSON.stringify(report, null, 2));
     return;
   }
+  if ("readiness" in report) {
+    renderWaitReport(report, deps);
+    return;
+  }
+  if ("channels" in report) {
+    renderAllChannelReport(report, deps);
+    return;
+  }
   deps.out("");
   deps.out(`  ${B}${CLI_DISPLAY_NAME} channels status:${R} ${report.sandbox} / ${report.channel}`);
+  renderSingleChannelSignals(report, deps, { includeDeepDiagnostics: true });
+}
+
+function renderWaitReport(report: ChannelStatusWaitReport, deps: Required<StatusDeps>): void {
+  deps.out("");
+  deps.out(
+    `  ${B}${CLI_DISPLAY_NAME} channels readiness:${R} ${report.sandbox} / ${report.channel}`,
+  );
+  renderSingleChannelSignals(report.status, deps, { includeDeepDiagnostics: true });
+  const color = report.readiness.state === "ready" ? G : RD;
+  deps.out(`  Readiness: ${color}${report.readiness.state}${R}`);
+  deps.out(
+    `    ${D}${report.readiness.reason}; attempts=${report.readiness.attempts}; elapsedMs=${report.readiness.elapsedMs}${R}`,
+  );
+  deps.out("");
+}
+
+function renderAllChannelReport(
+  report: Extract<ChannelStatusReport, { channels: ChannelStatusSingleReport[] }>,
+  deps: Required<StatusDeps>,
+): void {
+  deps.out("");
+  deps.out(`  ${B}${CLI_DISPLAY_NAME} channels status:${R} ${report.sandbox}`);
+  if (report.channels.length === 0) {
+    deps.out(`    ${severityLabel("info")} Configured channels: none`);
+    deps.out(`         ${D}hint: run \`${CLI_NAME} ${report.sandbox} channels add <channel>\`${R}`);
+    deps.out("");
+    return;
+  }
+  for (const channelReport of report.channels) {
+    deps.out(`  ${B}${channelReport.channel}${R}`);
+    renderSingleChannelSignals(channelReport, deps, { includeDeepDiagnostics: false });
+  }
+}
+
+function renderSingleChannelSignals(
+  report: ChannelStatusSingleReport,
+  deps: Required<StatusDeps>,
+  options: { readonly includeDeepDiagnostics: boolean },
+): void {
   if ("report" in report) {
     deps.out(`  Probed at ${report.report.probedAt} (agent: ${report.report.agent})`);
     deps.out("");
@@ -439,6 +259,8 @@ function renderReport(
         ? G
         : report.report.verdict === "idle" || report.report.verdict === "unpaired"
           ? YW
+          : report.report.verdict === "info"
+            ? D
           : RD;
     deps.out(`  Verdict: ${verdictColor}${report.report.verdict}${R}`);
     for (const hint of report.report.hints) {
@@ -448,16 +270,20 @@ function renderReport(
     return;
   }
   for (const signal of report.signals) {
+    if (!options.includeDeepDiagnostics && signal.label === "Deep diagnostics") continue;
     deps.out(`    ${severityLabel(signal.severity)} ${signal.label}: ${signal.detail}`);
     if (signal.hint) deps.out(`         ${D}hint: ${signal.hint}${R}`);
   }
   deps.out("");
 }
 
-function exitCodeFor(report: ChannelStatusReport): number {
+export function exitCodeFor(report: ChannelStatusReport): number {
+  if ("readiness" in report) return report.readiness.state === "ready" ? 0 : 1;
+  if ("channels" in report) return 0;
   if ("report" in report) {
     switch (report.report.verdict) {
       case "healthy":
+      case "info":
       case "unknown":
         return 0;
       default:
@@ -473,7 +299,8 @@ function buildBasicChannelReport(
   agent: AgentDefinition,
   deps: Required<StatusDeps>,
   diagnostic: MessagingChannelDiagnosticSpec,
-): ChannelStatusReport {
+  options: { readonly includeDeepDiagnostics?: boolean; readonly channelPaused?: boolean } = {},
+): ChannelStatusBasicReport {
   const entry = deps.getSandbox(sandboxName);
   const enabled = registry.getConfiguredMessagingChannelsFromEntry(entry).includes(channelName);
   const disabled = registry.getDisabledMessagingChannelsFromEntry(entry).includes(channelName);
@@ -503,13 +330,32 @@ function buildBasicChannelReport(
       : `${policyLabel} preset not applied`,
     hint: presetInRegistry
       ? undefined
-      : `run \`${CLI_NAME} ${sandboxName} policy-add ${policyPresets[0]}\``,
+      : `run \`${CLI_NAME} ${sandboxName} policy add ${policyPresets[0]}\``,
   });
-  signals.push({
-    label: "Deep diagnostics",
-    severity: "info",
-    detail: `not implemented for ${channelName}; see \`${CLI_NAME} ${sandboxName} doctor\` and \`${CLI_NAME} ${sandboxName} logs --follow\``,
-  });
+  if (enabled) {
+    signals.push(...buildConfigStatusSignals(sandboxName, channelName, entry, agent, deps));
+  }
+  if (diagnostic.deepProbe !== undefined) {
+    // Channel has a deep probe this path does not run: the summary view never
+    // runs it, and a paused channel is not probed in detail view. Say so instead
+    // of leaving a silent all-[ok] that reads as healthy (#6743).
+    signals.push({
+      label: "Runtime health",
+      severity: "info",
+      detail: options.channelPaused
+        ? `not checked — ${channelName} is currently paused`
+        : "not checked in summary view",
+      hint: options.channelPaused
+        ? undefined
+        : `run \`${CLI_NAME} ${sandboxName} channels status --channel ${channelName}\` for detailed status`,
+    });
+  } else if (options.includeDeepDiagnostics ?? true) {
+    signals.push({
+      label: "Deep diagnostics",
+      severity: "info",
+      detail: `not implemented for ${channelName}; see \`${CLI_NAME} ${sandboxName} doctor\` and \`${CLI_NAME} ${sandboxName} logs --follow\``,
+    });
+  }
   // Reference the agent in a hint so the deep-diagnostic section is
   // discoverable per agent without needing extra plumbing.
   if (!channelSupportedByAgent(channelName, agent)) {
@@ -528,10 +374,255 @@ function buildBasicChannelReport(
   };
 }
 
+function buildUnknownConfiguredChannelReport(
+  sandboxName: string,
+  channelName: string,
+): ChannelStatusBasicReport {
+  return {
+    schemaVersion: 1,
+    sandbox: sandboxName,
+    channel: channelName,
+    verdict: "info",
+    signals: [
+      {
+        label: "Channel registration",
+        severity: "warn",
+        detail: `${channelName} registered but not recognized by this CLI build`,
+      },
+    ],
+  };
+}
+
 function channelSupportedByAgent(channelName: string, agent: AgentDefinition): boolean {
   return channelManifestRegistry
     .listAvailable(getMessagingManifestAvailabilityContext(agent, channelManifestRegistry.list()))
     .some((manifest) => manifest.id === channelName);
+}
+
+function channelHealthStatusHook(channelName: string, agent: AgentDefinition) {
+  const agentId = agent.name === "hermes" ? "hermes" : "openclaw";
+  const manifest = channelManifestRegistry
+    .listAvailable(getMessagingManifestAvailabilityContext(agent, channelManifestRegistry.list()))
+    .find((candidate) => candidate.id === channelName);
+  return manifest?.hooks.find(
+    (hook) =>
+      hook.phase === "status" &&
+      (!hook.agents || hook.agents.includes(agentId)) &&
+      hook.outputs?.some((output) => output.id === "channelHealth") === true,
+  );
+}
+
+// Runs a deep-probe channel's `phase:"status"` health hook through the
+// generic status-hook runner and returns its channel-health report. All
+// channel-specific probing + classification lives in the channel's own hook
+// (e.g. channels/telegram/hooks/status-health.ts, channels/whatsapp/hooks);
+// this stays channel-agnostic. The hook's own `agents` gate skips channels
+// with no breadcrumb producer for the requested agent (e.g. Hermes
+// telegram), so the caller falls back to the basic report when no health
+// output is returned.
+function runChannelHealthHook(
+  sandboxName: string,
+  channelName: string,
+  agent: AgentDefinition,
+  deps: Required<StatusDeps>,
+  diagnostic: MessagingChannelDiagnosticSpec,
+  probeTimeoutMs?: number,
+): ChannelHealthReport | undefined {
+  const entry = deps.getSandbox(sandboxName);
+  const channelEnabledInRegistry = registry
+    .getConfiguredMessagingChannelsFromEntry(entry)
+    .includes(channelName);
+  const policyPresets =
+    diagnostic.policyPresets.length > 0 ? diagnostic.policyPresets : [channelName];
+  const appliedPresets = deps.getAppliedPresets(sandboxName);
+  const presetInRegistry = policyPresets.some((preset) => appliedPresets.includes(preset));
+  let presetOnGateway: boolean | null = null;
+  try {
+    const gatewayPresets = deps.getGatewayPresets(sandboxName);
+    presetOnGateway =
+      gatewayPresets === null
+        ? null
+        : policyPresets.some((preset) => gatewayPresets.includes(preset));
+  } catch {
+    presetOnGateway = null;
+  }
+
+  const results = runMessagingStatusHooks({
+    agent: agent.name === "hermes" ? "hermes" : "openclaw",
+    channels: new Set([channelName]),
+    currentSandbox: sandboxName,
+    hookRegistry: createBuiltInMessagingHookRegistry({
+      statusHealth: {
+        executeSandboxCommand: deps.execSandbox,
+        timeoutMs: probeTimeoutMs,
+      },
+    }),
+    extraInputs: channelHealthProbeInputs({
+      currentSandbox: sandboxName,
+      agent: agent.name,
+      probedAt: deps.now().toISOString(),
+      channelEnabledInRegistry,
+      presetInRegistry,
+      presetOnGateway,
+    }),
+  });
+  return results.flatMap(readChannelHealthOutputs)[0];
+}
+
+function collectChannelReport(
+  sandboxName: string,
+  channelName: string,
+  agent: AgentDefinition,
+  deps: Required<StatusDeps>,
+  diagnostic: MessagingChannelDiagnosticSpec,
+  hasHealthHook: boolean,
+  deadlineMs?: number,
+): ChannelStatusSingleReport {
+  const collectionDeps = deadlineMs === undefined ? deps : withStatusDeadline(deps, deadlineMs);
+  const probeTimeoutMs =
+    deadlineMs === undefined
+      ? undefined
+      : Math.max(1, Math.min(DEFAULT_CHANNEL_STATUS_HEALTH_TIMEOUT_MS, deadlineMs - deps.nowMs()));
+  const disabledChannels = new Set(
+    registry.getDisabledMessagingChannelsFromEntry(collectionDeps.getSandbox(sandboxName)),
+  );
+  const channelIsPaused = disabledChannels.has(channelName);
+  const healthReport =
+    hasHealthHook && !channelIsPaused
+      ? runChannelHealthHook(
+          sandboxName,
+          channelName,
+          agent,
+          collectionDeps,
+          diagnostic,
+          probeTimeoutMs,
+        )
+      : undefined;
+  if (!healthReport) {
+    const basicReport = buildBasicChannelReport(
+      sandboxName,
+      channelName,
+      agent,
+      collectionDeps,
+      diagnostic,
+      { channelPaused: channelIsPaused },
+    );
+    if (!hasHealthHook) return basicReport;
+    return {
+      schemaVersion: 1,
+      sandbox: sandboxName,
+      channel: channelName,
+      report: {
+        schemaVersion: 1,
+        agent: agent.name,
+        channel: channelName,
+        verdict: basicReport.verdict,
+        probedAt: collectionDeps.now().toISOString(),
+        signals: basicReport.signals,
+        hints: basicReport.signals.flatMap((signal) => (signal.hint ? [signal.hint] : [])),
+      },
+    };
+  }
+  const configSignals = buildConfigStatusSignals(
+    sandboxName,
+    channelName,
+    collectionDeps.getSandbox(sandboxName),
+    agent,
+    collectionDeps,
+  );
+  return {
+    schemaVersion: 1,
+    sandbox: sandboxName,
+    channel: channelName,
+    report: { ...healthReport, signals: [...healthReport.signals, ...configSignals] },
+  };
+}
+
+function withStatusDeadline(deps: Required<StatusDeps>, deadlineMs: number): Required<StatusDeps> {
+  const boundedTimeoutMs = (requestedTimeoutMs?: number): number | null => {
+    const remainingMs = deadlineMs - deps.nowMs();
+    if (remainingMs <= 0) return null;
+    return Math.min(requestedTimeoutMs ?? remainingMs, remainingMs);
+  };
+  return {
+    ...deps,
+    getGatewayPresets: (sandboxName, requestedTimeoutMs) => {
+      const timeoutMs = boundedTimeoutMs(requestedTimeoutMs);
+      return timeoutMs === null ? null : deps.getGatewayPresets(sandboxName, timeoutMs);
+    },
+    execSandbox: (sandboxName, command, requestedTimeoutMs) => {
+      const timeoutMs = boundedTimeoutMs(requestedTimeoutMs);
+      return timeoutMs === null ? null : deps.execSandbox(sandboxName, command, timeoutMs);
+    },
+  };
+}
+
+async function waitForChannelReadiness(
+  sandboxName: string,
+  channelName: string,
+  readinessSupported: boolean,
+  collect: (deadlineMs?: number) => ChannelStatusSingleReport,
+  options: ChannelStatusOptions,
+  deps: Required<StatusDeps>,
+): Promise<ChannelStatusWaitReport> {
+  const startedAt = deps.nowMs();
+  const timeoutMs = positiveNumber(options.timeoutSeconds, DEFAULT_WAIT_TIMEOUT_SECONDS) * 1_000;
+  const deadlineMs = startedAt + timeoutMs;
+  const pollIntervalMs = positiveNumber(options.pollIntervalMs, DEFAULT_WAIT_POLL_INTERVAL_MS);
+  const channelPaused = registry
+    .getDisabledMessagingChannelsFromEntry(deps.getSandbox(sandboxName))
+    .includes(channelName);
+  const pausedReadiness: ChannelReadiness | undefined =
+    channelPaused && readinessSupported
+      ? {
+          state: "terminal",
+          category: "runtime",
+          reason: "channel_paused",
+          retryable: false,
+          lastTransitionAt: null,
+        }
+      : undefined;
+  const readReadiness = (status: ChannelStatusSingleReport): ChannelReadiness =>
+    pausedReadiness ??
+    ("report" in status ? status.report.readiness : undefined) ?? {
+      state: "terminal",
+      category: "runtime",
+      reason: "readiness_not_supported",
+      retryable: false,
+      lastTransitionAt: null,
+    };
+
+  let attempts = 1;
+  let status = collect(deadlineMs);
+  let lastObserved = readReadiness(status);
+  let elapsedMs = Math.max(0, deps.nowMs() - startedAt);
+  while (lastObserved.state === "waiting" && elapsedMs < timeoutMs) {
+    await deps.sleep(Math.min(pollIntervalMs, timeoutMs - elapsedMs));
+    elapsedMs = Math.max(0, deps.nowMs() - startedAt);
+    if (elapsedMs >= timeoutMs) break;
+    attempts += 1;
+    status = collect(deadlineMs);
+    lastObserved = readReadiness(status);
+    elapsedMs = Math.max(0, deps.nowMs() - startedAt);
+  }
+  const state: ChannelStatusWaitState =
+    lastObserved.state === "waiting" ? "timeout" : lastObserved.state;
+  return {
+    schemaVersion: 1,
+    sandbox: sandboxName,
+    channel: channelName,
+    status,
+    readiness: {
+      state,
+      category: state === "timeout" ? "timeout" : lastObserved.category,
+      reason: state === "timeout" ? "timeout" : lastObserved.reason,
+      retryable: lastObserved.retryable,
+      attempts,
+      elapsedMs,
+      lastTransitionAt: lastObserved.lastTransitionAt,
+      lastObserved,
+    },
+  };
 }
 
 /**
@@ -565,14 +656,31 @@ export async function showSandboxChannelStatus(
     process.exit(1);
   }
 
-  let channelName = channelArg;
-  if (!channelName) {
+  const agent = deps.loadAgent(entry.agent || "openclaw");
+
+  if (!channelArg) {
     const configuredChannels = registry.getConfiguredMessagingChannelsFromEntry(entry);
-    channelName = selectDefaultChannel(configuredChannels);
+    const report: ChannelStatusReport = {
+      schemaVersion: 1,
+      sandbox: sandboxName,
+      channels: configuredChannels.map((channelName) => {
+        const diagnostic = getChannelStatusDiagnostic(channelName);
+        return diagnostic
+          ? buildBasicChannelReport(sandboxName, channelName, agent, deps, diagnostic, {
+              includeDeepDiagnostics: false,
+            })
+          : buildUnknownConfiguredChannelReport(sandboxName, channelName);
+      }),
+    };
+    if (!(asJson && quietJson)) {
+      renderReport(report, asJson, deps);
+    }
+    return report;
   }
 
-  const diagnostic = channelName ? getChannelStatusDiagnostic(channelName) : null;
-  if (!channelName || !diagnostic) {
+  const channelName = channelArg;
+  const diagnostic = getChannelStatusDiagnostic(channelName);
+  if (!diagnostic) {
     const known = diagnosticChannelNames().join(", ");
     if (asJson) {
       deps.out(
@@ -588,24 +696,27 @@ export async function showSandboxChannelStatus(
     process.exit(1);
   }
 
-  const agent = deps.loadAgent(entry.agent || "openclaw");
-
-  const disabledChannels = new Set(registry.getDisabledMessagingChannelsFromEntry(entry));
-  const channelIsPaused = disabledChannels.has(channelName);
-
-  let report: ChannelStatusReport;
-  if (diagnostic.deepProbe === "in-sandbox-qr" && !channelIsPaused) {
-    const input = buildWhatsappProbeInput(sandboxName, agent, deps);
-    const whatsappReport = evaluateWhatsappDiagnostics(input);
-    report = {
-      schemaVersion: 1,
-      sandbox: sandboxName,
-      channel: channelName,
-      report: whatsappReport,
-    };
-  } else {
-    report = buildBasicChannelReport(sandboxName, channelName, agent, deps, diagnostic);
-  }
+  const statusHook = channelHealthStatusHook(channelName, agent);
+  const collect = (deadlineMs?: number) =>
+    collectChannelReport(
+      sandboxName,
+      channelName,
+      agent,
+      deps,
+      diagnostic,
+      Boolean(statusHook),
+      deadlineMs,
+    );
+  const report: ChannelStatusReport = options.wait
+    ? await waitForChannelReadiness(
+        sandboxName,
+        channelName,
+        statusHook?.providesReadiness === true,
+        collect,
+        options,
+        deps,
+      )
+    : collect();
 
   if (!(asJson && quietJson)) {
     renderReport(report, asJson, deps);

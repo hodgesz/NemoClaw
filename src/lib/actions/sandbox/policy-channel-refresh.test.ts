@@ -12,17 +12,25 @@
  * silently let the in-sandbox POLICY.md drift.
  */
 
-import { createRequire } from "node:module";
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as fs from "node:fs";
 
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 
-const requireDist = createRequire(import.meta.url);
-const D = (p: string) => requireDist(`../../../../dist/lib/${p}`);
+import * as store from "../../credentials/store";
+import * as policies from "../../policy";
+import * as onboardSession from "../../state/onboard-session";
+import * as registry from "../../state/registry";
+import {
+  addSandboxPolicy,
+  applyChannelPresetIfAvailable,
+  removeChannelPresetIfPresent,
+  removeSandboxPolicy,
+} from "./policy-channel";
+import * as policyContextRefresh from "./policy-context-refresh";
 
-type PresetInfo = { name: string };
+type PresetInfo = ReturnType<typeof policies.listPresets>[number];
 
 class ExitError extends Error {
   constructor(public readonly code: number | undefined) {
@@ -30,24 +38,11 @@ class ExitError extends Error {
   }
 }
 
-const store = D("credentials/store.js");
-const registry = D("state/registry.js");
-const onboardSession = D("state/onboard-session.js");
-const policies = D("policy/index.js");
-const policyContextRefresh = D("actions/sandbox/policy-context-refresh.js");
-const {
-  addSandboxPolicy,
-  removeSandboxPolicy,
-  applyChannelPresetIfAvailable,
-  removeChannelPresetIfPresent,
-} = D("actions/sandbox/policy-channel.js") as {
-  addSandboxPolicy: (sandboxName: string, options?: Record<string, unknown>) => Promise<void>;
-  removeSandboxPolicy: (sandboxName: string, options?: Record<string, unknown>) => Promise<void>;
-  applyChannelPresetIfAvailable: (sandboxName: string, channelName: string) => boolean;
-  removeChannelPresetIfPresent: (sandboxName: string, channelName: string) => void;
-};
-
-const POLICY_PRESETS: PresetInfo[] = [{ name: "npm" }, { name: "pypi" }, { name: "discord" }];
+const POLICY_PRESETS: PresetInfo[] = [
+  { file: "npm.yaml", name: "npm", description: "npm and Yarn registry access" },
+  { file: "pypi.yaml", name: "pypi", description: "Python Package Index access" },
+  { file: "discord.yaml", name: "discord", description: "Discord API access" },
+];
 
 let logSpy: MockInstance;
 let errSpy: MockInstance;
@@ -68,8 +63,12 @@ async function captureExit(action: () => Promise<void>): Promise<number | undefi
   throw new Error("Expected process.exit to be called");
 }
 
+let stdinIsTty: PropertyDescriptor | undefined;
+
 beforeEach(() => {
   delete process.env.NEMOCLAW_NON_INTERACTIVE;
+  stdinIsTty = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
 
   logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
   errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -86,16 +85,23 @@ beforeEach(() => {
   vi.spyOn(registry, "getCustomPolicies").mockReturnValue([]);
 
   vi.spyOn(onboardSession, "loadSession").mockReturnValue(null);
-  vi.spyOn(onboardSession, "updateSession").mockImplementation(() => undefined);
+  vi.spyOn(onboardSession, "updateSession").mockReturnValue(
+    undefined as unknown as onboardSession.Session,
+  );
 
   vi.spyOn(policies, "listPresets").mockReturnValue(POLICY_PRESETS);
   vi.spyOn(policies, "listCustomPresets").mockReturnValue([]);
   vi.spyOn(policies, "getAppliedPresets").mockReturnValue([]);
+  vi.spyOn(policies, "getGatewayPresets").mockReturnValue(null);
   vi.spyOn(policies, "selectFromList").mockResolvedValue("pypi");
   vi.spyOn(policies, "selectForRemoval").mockResolvedValue("pypi");
   vi.spyOn(policies, "loadPreset").mockImplementation((name: unknown) => {
     return `network_policies:\n  ${String(name)}:\n    host: ${String(name)}.example.com\n`;
   });
+  vi.spyOn(policies, "loadPresetForSandbox").mockImplementation(
+    (_sandboxName: unknown, name: unknown) =>
+      `network_policies:\n  ${String(name)}:\n    host: ${String(name)}.example.com\n`,
+  );
   applyPresetMock = vi.spyOn(policies, "applyPreset").mockReturnValue(true);
   removePresetMock = vi.spyOn(policies, "removePreset").mockReturnValue(true);
   applyPresetContentMock = vi.spyOn(policies, "applyPresetContent").mockReturnValue(true);
@@ -114,13 +120,18 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   delete process.env.NEMOCLAW_NON_INTERACTIVE;
+  stdinIsTty
+    ? Object.defineProperty(process.stdin, "isTTY", stdinIsTty)
+    : Reflect.deleteProperty(process.stdin, "isTTY");
 });
 
 describe("addSandboxPolicy refresh contract", () => {
   it("refreshes the in-sandbox POLICY.md after a successful built-in apply", async () => {
     await addSandboxPolicy("alpha", { preset: "pypi", yes: true });
 
-    expect(applyPresetMock).toHaveBeenCalledWith("alpha", "pypi");
+    expect(applyPresetMock).toHaveBeenCalledWith("alpha", "pypi", {
+      suppressDisclosure: true,
+    });
     expect(refreshSpy).toHaveBeenCalledTimes(1);
     expect(refreshSpy).toHaveBeenCalledWith("alpha");
   });
@@ -148,7 +159,9 @@ describe("addSandboxPolicy refresh contract", () => {
       captureExit(() => addSandboxPolicy("alpha", { preset: "pypi", yes: true })),
     ).resolves.toBe(1);
 
-    expect(applyPresetMock).toHaveBeenCalledWith("alpha", "pypi");
+    expect(applyPresetMock).toHaveBeenCalledWith("alpha", "pypi", {
+      suppressDisclosure: true,
+    });
     expect(refreshSpy).not.toHaveBeenCalled();
   });
 

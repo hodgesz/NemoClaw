@@ -5,6 +5,7 @@ import { posix as path } from "node:path";
 
 import YAML from "yaml";
 
+import { isObjectRecord } from "../../core/json-types";
 import { redact } from "../../security/redact";
 import type { MessagingHookOutputMap } from "../hooks";
 import type {
@@ -18,6 +19,7 @@ import type {
   SandboxMessagingPlan,
 } from "../manifest";
 import { isProviderPlaceholderForEnvKey } from "../provider-placeholders";
+import { allowRenderedOpenClawPlugins } from "./openclaw-plugin-allow";
 import { enabledPlanChannels, filterEnabledPlanEntries } from "./plan-filter";
 import type {
   MessagingHookApplyRequest,
@@ -64,8 +66,13 @@ export async function applyAgentConfigAtOpenShell(
   }
 
   const enabledRender = filterEnabledPlanEntries(plan, plan.agentRender);
+  const disabledChannelIds = new Set(plan.disabledChannels);
+  const disabledJsonRender = plan.agentRender.filter(
+    (entry): entry is SandboxMessagingJsonRenderPlan =>
+      entry.kind === "json-fragment" && disabledChannelIds.has(entry.channelId),
+  );
 
-  for (const [target, render] of groupRenderByTarget(enabledRender)) {
+  for (const [target, render] of groupRenderByTarget([...enabledRender, ...disabledJsonRender])) {
     const resolvedTarget = resolveSandboxAgentConfigTarget(target, plan.agent);
     const kind = render[0]?.kind;
     if (!kind) continue;
@@ -75,7 +82,19 @@ export async function applyAgentConfigAtOpenShell(
     const existing = readSandboxFile(plan.sandboxName, resolvedTarget, options.runOpenshell);
     const contents =
       kind === "json-fragment"
-        ? applyJsonFragments(plan, existing, render.filter(isJsonRender), resolvedTarget)
+        ? applyJsonFragments(
+            plan,
+            existing,
+            render.filter(
+              (entry): entry is SandboxMessagingJsonRenderPlan =>
+                isJsonRender(entry) && !disabledChannelIds.has(entry.channelId),
+            ),
+            render.filter(
+              (entry): entry is SandboxMessagingJsonRenderPlan =>
+                isJsonRender(entry) && disabledChannelIds.has(entry.channelId),
+            ),
+            resolvedTarget,
+          )
         : applyEnvLines(existing, render.filter(isEnvLinesRender));
     writeSandboxFile(plan.sandboxName, resolvedTarget, contents, options.runOpenshell);
     appliedTargets.push(resolvedTarget);
@@ -202,11 +221,15 @@ function applyJsonFragments(
   plan: SandboxMessagingPlan,
   existing: string | undefined,
   render: readonly SandboxMessagingJsonRenderPlan[],
+  disabledRender: readonly SandboxMessagingJsonRenderPlan[],
   target: string,
 ): string {
   const format = target.endsWith(".yaml") || target.endsWith(".yml") ? "yaml" : "json";
   const root = parseStructuredConfig(existing, target, format);
   const rules = credentialPlaceholderRules(plan);
+  for (const entry of disabledRender) {
+    deleteJsonPath(root, entry.path);
+  }
   for (const entry of render) {
     setJsonPath(
       root,
@@ -214,7 +237,25 @@ function applyJsonFragments(
       preserveCredentialPlaceholders(entry.value, getJsonPath(root, entry.path), rules),
     );
   }
+  if (plan.agent === "openclaw") allowRenderedOpenClawPlugins(root, render);
   return format === "yaml" ? YAML.stringify(root) : JSON.stringify(root, null, 2) + "\n";
+}
+
+function deleteJsonPath(root: Record<string, MessagingSerializableValue>, pathValue: string): void {
+  const segments = pathValue.split(".").filter(Boolean);
+  if (segments.length === 0) {
+    throw new Error("Messaging render path must not be empty.");
+  }
+  let cursor: Record<string, MessagingSerializableValue> = root;
+  for (const segment of segments.slice(0, -1)) {
+    assertSafeObjectKey(segment, "Messaging render path");
+    const next = cursor[segment];
+    if (!isObjectRecord(next)) return;
+    cursor = next as Record<string, MessagingSerializableValue>;
+  }
+  const finalSegment = segments[segments.length - 1] as string;
+  assertSafeObjectKey(finalSegment, "Messaging render path");
+  delete cursor[finalSegment];
 }
 
 function parseStructuredConfig(
@@ -224,7 +265,7 @@ function parseStructuredConfig(
 ): Record<string, MessagingSerializableValue> {
   if (!existing || existing.trim().length === 0) return {};
   const parsed = format === "yaml" ? YAML.parse(existing) : (JSON.parse(existing) as unknown);
-  if (!isObject(parsed)) {
+  if (!isObjectRecord(parsed)) {
     throw new Error(`Messaging agent config target ${target} must contain an object.`);
   }
   return parsed as Record<string, MessagingSerializableValue>;
@@ -271,8 +312,8 @@ function preserveCredentialPlaceholders(
       ),
     );
   }
-  if (isObject(desired)) {
-    const existingObject = isObject(existing) ? existing : {};
+  if (isObjectRecord(desired)) {
+    const existingObject = isObjectRecord(existing) ? existing : {};
     return Object.fromEntries(
       Object.entries(desired).map(([key, value]) => [
         key,
@@ -286,7 +327,7 @@ function preserveCredentialPlaceholders(
 function getJsonPath(root: Record<string, MessagingSerializableValue>, pathValue: string): unknown {
   let cursor: unknown = root;
   for (const segment of pathValue.split(".").filter(Boolean)) {
-    if (!isObject(cursor)) return undefined;
+    if (!isObjectRecord(cursor)) return undefined;
     cursor = cursor[segment];
   }
   return cursor;
@@ -305,7 +346,7 @@ function setJsonPath(
   for (const segment of segments.slice(0, -1)) {
     assertSafeObjectKey(segment, "Messaging render path");
     const next = cursor[segment];
-    if (!isObject(next)) {
+    if (!isObjectRecord(next)) {
       const created: Record<string, MessagingSerializableValue> = {};
       cursor[segment] = created;
       cursor = created;
@@ -316,7 +357,7 @@ function setJsonPath(
   const finalSegment = segments[segments.length - 1] as string;
   assertSafeObjectKey(finalSegment, "Messaging render path");
   const existing = cursor[finalSegment];
-  if (isObject(existing) && isObject(value)) {
+  if (isObjectRecord(existing) && isObjectRecord(value)) {
     mergeObjects(
       existing as Record<string, MessagingSerializableValue>,
       value as Record<string, MessagingSerializableValue>,
@@ -398,7 +439,7 @@ function readHookBuildFile(value: MessagingSerializableValue): {
   readonly content?: MessagingSerializableValue;
   readonly merge?: MessagingSerializableValue;
 } {
-  if (!isObject(value) || typeof value.path !== "string" || value.path.trim().length === 0) {
+  if (!isObjectRecord(value) || typeof value.path !== "string" || value.path.trim().length === 0) {
     throw new Error("Messaging build-file hook output must include a non-empty path.");
   }
   const file = value as Record<string, MessagingSerializableValue | undefined>;
@@ -426,7 +467,7 @@ function applyStructuredMerge(
   patch: MessagingSerializableValue,
   target: string,
 ): string {
-  if (!isObject(patch)) {
+  if (!isObjectRecord(patch)) {
     throw new Error(`Messaging build-file merge for ${target} must be an object.`);
   }
   const format = target.endsWith(".yaml") || target.endsWith(".yml") ? "yaml" : "json";
@@ -444,7 +485,7 @@ function mergeObjects(
       throw new Error(`Messaging build-file merge rejected unsafe object key '${key}'.`);
     }
     const existing = target[key];
-    if (isObject(existing) && isObject(value)) {
+    if (isObjectRecord(existing) && isObjectRecord(value)) {
       mergeObjects(
         existing as Record<string, MessagingSerializableValue>,
         value as Record<string, MessagingSerializableValue>,
@@ -463,7 +504,7 @@ function validateSafeMergeValue(value: MessagingSerializableValue): void {
     }
     return;
   }
-  if (!isObject(value)) return;
+  if (!isObjectRecord(value)) return;
   for (const [key, entry] of Object.entries(value)) {
     if (key === "__proto__" || key === "prototype" || key === "constructor") {
       throw new Error(`Messaging build-file merge rejected unsafe object key '${key}'.`);
@@ -655,10 +696,6 @@ function assertSafeObjectKey(key: string, context: string): void {
   if (key === "__proto__" || key === "prototype" || key === "constructor") {
     throw new Error(`${context} rejected unsafe object key '${key}'.`);
   }
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function uniqueStrings(values: readonly string[]): string[] {

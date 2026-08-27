@@ -3,6 +3,14 @@
 
 import type { AgentDefinition } from "../agent/defs";
 import type { WebSearchConfig } from "../inference/web-search";
+import {
+  SandboxBaseImageResolutionError,
+  type SandboxBaseImageResolutionMetadata,
+} from "../sandbox-base-image";
+import type { PreservedEnvFile } from "../state/preserved-env";
+import { DEFAULT_TOOL_DISCLOSURE, type ToolDisclosure } from "../tool-disclosure";
+import type { DcodeAutoApprovalMode } from "./dcode-auto-approval";
+import type { SelectedDockerGpuRoute } from "./docker-gpu-route";
 import type { SandboxGpuConfig } from "./sandbox-gpu-mode";
 
 type DockerRunResult = { status: number | null };
@@ -12,11 +20,14 @@ type EnforceDockerGpuPatchPreserveNetwork =
   typeof import("./docker-gpu-local-inference").enforceDockerGpuPatchPreserveNetwork;
 type PatchStagedDockerfile = typeof import("./dockerfile-patch").patchStagedDockerfile;
 
+const STABLE_MANAGED_BUILD_ID_AGENTS = new Set(["openclaw", "hermes"]);
+
 export type SandboxDockerfilePatchDeps = {
   pullAndResolveBaseImageDigest?: PullAndResolveBaseImageDigest;
   dockerImageInspect?: (target: string, opts?: Record<string, unknown>) => DockerRunResult;
   isLinuxDockerDriverGatewayEnabled?: () => boolean;
   enforceDockerGpuPatchPreserveNetwork?: EnforceDockerGpuPatchPreserveNetwork;
+  isWsl?: () => boolean;
   patchStagedDockerfile?: PatchStagedDockerfile;
   now?: () => number;
 };
@@ -30,10 +41,20 @@ export type PrepareSandboxDockerfilePatchInput = {
   model: string;
   chatUiUrl: string;
   provider: string | null;
+  endpointUrl?: string | null;
+  compatibleEndpointReasoning?: "true" | "false";
   preferredInferenceApi: string | null;
   webSearchConfig: WebSearchConfig | null;
+  toolDisclosure?: ToolDisclosure;
+  rebuildPreservedEnv?: readonly PreservedEnvFile[];
+  dcodeAutoApprovalMode?: DcodeAutoApprovalMode;
   hermesToolGateways: string[];
   sandboxGpuConfig: SandboxGpuConfig;
+  selectedGpuRoute?: SelectedDockerGpuRoute;
+  resolutionHint?: SandboxBaseImageResolutionMetadata | null;
+  preResolvedBaseImageMetadata?: SandboxBaseImageResolutionMetadata | null;
+  forceBaseImageRefresh?: boolean;
+  gatewayPort?: number;
   log?: (message: string) => void;
   warn?: (message: string) => void;
   deps?: SandboxDockerfilePatchDeps;
@@ -41,6 +62,7 @@ export type PrepareSandboxDockerfilePatchInput = {
 
 export type SandboxDockerfilePatchResult = {
   buildId: string;
+  dashboardRemoteBindPrepared: boolean;
   resolvedBaseImage: ResolvedSandboxBaseImage | null;
 };
 
@@ -62,6 +84,11 @@ function linuxDockerDriverGatewayEnabled(): boolean {
   const { isLinuxDockerDriverGatewayEnabled } =
     require("./docker-driver-platform") as typeof import("./docker-driver-platform");
   return isLinuxDockerDriverGatewayEnabled();
+}
+
+function wslHostDetected(): boolean {
+  const { isWsl } = require("../platform") as typeof import("../platform");
+  return isWsl();
 }
 
 function enforceDockerGpuPatchPreserveNetwork(
@@ -89,10 +116,20 @@ export async function prepareSandboxDockerfilePatch({
   model,
   chatUiUrl,
   provider,
+  endpointUrl = null,
+  compatibleEndpointReasoning,
   preferredInferenceApi,
   webSearchConfig,
+  toolDisclosure = DEFAULT_TOOL_DISCLOSURE,
+  rebuildPreservedEnv,
+  dcodeAutoApprovalMode,
   hermesToolGateways,
   sandboxGpuConfig,
+  selectedGpuRoute = "none",
+  resolutionHint = null,
+  preResolvedBaseImageMetadata = null,
+  forceBaseImageRefresh = false,
+  gatewayPort,
   log = console.log,
   warn = console.warn,
   deps = {},
@@ -100,15 +137,23 @@ export async function prepareSandboxDockerfilePatch({
   const shouldResolveBaseImage = !(agent && !fromDockerfile);
   const getDockerDriverGateway =
     deps.isLinuxDockerDriverGatewayEnabled ?? linuxDockerDriverGatewayEnabled;
+  const dockerDriverGateway = getDockerDriverGateway();
   const resolved = shouldResolveBaseImage
     ? (deps.pullAndResolveBaseImageDigest ?? pullAndResolveBaseImageDigest)({
-        requireOpenshellSandboxAbi: getDockerDriverGateway(),
+        requireOpenshellSandboxAbi: dockerDriverGateway,
+        ...(resolutionHint ? { resolutionHint } : {}),
+        ...(forceBaseImageRefresh ? { forceRefresh: true } : {}),
       })
     : null;
   if (resolved?.digest) {
     log(`  Pinning base image to ${resolved.digest.slice(0, 19)}...`);
   } else if (resolved) {
     log(`  Using sandbox base image ${resolved.ref}`);
+  } else if (shouldResolveBaseImage && dockerDriverGateway) {
+    throw new SandboxBaseImageResolutionError(
+      "No OpenShell ABI-compatible sandbox base image could be resolved. " +
+        "Refusing to fall back to an unvalidated cached :latest image.",
+    );
   } else if (shouldResolveBaseImage) {
     const localCheck = (deps.dockerImageInspect ?? inspectDockerImage)(
       `${sandboxBaseImage}:${sandboxBaseTag}`,
@@ -132,12 +177,24 @@ export async function prepareSandboxDockerfilePatch({
     provider,
     sandboxGpuConfig,
     {
-      dockerDriverGateway: getDockerDriverGateway(),
+      dockerDriverGateway,
+      selectedRoute: selectedGpuRoute,
+      gatewayPort,
       log,
     },
   );
   const darwinVmCompat = false;
-  (deps.patchStagedDockerfile ?? patchStagedDockerfile)(
+  // Preserve the compatibility ARG only for managed Dockerfiles that are
+  // checked in here and known not to consume it. Custom --from Dockerfiles
+  // and other managed agents retain the historical per-run rewrite.
+  const managedAgentName = agent?.name ?? "openclaw";
+  const managedOpenClawWslExposure =
+    !fromDockerfile && managedAgentName === "openclaw" && (deps.isWsl ?? wslHostDetected)();
+  const buildIdPolicy =
+    !fromDockerfile && STABLE_MANAGED_BUILD_ID_AGENTS.has(managedAgentName)
+      ? "preserve"
+      : "rewrite";
+  const patched = (deps.patchStagedDockerfile ?? patchStagedDockerfile)(
     stagedDockerfile,
     model,
     chatUiUrl,
@@ -149,7 +206,29 @@ export async function prepareSandboxDockerfilePatch({
     darwinVmCompat,
     null,
     hermesToolGateways,
+    (() => {
+      const metadata = fromDockerfile ? null : (resolved?.metadata ?? preResolvedBaseImageMetadata);
+      return {
+        agentName: managedAgentName,
+        buildIdPolicy,
+        toolDisclosure,
+        ...(rebuildPreservedEnv ? { rebuildPreservedEnv } : {}),
+        ...(!fromDockerfile ? { trustedManagedDockerfile: true } : {}),
+        ...(!fromDockerfile && managedAgentName === "openclaw"
+          ? { wslDashboardExposure: managedOpenClawWslExposure }
+          : {}),
+        ...(endpointUrl ? { upstreamEndpointUrl: endpointUrl } : {}),
+        ...(compatibleEndpointReasoning ? { compatibleEndpointReasoning } : {}),
+        ...(dcodeAutoApprovalMode ? { dcodeAutoApprovalMode } : {}),
+        requireToolDisclosureContract: Boolean(fromDockerfile),
+        ...(metadata ? { baseImageResolutionMetadata: metadata } : {}),
+      };
+    })(),
   );
 
-  return { buildId, resolvedBaseImage: resolved };
+  return {
+    buildId,
+    dashboardRemoteBindPrepared: patched?.dashboardRemoteBindPrepared === true,
+    resolvedBaseImage: resolved,
+  };
 }

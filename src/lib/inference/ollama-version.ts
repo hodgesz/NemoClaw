@@ -7,9 +7,9 @@
  * dragging the rest of the local-inference helpers along.
  */
 
-const { runCapture } = require("../runner");
 import { buildValidatedCurlCommandArgs } from "../adapters/http/curl-args";
 import { OLLAMA_PORT } from "../core/ports";
+import { runCapture } from "../runner";
 
 export type OllamaVersionRunCapture = (
   cmd: readonly string[],
@@ -18,16 +18,20 @@ export type OllamaVersionRunCapture = (
 
 /**
  * Minimum Ollama version NemoClaw expects when reusing an existing host
- * Ollama. Older Ollama runners crash loading newer starter models because
- * their GGUF parsers predate the model format. Bump this when starter-model
- * recipes adopt a newer GGUF feature.
+ * Ollama. Older Ollama runners can fail to return structured tool calls for
+ * the default Nemotron starter model. Bump this when starter-model recipes
+ * adopt a newer Ollama feature.
  */
-export const MIN_OLLAMA_VERSION = "0.7.0";
+export const MIN_OLLAMA_VERSION = "0.32.9";
+
+const OLLAMA_CLIENT_VERSION_LINE = /client version is\s+(\d+\.\d+\.\d+)/i;
 
 export function getInstalledOllamaVersion(runCaptureImpl?: OllamaVersionRunCapture): string | null {
   const capture = runCaptureImpl ?? runCapture;
   const out = capture(["ollama", "--version"], { ignoreError: true });
   if (!out) return null;
+  const clientVersion = out.match(OLLAMA_CLIENT_VERSION_LINE);
+  if (clientVersion) return clientVersion[1];
   const match = out.match(/(\d+)\.(\d+)\.(\d+)/);
   return match ? match[0] : null;
 }

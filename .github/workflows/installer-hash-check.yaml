@@ -2,14 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Verifies pinned installer SHA-256 hashes still match upstream scripts.
-# Checked: Ollama installer.
-# Runs on every PR and push to main, plus a weekly scheduled check.
+# Checked: allowlisted OpenShell installer and Brev release assets.
+# Reports the required network-backed drift check on every PR, every push to
+# main, and weekly. Pull requests execute checker code from their base commit.
+# A new release-manifest allowlist entry must land on main in a prerequisite PR
+# before a later PR changes runtime selectors to that release.
 
-name: Security / Installer Hash Check
+name: Security / Verify Installer Hashes
+
+run-name: >-
+  ${{ github.event_name == 'pull_request' &&
+  format('Installer Hash PR #{0} head {1} base {2} gate true',
+  github.event.pull_request.number, github.event.pull_request.head.sha,
+  github.event.pull_request.base.sha) ||
+  format('Installer Hash {0} {1}', github.event_name, github.sha) }}
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
   schedule:
@@ -26,8 +36,48 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Set up trusted installer hash parser runtime
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.19.0
 
-      - name: Verify installer hashes are current
-        run: bash scripts/check-installer-hash.sh
+      # The checkout of the latest PR commit supplies data only. The checker and
+      # pin parser execute from the checkout of the PR base SHA below.
+      - name: Checkout pull request head
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Checkout trusted event
+        if: github.event_name != 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout base-trusted installer hash action
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .trusted-installer-hash
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/ci-installer-hash-check
+            scripts/check-installer-hash.sh
+            scripts/checks/extract-installer-pins.mts
+          sparse-checkout-cone-mode: false
+
+      - name: Verify pull request installer hashes from base-trusted code
+        if: github.event_name == 'pull_request'
+        uses: ./.trusted-installer-hash/.github/actions/ci-installer-hash-check
+        with:
+          repo-root: ${{ github.workspace }}
+
+      - name: Verify trusted event installer hashes
+        if: github.event_name != 'pull_request'
+        uses: ./.github/actions/ci-installer-hash-check
+        with:
+          repo-root: ${{ github.workspace }}

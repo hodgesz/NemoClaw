@@ -1,18 +1,64 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-type RunResult = { status: number; stdout?: string; stderr?: string };
-type RunOptions = { env?: Record<string, string | undefined> };
+type RunResult = {
+  error?: unknown;
+  output?: string;
+  signal?: unknown;
+  status: number;
+  stdout?: string;
+  stderr?: string;
+};
+type RunOptions = {
+  env?: Record<string, string | undefined>;
+  ignoreError?: boolean;
+  maxBuffer?: number;
+  stdio?: readonly unknown[];
+  suppressOutput?: boolean;
+  timeout?: number;
+};
 type RunOpenshell = (command: string[], opts?: RunOptions) => RunResult;
+
+const messagingBridgeProvider = require(
+  "./messaging-bridge-provider"
+) as typeof import("./messaging-bridge-provider");
+
+const DISCORD_STATIC_PROFILE_EXPORT = JSON.stringify({
+  id: "discord-hermes-static-v1",
+  credentials: [
+    {
+      name: "bot_token",
+      env_vars: ["DISCORD_BOT_TOKEN"],
+      required: true,
+      auth_style: "header",
+      header_name: "Authorization",
+      query_param: "",
+    },
+  ],
+  endpoints: [],
+  binaries: [],
+  inference_capable: false,
+});
+
+const MESSAGING_ENDPOINTLESS_PROFILE_EXPORT = JSON.stringify({
+  id: "nemoclaw-mcp-v1",
+  credentials: [],
+  endpoints: [],
+  binaries: [],
+  inference_capable: false,
+});
 
 const {
   HOSTED_INFERENCE_ENDPOINT_URL,
   HOSTED_INFERENCE_MODEL,
   NON_INTERACTIVE_PROVIDER_ALIASES,
   NON_INTERACTIVE_PROVIDER_KEYS,
+  REMOTE_PROVIDER_CONFIG,
   buildProviderArgs,
+  getNonInteractiveProvider,
+  getNonInteractiveModel,
   getRequestedModelHint,
   getRequestedProviderHint,
   isProviderKeyCredentialCandidate,
@@ -20,11 +66,20 @@ const {
   stageHostedInferenceSourceSecretEnv,
   upsertProvider,
   upsertMessagingProviders,
-} = require("../../../dist/lib/onboard/providers") as {
+} = require("./providers") as {
   HOSTED_INFERENCE_ENDPOINT_URL: string;
   HOSTED_INFERENCE_MODEL: string;
   NON_INTERACTIVE_PROVIDER_ALIASES: Record<string, string>;
   NON_INTERACTIVE_PROVIDER_KEYS: Set<string>;
+  REMOTE_PROVIDER_CONFIG: Record<
+    string,
+    {
+      providerName: string;
+      providerType: string;
+      credentialEnv: string;
+      defaultModel: string;
+    }
+  >;
   buildProviderArgs: (
     action: "create" | "update",
     name: string,
@@ -32,8 +87,19 @@ const {
     credentialEnv: string,
     baseUrl: string | null,
   ) => string[];
-  getRequestedModelHint: (nonInteractive: boolean) => string | null;
-  getRequestedProviderHint: (nonInteractive: boolean) => string | null;
+  getNonInteractiveProvider: (allowHostedInferenceStaging?: boolean) => string | null;
+  getNonInteractiveModel: (
+    providerKey: string,
+    options?: { allowProviderModelFallback?: boolean },
+  ) => string | null;
+  getRequestedModelHint: (
+    nonInteractive: boolean,
+    allowHostedInferenceStaging?: boolean,
+  ) => string | null;
+  getRequestedProviderHint: (
+    nonInteractive: boolean,
+    allowHostedInferenceStaging?: boolean,
+  ) => string | null;
   isProviderKeyCredentialCandidate: (value: string | null | undefined) => boolean;
   providerExistsInGateway: (name: string, runOpenshell: RunOpenshell) => boolean;
   stageHostedInferenceSourceSecretEnv: () => boolean;
@@ -44,8 +110,14 @@ const {
     baseUrl: string | null,
     env: Record<string, string | undefined>,
     runOpenshell: RunOpenshell,
-    options?: { replaceExisting?: boolean },
-  ) => { ok: boolean; status?: number; message?: string };
+    options?: {
+      knownExists?: boolean;
+      replaceExisting?: boolean;
+      allowedSandboxes?: readonly string[];
+      requireExactBinding?: boolean;
+      revalidatePolicyRequirements?(operation: string): void;
+    },
+  ) => { ok: boolean; status?: number; message?: string; reason?: string };
   upsertMessagingProviders: (
     tokenDefs: Array<{
       name: string;
@@ -54,7 +126,13 @@ const {
       providerType?: string;
     }>,
     runOpenshell: RunOpenshell,
-    options?: { replaceExisting?: boolean; bestEffort?: boolean },
+    options?: {
+      allowedSandboxes?: readonly string[];
+      bestEffort?: boolean;
+      replaceExisting?: boolean;
+      revalidatePolicyRequirements?(operation: string): void;
+      requireExactBindings?: boolean;
+    },
   ) => string[];
 };
 
@@ -66,6 +144,7 @@ function withProviderEnv(next: Record<string, string | undefined>, testBody: () 
     "NEMOCLAW_PROVIDER",
     "NEMOCLAW_ENDPOINT_URL",
     "NEMOCLAW_MODEL",
+    "NEMOCLAW_PROVIDER_MODEL",
     "NEMOCLAW_COMPAT_MODEL",
     "NEMOCLAW_PREFERRED_API",
     "NEMOCLAW_CLOUD_EXPERIMENTAL_MODEL",
@@ -99,6 +178,60 @@ function withProviderEnv(next: Record<string, string | undefined>, testBody: () 
 }
 
 describe("onboard provider helpers", () => {
+  it("uses Gemini 3.6 Flash as the onboarding default (#9298)", () => {
+    expect(REMOTE_PROVIDER_CONFIG.gemini.defaultModel).toBe("gemini-3.6-flash");
+  });
+
+  it("keeps managed llama.cpp as a public non-interactive provider selector (#8433)", () => {
+    expect(NON_INTERACTIVE_PROVIDER_KEYS.has("install-llama-cpp")).toBe(true);
+    withProviderEnv({ NEMOCLAW_PROVIDER: "install-llama-cpp" }, () => {
+      expect(getNonInteractiveProvider(false)).toBe("install-llama-cpp");
+    });
+  });
+
+  it("registers OpenRouter with an OpenAI-compatible provider profile and aliases (#5826)", () => {
+    const provider = REMOTE_PROVIDER_CONFIG.openrouter;
+
+    expect(provider).toMatchObject({
+      providerName: "openrouter-api",
+      providerType: "openai",
+      credentialEnv: "OPENROUTER_API_KEY",
+    });
+    expect(NON_INTERACTIVE_PROVIDER_KEYS.has("openrouter")).toBe(true);
+    expect(NON_INTERACTIVE_PROVIDER_ALIASES["open-router"]).toBe("openrouter");
+    expect(NON_INTERACTIVE_PROVIDER_ALIASES.openrouterai).toBe("openrouter");
+    expect(
+      buildProviderArgs(
+        "create",
+        provider.providerName,
+        provider.providerType,
+        provider.credentialEnv,
+        "https://openrouter.ai/api/v1",
+      ),
+    ).toContain("OPENAI_BASE_URL=https://openrouter.ai/api/v1");
+  });
+
+  it("keeps the discovery profile Anthropic before agent-specific surface selection (#6289)", () => {
+    const provider = REMOTE_PROVIDER_CONFIG.anthropicCompatible;
+
+    // Remote provider setup can replace this registration with type=openai
+    // after an agent selects and verifies the endpoint's OpenAI surface.
+    expect(provider).toMatchObject({
+      providerName: "compatible-anthropic-endpoint",
+      providerType: "anthropic",
+      credentialEnv: "COMPATIBLE_ANTHROPIC_API_KEY",
+    });
+    expect(
+      buildProviderArgs(
+        "create",
+        provider.providerName,
+        provider.providerType,
+        provider.credentialEnv,
+        "https://inference-api.nvidia.com",
+      ),
+    ).toContain("ANTHROPIC_BASE_URL=https://inference-api.nvidia.com");
+  });
+
   it("builds create arguments for generic providers", () => {
     const args = buildProviderArgs(
       "create",
@@ -318,6 +451,66 @@ describe("onboard provider helpers", () => {
     );
   });
 
+  it("does not synthesize hosted selection when authoritative resume disables staging", () => {
+    withProviderEnv(
+      {
+        NVIDIA_INFERENCE_API_KEY: "repo-hosted-key",
+      },
+      () => {
+        expect(getRequestedProviderHint(true, false)).toBeNull();
+        expect(getRequestedModelHint(true, false)).toBeNull();
+        expect(process.env.NEMOCLAW_PROVIDER).toBeUndefined();
+        expect(process.env.NEMOCLAW_MODEL).toBeUndefined();
+        expect(process.env.COMPATIBLE_API_KEY).toBeUndefined();
+      },
+    );
+  });
+
+  it("supports the NVIDIA QA non-interactive provider-model contract (#6869)", () => {
+    withProviderEnv(
+      {
+        NEMOCLAW_PROVIDER: "ollama",
+        NEMOCLAW_PROVIDER_MODEL: "qwen3.6:35b",
+      },
+      () => {
+        expect(getRequestedModelHint(true)).toBe("qwen3.6:35b");
+      },
+    );
+  });
+
+  it("keeps NEMOCLAW_MODEL ahead of NEMOCLAW_PROVIDER_MODEL", () => {
+    withProviderEnv(
+      {
+        NEMOCLAW_PROVIDER: "ollama",
+        NEMOCLAW_MODEL: "qwen2.5:0.5b",
+        NEMOCLAW_PROVIDER_MODEL: "qwen3.6:35b",
+      },
+      () => {
+        expect(getRequestedModelHint(true)).toBe("qwen2.5:0.5b");
+      },
+    );
+  });
+
+  it("preserves NEMOCLAW_MODEL when the provider-model fallback is disabled", () => {
+    withProviderEnv(
+      {
+        NEMOCLAW_MODEL: "nvidia/nemotron-3-super-120b-a12b",
+        NEMOCLAW_PROVIDER_MODEL: "fallback-model",
+      },
+      () => {
+        expect(getNonInteractiveModel("openai", { allowProviderModelFallback: false })).toBe(
+          "nvidia/nemotron-3-super-120b-a12b",
+        );
+      },
+    );
+  });
+
+  it("omits NEMOCLAW_PROVIDER_MODEL when the provider-model fallback is disabled", () => {
+    withProviderEnv({ NEMOCLAW_PROVIDER_MODEL: "fallback-model" }, () => {
+      expect(getNonInteractiveModel("openai", { allowProviderModelFallback: false })).toBeNull();
+    });
+  });
+
   it("stages Deep Agents NEMOCLAW_PROVIDER_KEY as hosted custom inference", () => {
     withProviderEnv(
       {
@@ -361,16 +554,17 @@ describe("onboard provider helpers", () => {
     expect(isProviderKeyCredentialCandidate(value)).toBe(expected);
   });
 
-  it("rejects every supported non-interactive provider selector and alias as a provider-key credential", () => {
-    const selectors = new Set([
-      "inference",
-      ...Object.keys(NON_INTERACTIVE_PROVIDER_ALIASES),
-      ...Array.from(NON_INTERACTIVE_PROVIDER_KEYS),
-    ]);
-
-    for (const selector of selectors) {
-      expect(isProviderKeyCredentialCandidate(selector)).toBe(false);
-    }
+  it.each(
+    Array.from(
+      new Set([
+        "inference",
+        ...Object.keys(NON_INTERACTIVE_PROVIDER_ALIASES),
+        ...Array.from(NON_INTERACTIVE_PROVIDER_KEYS),
+      ]),
+      (value) => [value],
+    ),
+  )("rejects provider selector %s as a provider-key credential", (selector) => {
+    expect(isProviderKeyCredentialCandidate(selector)).toBe(false);
   });
 
   it.each([
@@ -388,19 +582,22 @@ describe("onboard provider helpers", () => {
     "openai",
     "routed",
     "vllm",
-  ])("keeps Deep Agents provider-key selector %s from being staged as a credential", (providerKey) => {
-    withProviderEnv(
-      {
-        NEMOCLAW_AGENT: "langchain-deepagents-code",
-        NEMOCLAW_PROVIDER_KEY: providerKey,
-      },
-      () => {
-        expect(stageHostedInferenceSourceSecretEnv()).toBe(false);
-        expect(process.env.NEMOCLAW_PROVIDER).toBeUndefined();
-        expect(process.env.COMPATIBLE_API_KEY).toBeUndefined();
-      },
-    );
-  });
+  ])(
+    "keeps Deep Agents provider-key selector %s from being staged as a credential",
+    (providerKey) => {
+      withProviderEnv(
+        {
+          NEMOCLAW_AGENT: "langchain-deepagents-code",
+          NEMOCLAW_PROVIDER_KEY: providerKey,
+        },
+        () => {
+          expect(stageHostedInferenceSourceSecretEnv()).toBe(false);
+          expect(process.env.NEMOCLAW_PROVIDER).toBeUndefined();
+          expect(process.env.COMPATIBLE_API_KEY).toBeUndefined();
+        },
+      );
+    },
+  );
 
   it("keeps generic NEMOCLAW_PROVIDER_KEY from implying hosted custom inference", () => {
     withProviderEnv(
@@ -494,6 +691,207 @@ describe("onboard provider helpers", () => {
     );
   });
 
+  it("imports the endpointless profile before creating a static messaging provider (#9875)", () => {
+    const credential = "discord-credential-must-not-leak";
+    const calls: Array<{ command: string[]; env?: Record<string, string | undefined> }> = [];
+    let created = false;
+    const providers = upsertMessagingProviders(
+      [
+        {
+          name: "alpha-discord-bridge",
+          envKey: "DISCORD_BOT_TOKEN",
+          token: credential,
+          providerType: "nemoclaw-mcp-v1",
+        },
+      ],
+      (command, options) => {
+        calls.push({ command, env: options?.env });
+        switch (command[1]) {
+          case "profile":
+            return command.includes("export")
+              ? { status: 1, stdout: "", stderr: "provider profile not found" }
+              : { status: 0, stdout: "", stderr: "" };
+          case "get":
+            return created
+              ? {
+                  status: 0,
+                  stdout:
+                    "Name: alpha-discord-bridge\nType: nemoclaw-mcp-v1\nCredential keys: DISCORD_BOT_TOKEN\nConfig keys: <none>\n",
+                }
+              : {
+                  status: 1,
+                  stdout: "",
+                  stderr: "provider 'alpha-discord-bridge' not found",
+                };
+          case "create":
+            created = true;
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    );
+
+    expect(providers).toEqual(["alpha-discord-bridge"]);
+    expect(calls.map(({ command }) => command.join(" "))).toEqual([
+      "provider profile export nemoclaw-mcp-v1 --output json",
+      expect.stringMatching(/^provider profile import --file .*nemoclaw-mcp-v1\.yaml$/),
+      "provider get alpha-discord-bridge",
+      "provider create --name alpha-discord-bridge --type nemoclaw-mcp-v1 --credential DISCORD_BOT_TOKEN",
+      "provider get alpha-discord-bridge",
+    ]);
+    expect(calls[3]?.env).toEqual({ DISCORD_BOT_TOKEN: credential });
+    expect(calls.flatMap(({ command }) => command)).not.toContain(credential);
+  });
+
+  it("rejects credential-free reuse when the messaging profile is incompatible (#9875)", () => {
+    const commands: string[] = [];
+    const profileResults: Record<string, RunResult> = {
+      export: {
+        status: 0,
+        stdout: JSON.stringify({
+          id: "nemoclaw-mcp-v1",
+          credentials: [],
+          endpoints: [{ url: "https://foreign.example" }],
+          binaries: [],
+          inference_capable: false,
+        }),
+        stderr: "",
+      },
+    };
+
+    expect(() =>
+      upsertMessagingProviders(
+        [
+          {
+            name: "alpha-discord-bridge",
+            envKey: "DISCORD_BOT_TOKEN",
+            token: null,
+            providerType: "nemoclaw-mcp-v1",
+          },
+        ],
+        (command) => {
+          const joined = command.join(" ");
+          commands.push(joined);
+          return profileResults[command[2] ?? ""] ?? { status: 0, stdout: "", stderr: "" };
+        },
+        { bestEffort: true },
+      ),
+    ).toThrow(/does not match NemoClaw's endpointless messaging credential contract/u);
+    expect(commands).toEqual(["provider profile export nemoclaw-mcp-v1 --output json"]);
+  });
+
+  it.each([
+    ["alpha-discord-bridge", "DISCORD_BOT_TOKEN"],
+    ["alpha-slack-bridge", "SLACK_BOT_TOKEN"],
+  ])("rejects a live legacy provider before updating %s (#9875)", (name, credentialKey) => {
+    const commands: string[] = [];
+
+    expect(() =>
+      upsertMessagingProviders(
+        [
+          {
+            name,
+            envKey: credentialKey,
+            token: "test-only-messaging-credential",
+            providerType: "nemoclaw-mcp-v1",
+          },
+        ],
+        (command) => {
+          commands.push(command.join(" "));
+          return command[1] === "profile"
+            ? { status: 0, stdout: MESSAGING_ENDPOINTLESS_PROFILE_EXPORT }
+            : {
+                status: 0,
+                stdout: `Name: ${name}\nType: generic\nCredential keys: ${credentialKey}\nConfig keys: <none>\n`,
+              };
+        },
+        { bestEffort: true },
+      ),
+    ).toThrow(/does not match the required endpointless credential binding/);
+    expect(commands.some((command) => /provider (create|update)/u.test(command))).toBe(false);
+  });
+
+  it("rejects an ambiguous messaging provider lookup before mutation (#9875)", () => {
+    const mutations: string[] = [];
+    const getResult = {
+      status: 1,
+      stdout: "",
+      stderr: 'Error: status: Unavailable, message: "provider not found"',
+    };
+    const profileResult = {
+      status: 0,
+      stdout: MESSAGING_ENDPOINTLESS_PROFILE_EXPORT,
+      stderr: "",
+    };
+
+    expect(() =>
+      upsertMessagingProviders(
+        [
+          {
+            name: "alpha-discord-bridge",
+            envKey: "DISCORD_BOT_TOKEN",
+            token: "credential",
+            providerType: "nemoclaw-mcp-v1",
+          },
+        ],
+        (command) => {
+          const joined = command.join(" ");
+          const result = joined.startsWith("provider profile ")
+            ? profileResult
+            : new Map([["provider get alpha-discord-bridge", getResult]]).get(joined);
+          mutations.push(...(result ? [] : [joined]));
+          return result ?? profileResult;
+        },
+        { bestEffort: true },
+      ),
+    ).toThrow(/Could not inspect messaging provider/);
+    expect(mutations).toEqual([]);
+  });
+
+  it.each([
+    ["alpha-discord-bridge", "DISCORD_BOT_TOKEN"],
+    ["alpha-slack-bridge", "SLACK_BOT_TOKEN"],
+  ])("replaces a detached legacy provider before registering %s (#9875)", (name, credentialKey) => {
+    const commands: string[] = [];
+    let providerType = "generic";
+    const providers = upsertMessagingProviders(
+      [
+        {
+          name,
+          envKey: credentialKey,
+          token: "test-only-messaging-credential",
+          providerType: "nemoclaw-mcp-v1",
+        },
+      ],
+      (command) => {
+        commands.push(command.join(" "));
+        switch (command[1]) {
+          case "profile":
+            return { status: 0, stdout: MESSAGING_ENDPOINTLESS_PROFILE_EXPORT };
+          case "delete":
+            return { status: 0 };
+          case "create":
+            providerType = "nemoclaw-mcp-v1";
+            return { status: 0 };
+          default:
+            return {
+              status: 0,
+              stdout: `Name: ${name}\nType: ${providerType}\nCredential keys: ${credentialKey}\nConfig keys: <none>\n`,
+            };
+        }
+      },
+      { replaceExisting: true },
+    );
+
+    expect(providers).toEqual([name]);
+    expect(commands).toEqual([
+      "provider profile export nemoclaw-mcp-v1 --output json",
+      `provider get ${name}`,
+      `provider delete ${name}`,
+      `provider create --name ${name} --type nemoclaw-mcp-v1 --credential ${credentialKey}`,
+      `provider get ${name}`,
+    ]);
+  });
+
   it("updates an existing Brave Search provider in place on reuse paths", () => {
     const commands: string[] = [];
     const providers = upsertMessagingProviders(
@@ -520,6 +918,133 @@ describe("onboard provider helpers", () => {
     ]);
   });
 
+  it("revalidates policy requirements before each messaging provider mutation (#9833)", () => {
+    const commands: string[] = [];
+    const revalidationSteps = [
+      () => undefined,
+      () => undefined,
+      () => {
+        throw new Error("policy authority changed between providers");
+      },
+    ];
+
+    expect(() =>
+      upsertMessagingProviders(
+        [
+          { name: "alpha-first", envKey: "FIRST_TOKEN", token: "first" },
+          { name: "alpha-second", envKey: "SECOND_TOKEN", token: "second" },
+        ],
+        (command) => {
+          commands.push(command.join(" "));
+          return command.includes("get")
+            ? { status: 1, stdout: "", stderr: "" }
+            : { status: 0, stdout: "", stderr: "" };
+        },
+        { revalidatePolicyRequirements: () => revalidationSteps.shift()?.() },
+      ),
+    ).toThrow(/authority changed between providers/);
+    expect(commands).toEqual([
+      "provider get alpha-first",
+      "provider create --name alpha-first --type generic --credential FIRST_TOKEN",
+    ]);
+  });
+
+  it("rechecks policy authority after a provider probe and before its mutation (#9833)", () => {
+    const commands: string[] = [];
+    const revalidationSteps = [
+      () => undefined,
+      () => {
+        throw new Error("policy authority changed after provider probe");
+      },
+    ];
+
+    expect(() =>
+      upsertProvider(
+        "alpha-discord-bridge",
+        "generic",
+        "DISCORD_BOT_TOKEN",
+        null,
+        { DISCORD_BOT_TOKEN: "secret" },
+        (command) => {
+          commands.push(command.join(" "));
+          return { status: 1, stdout: "", stderr: "not found" };
+        },
+        { revalidatePolicyRequirements: () => revalidationSteps.shift()?.() },
+      ),
+    ).toThrow(/authority changed after provider probe/u);
+    expect(commands).toEqual(["provider get alpha-discord-bridge"]);
+  });
+
+  it("rejects an existing generic provider when an exact credential binding is required", () => {
+    const commands: string[] = [];
+    const result = upsertProvider(
+      "alpha-discord-bridge",
+      "discord-hermes-static-v1",
+      "DISCORD_BOT_TOKEN",
+      null,
+      { DISCORD_BOT_TOKEN: "discord-test" },
+      (command) => {
+        commands.push(command.join(" "));
+        return {
+          status: 0,
+          stdout: [
+            "Name: alpha-discord-bridge",
+            "Type: generic",
+            "Credential keys: DISCORD_BOT_TOKEN",
+            "Config keys: <none>",
+            "",
+          ].join("\n"),
+        };
+      },
+      { requireExactBinding: true },
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      status: 1,
+      reason: "binding-conflict",
+      message:
+        "Existing provider 'alpha-discord-bridge' does not match the required 'discord-hermes-static-v1' credential binding.",
+    });
+    expect(commands).toEqual([
+      "provider get alpha-discord-bridge",
+      "provider get alpha-discord-bridge",
+    ]);
+  });
+
+  it("updates an existing provider when its exact credential binding matches", () => {
+    const commands: string[] = [];
+    const result = upsertProvider(
+      "alpha-discord-bridge",
+      "discord-hermes-static-v1",
+      "DISCORD_BOT_TOKEN",
+      null,
+      { DISCORD_BOT_TOKEN: "discord-test" },
+      (command) => {
+        commands.push(command.join(" "));
+        return {
+          status: 0,
+          stdout: [
+            "Name: alpha-discord-bridge",
+            "Type: discord-hermes-static-v1",
+            "Credential keys: DISCORD_BOT_TOKEN",
+            "Config keys: <none>",
+            "",
+          ].join("\n"),
+        };
+      },
+      { requireExactBinding: true },
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(commands).toEqual([
+      "provider get alpha-discord-bridge",
+      "provider get alpha-discord-bridge",
+      "provider update alpha-discord-bridge --credential DISCORD_BOT_TOKEN",
+    ]);
+  });
+
+
   it("throws instead of exiting when best-effort messaging provider upsert fails", () => {
     const originalExit = process.exit;
     process.exit = ((code?: number | string | null) => {
@@ -545,6 +1070,143 @@ describe("onboard provider helpers", () => {
     } finally {
       process.exit = originalExit;
     }
+  });
+
+  it("reports providers changed before bridge refresh throws (#9833)", () => {
+    const configureRefreshes = vi
+      .spyOn(messagingBridgeProvider, "configureMessagingBridgeRefreshes")
+      .mockImplementation(() => {
+        throw new Error("policy authority changed");
+      });
+    try {
+      expect(() =>
+        upsertMessagingProviders(
+          [{ name: "alpha-bridge", envKey: "BRIDGE_TOKEN", token: "test-token" }],
+          () => ({ status: 0, stdout: "", stderr: "" }),
+          { bestEffort: true },
+        ),
+      ).toThrow(
+        expect.objectContaining({
+          message: expect.stringMatching(/policy authority changed.*alpha-bridge/isu),
+          mutatedProviderNames: ["alpha-bridge"],
+        }),
+      );
+    } finally {
+      configureRefreshes.mockRestore();
+    }
+  });
+
+  it("reports providers changed before bridge refresh returns failure (#9833)", () => {
+    const configureRefreshes = vi
+      .spyOn(messagingBridgeProvider, "configureMessagingBridgeRefreshes")
+      .mockReturnValue({ ok: false, reason: "refresh failed" });
+    try {
+      expect(() =>
+        upsertMessagingProviders(
+          [{ name: "alpha-bridge", envKey: "BRIDGE_TOKEN", token: "test-token" }],
+          () => ({ status: 0, stdout: "", stderr: "" }),
+          { bestEffort: true },
+        ),
+      ).toThrow(
+        expect.objectContaining({
+          message: expect.stringMatching(/token minting.*alpha-bridge/isu),
+          mutatedProviderNames: ["alpha-bridge"],
+        }),
+      );
+    } finally {
+      configureRefreshes.mockRestore();
+    }
+  });
+
+  it("classifies an exact-binding conflict without mutating the existing provider", () => {
+    const commands: string[] = [];
+
+    expect(() =>
+      upsertMessagingProviders(
+        [
+          {
+            name: "alpha-discord-bridge",
+            envKey: "DISCORD_BOT_TOKEN",
+            token: "discord-test",
+            providerType: "discord-hermes-static-v1",
+          },
+        ],
+        (command) => {
+          commands.push(command.join(" "));
+          return command.includes("profile") && command.includes("export")
+            ? { status: 0, stdout: DISCORD_STATIC_PROFILE_EXPORT }
+            : {
+                status: 0,
+                stdout: [
+                  "Name: alpha-discord-bridge",
+                  "Type: generic",
+                  "Credential keys: DISCORD_BOT_TOKEN",
+                  "Config keys: <none>",
+                  "",
+                ].join("\n"),
+              };
+        },
+        { bestEffort: true, requireExactBindings: true },
+      ),
+    ).toThrow(
+      expect.objectContaining({
+        code: "NEMOCLAW_MESSAGING_PROVIDER_BINDING_CONFLICT",
+        mutatedProviderNames: [],
+      }),
+    );
+    expect(commands).not.toContain(
+      "provider update alpha-discord-bridge --credential DISCORD_BOT_TOKEN",
+    );
+  });
+
+  it("preflights every exact binding before creating any messaging provider", () => {
+    const commands: string[] = [];
+
+    expect(() =>
+      upsertMessagingProviders(
+        [
+          {
+            name: "alpha-discord-bridge",
+            envKey: "DISCORD_BOT_TOKEN",
+            token: "alpha-discord-test",
+            providerType: "discord-hermes-static-v1",
+          },
+          {
+            name: "beta-discord-bridge",
+            envKey: "DISCORD_BOT_TOKEN",
+            token: "beta-discord-test",
+            providerType: "discord-hermes-static-v1",
+          },
+        ],
+        (command) => {
+          commands.push(command.join(" "));
+          return command[1] === "get" && command[2] === "alpha-discord-bridge"
+            ? { status: 1, stdout: "", stderr: "not found" }
+            : {
+                status: 0,
+                stdout: [
+                  "Name: beta-discord-bridge",
+                  "Type: generic",
+                  "Credential keys: DISCORD_BOT_TOKEN",
+                  "Config keys: <none>",
+                  "",
+                ].join("\n"),
+              };
+        },
+        { bestEffort: true, requireExactBindings: true },
+      ),
+    ).toThrow(
+      expect.objectContaining({
+        code: "NEMOCLAW_MESSAGING_PROVIDER_BINDING_CONFLICT",
+        mutatedProviderNames: [],
+      }),
+    );
+    expect(commands).not.toContain(
+      "provider create --name alpha-discord-bridge --type discord-hermes-static-v1 --credential DISCORD_BOT_TOKEN",
+    );
+    expect(commands.some((command) => command.includes("provider create"))).toBe(false);
+    expect(commands.some((command) => command.includes("provider update"))).toBe(false);
+    expect(commands.some((command) => command.includes("profile import"))).toBe(false);
   });
 
   it("replaces existing providers when the caller opts in (post-sandbox-delete path)", () => {
@@ -618,6 +1280,44 @@ describe("onboard provider helpers", () => {
       "sandbox provider detach spark-nemo spark-nemo-telegram-bridge",
       "provider delete spark-nemo-telegram-bridge",
       "provider create --name spark-nemo-telegram-bridge --type generic --credential TELEGRAM_BOT_TOKEN",
+    ]);
+  });
+
+  it("does not detach a sibling sandbox while replacing a recreate-owned provider (#9875)", () => {
+    const commands: string[] = [];
+
+    expect(() =>
+      upsertMessagingProviders(
+        [
+          {
+            name: "spark-nemo-telegram-bridge",
+            envKey: "TELEGRAM_BOT_TOKEN",
+            token: "tg-test",
+            providerType: "generic",
+          },
+        ],
+        (command) => {
+          const joined = command.join(" ");
+          commands.push(joined);
+          return joined === "provider delete spark-nemo-telegram-bridge"
+            ? {
+                status: 1,
+                stdout: "",
+                stderr:
+                  "Error: status: FailedPrecondition, message: \"provider 'spark-nemo-telegram-bridge' is attached to sandbox(es): sibling-live\"",
+              }
+            : { status: 0, stdout: "", stderr: "" };
+        },
+        {
+          replaceExisting: true,
+          bestEffort: true,
+          allowedSandboxes: ["spark-nemo"],
+        },
+      ),
+    ).toThrow(/sibling-live/u);
+    expect(commands).toEqual([
+      "provider get spark-nemo-telegram-bridge",
+      "provider delete spark-nemo-telegram-bridge",
     ]);
   });
 

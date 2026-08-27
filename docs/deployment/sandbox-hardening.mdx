@@ -1,15 +1,23 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Sandbox Image Hardening"
-sidebar-title: "Sandbox Hardening"
+title: "Review Sandbox Hardening"
+sidebar-title: "Review Sandbox Hardening"
 description: "Security hardening measures applied to the NemoClaw sandbox container image."
 description-agent: "Includes the sandbox container image hardening reference, covering Docker capabilities and process limits. Use when reviewing sandbox image security controls, auditing capability drops, or looking up the runtime resource limits."
 keywords: ["nemoclaw sandbox hardening", "container security", "docker capabilities", "process limits"]
 content:
   type: "reference"
+agent-variants: ["openclaw"]
 ---
 The NemoClaw sandbox image applies several security measures to reduce the attack surface and limit damage from untrusted workloads.
+
+## Immutable Managed Image Selection
+
+Stock onboarding through the OpenShell Docker driver selects an exact managed-image digest and validates the complete OpenClaw, Hermes, and LangChain Deep Agents Code publication cohort before sandbox creation.
+If registry or catalog availability prevents resolution, the ordinary `prefer-managed` path builds the shipped, reviewed repository Dockerfile instead; it never selects an unpinned `:latest` image.
+An available but incomplete, mixed, mutable, wrong-platform, or identity-inconsistent cohort fails closed before sandbox creation.
+Passing `--from <Dockerfile>` remains a separate explicit opt-in whose complete custom image must be reviewed independently.
 
 ## Removed Unnecessary Tools
 
@@ -47,15 +55,19 @@ Enforce both limits at the container runtime when that residual risk matters to 
 
 The NemoClaw entrypoint drops dangerous capabilities from the process bounding set before it starts agent services.
 It removes `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_NET_RAW`, `CAP_DAC_OVERRIDE`, `CAP_SYS_CHROOT`, `CAP_FSETID`, `CAP_SETFCAP`, `CAP_MKNOD`, `CAP_AUDIT_WRITE`, and `CAP_NET_BIND_SERVICE`.
-When `setpriv` is available, the entrypoint also removes the remaining privilege-separation capabilities during the switch from root to the `sandbox` and `gateway` users.
+The managed images install `setpriv` from `util-linux` and require it for the switch from root to the `sandbox` and `gateway` users.
+When `CAP_SETPCAP` is available, the same `setpriv` operation also removes the remaining privilege-separation capabilities from the child process bounding set.
 
-The bounding-set drop is best effort: if `capsh` or `CAP_SETPCAP` is unavailable the entrypoint logs a warning and continues with the runtime-provided capability set.
-If `setpriv` is unavailable, the entrypoint falls back to `gosu`.
+The bounding-set drop is best effort: if `capsh` or `CAP_SETPCAP` is unavailable, the entrypoint logs a warning and still uses `setpriv` to change the user, group, and supplementary groups.
+When a root entrypoint must change identity, it fails closed if `setpriv` is missing instead of starting an agent service as root.
+
 To make the drop fail-closed instead, set `NEMOCLAW_REQUIRE_CAP_DROP=1` in the entrypoint environment: the agent then refuses to start unless the agent process tree's bounding set is verified free of the dangerous capabilities.
 This is opt-in because many hosts cannot drop capabilities, including cloud VMs, Docker Desktop, and WSL environments without `CAP_SETPCAP`.
+
 The check covers the agent process tree only.
 
-For defense-in-depth, also drop all Linux capabilities at the container runtime when you launch the image directly:
+For defense-in-depth, also drop all Linux capabilities at the container runtime when you launch the image directly.
+In the examples below, `nemoclaw-sandbox` is a placeholder for the sandbox image NemoClaw builds during onboarding; substitute the image tag your install produced, which you can find with `docker images`.
 
 ```bash
 docker run --rm \
@@ -137,6 +149,9 @@ Verify Landlock availability:
 ```bash
 ls /sys/kernel/security/landlock
 ```
+
+On a kernel with Landlock support, the path exists and `ls` succeeds.
+If it reports `No such file or directory`, the kernel does not expose Landlock, and the sandbox falls back to DAC-only enforcement as described above.
 
 For production deployments, use kernel 5.13+ with Landlock enabled.
 The `test/e2e/e2e-cloud-experimental/checks/04-landlock-readonly.sh` script validates enforcement at runtime.

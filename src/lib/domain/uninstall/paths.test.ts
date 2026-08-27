@@ -32,6 +32,7 @@ describe("uninstall paths", () => {
       ...OPENSHELL_MANAGED_BINARIES.map((binary) => path.join("/xdg/bin", binary)),
     ]);
     expect(paths.helperServiceGlob).toBe(path.join("/tmp/nemo", "nemoclaw-services-*"));
+    expect(paths.huggingFaceModelCacheDir).toBe(path.join("/home/test", ".cache", "huggingface"));
     expect(paths.runtimeTempGlobs).toEqual([
       path.join("/tmp/nemo", "nemoclaw-create-*.log"),
       path.join("/tmp/nemo", "nemoclaw-tg-ssh-*.conf"),
@@ -53,7 +54,7 @@ describe("uninstall paths", () => {
       path.join("/home/test", ".config", "nemoclaw"),
     ]);
   });
-  it("#3456: exposes the Linux Docker-driver gateway state dir so uninstall can clean it", () => {
+  it("exposes the Linux Docker-driver gateway state dir so uninstall can clean it (#3456)", () => {
     // ~/.local/state/nemoclaw/ holds the openshell-gateway PID file, SQLite
     // database, audit log, and vm-driver/ state. Documented as
     // NEMOCLAW_OPENSHELL_GATEWAY_STATE_DIR in docs/reference/commands.mdx.

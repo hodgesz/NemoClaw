@@ -40,8 +40,9 @@ function expectHostAliasError(action: () => void): HostAliasesCommandError {
 }
 
 describe("host alias legacy gateway support checks", () => {
-  for (const driver of ["docker", "vm"] as const) {
-    it(`rejects ${driver} driver sandboxes before probing Docker`, () => {
+  it.each(["docker", "vm"] as const)(
+    "rejects %s driver sandboxes before probing Docker",
+    (driver) => {
       const probeLegacyGatewayContainer = vi.fn(() => ({ state: "present" as const }));
 
       const error = expectHostAliasError(() =>
@@ -56,8 +57,8 @@ describe("host alias legacy gateway support checks", () => {
       );
       expect(error.message).toContain(`which the ${driver} driver does not run`);
       expect(probeLegacyGatewayContainer).not.toHaveBeenCalled();
-    });
-  }
+    },
+  );
 
   it("reports a missing legacy gateway distinctly from Docker probe failures", () => {
     const error = expectHostAliasError(() =>
@@ -96,11 +97,17 @@ describe("host alias legacy gateway support checks", () => {
 
 describe("legacy gateway Docker probe classification", () => {
   it("classifies exact gateway container matches as present", () => {
-    const result = probeLegacyGatewayContainerWithDeps(() =>
+    const dockerPs = vi.fn(() =>
       dockerPsResult({ stdout: "openshell-cluster-nemoclaw\nother-container\n" }),
     );
+    const result = probeLegacyGatewayContainerWithDeps(dockerPs);
 
     expect(result).toEqual({ state: "present" });
+    expect(dockerPs).toHaveBeenCalledWith(["ps", "--format", "{{.Names}}"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+      timeout: 5_000,
+    });
   });
 
   it("classifies missing exact gateway container matches as absent", () => {

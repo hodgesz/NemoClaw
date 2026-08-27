@@ -14,12 +14,17 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { createServer } from "node:net";
+import os from "node:os";
 
 import {
   DASHBOARD_PORT,
   DASHBOARD_PORT_RANGE_END,
   DASHBOARD_PORT_RANGE_START,
+  GATEWAY_PORT,
 } from "../core/ports";
+import { listHostGatewayRegistryEntries } from "../state/gateway-registry";
+import { type McpLifecycleLockOptions, withMcpLifecycleLock } from "../state/mcp-lifecycle-lock";
 
 // runner.ts is still CommonJS — use require so module shape matches.
 const { runCapture } = require("../runner");
@@ -28,9 +33,30 @@ type RunCaptureFn = typeof import("../runner").runCapture;
 type SandboxRegistryEntry = {
   name: string;
   dashboardPort?: number | null;
+  hermesApiPort?: number | null;
+  scopeGatewayPort?: number;
 };
 
 export type ListSandboxesFn = () => { sandboxes: SandboxRegistryEntry[] };
+
+const DASHBOARD_PORT_RESERVATION_LOCK = "dashboard-port-reservation:host";
+
+/**
+ * Serialize host-wide dashboard-port selection through durable ownership.
+ *
+ * OpenShell forward listings are gateway-scoped while dashboard ports and the
+ * NemoClaw registry are host-scoped. Holding one cross-process lease across
+ * allocation and registration prevents onboard or snapshot restores on
+ * different gateways from selecting the same currently-free port.
+ * Callers that also need lifecycle locks must use the shared order:
+ * sandbox mutation → this host reservation → gateway route mutation.
+ */
+export function withDashboardPortReservationLock<T>(
+  operation: () => Promise<T> | T,
+  options: McpLifecycleLockOptions = {},
+): Promise<T> {
+  return withMcpLifecycleLock(DASHBOARD_PORT_RESERVATION_LOCK, operation, options);
+}
 
 // Match the broader pattern used by onboard.ts (covers CSI, OSC, and Fe escapes)
 // so colorised `openshell forward list` output parses correctly.
@@ -166,13 +192,11 @@ export function findDashboardForwardOwner(
  * The host-level bind probe also misses Docker-mediated forwards on macOS,
  * which is exactly the scenario reported on multi-instance hosts.
  *
- * The registry persists `dashboardPort` per sandbox and lives at host scope
- * (one file under `~/.nemoclaw/sandboxes.json`), so consulting it during
- * allocation closes the gap between gateway namespaces without enumerating
- * forwards across every NemoClaw gateway. The forward-list value still wins
- * for sandboxes whose forward exists on the currently selected gateway —
- * the registry view is a supplementary signal for sandboxes whose owning
- * gateway is not currently selected.
+ * The registry persists `dashboardPort` per sandbox. Allocation aggregates
+ * the default registry plus bounded real directories under `gateways/*`, so
+ * the view remains host-wide after gateway state becomes port-scoped. The
+ * forward-list value still wins for sandboxes whose forward exists on the
+ * currently selected gateway.
  */
 function mergeOccupiedPorts(
   forwardOccupied: Map<string, string>,
@@ -187,37 +211,176 @@ function mergeOccupiedPorts(
   return forwardOccupied;
 }
 
+/** Host-wide registry view shared by the allocator and the persisted-port lookup. */
+function listHostRegistrySandboxes(): { sandboxes: SandboxRegistryEntry[] } {
+  return {
+    sandboxes: listHostGatewayRegistryEntries(process.env.HOME || os.homedir()).map(
+      ({ entry, gatewayPort }) => ({
+        name: entry.name,
+        dashboardPort: entry.dashboardPort,
+        hermesApiPort: entry.hermesApiPort,
+        scopeGatewayPort: gatewayPort,
+      }),
+    ),
+  };
+}
+
 /**
  * Build a cross-gateway occupancy map (port → owning sandbox name) from the
- * persisted sandbox registry, excluding the sandbox currently being allocated
- * for. The registry is the single host-scope view of dashboard ports across
- * every NemoClaw gateway — `openshell forward list` only knows about the
+ * persisted sandbox registries, excluding the current sandbox only in the
+ * selected gateway scope. `openshell forward list` only knows about the
  * currently selected gateway's forwards, so a fresh onboard against a second
- * `NEMOCLAW_GATEWAY_PORT` gateway cannot see the first gateway's allocations
- * without this view.
+ * `NEMOCLAW_GATEWAY_PORT` gateway needs this host-wide view.
  *
- * `listSandboxes()` already degrades to an empty registry when
- * `~/.nemoclaw/sandboxes.json` is missing or unparseable, so this helper does
- * not need an extra catch-all. Any remaining error (e.g. an unreadable
- * registry file with the wrong filesystem permissions) propagates so the
- * allocator surfaces it instead of silently handing out a colliding port.
+ * Production enumeration is bounded and rejects symlinked, malformed, or
+ * unreadable registry state. Errors propagate so the allocator fails closed
+ * instead of silently handing out a colliding port.
  *
  * `listSandboxesFn` is an injectable seam for tests; production callers
- * leave it at the default that reads `~/.nemoclaw/sandboxes.json`.
+ * leave it at the host-wide default.
+ */
+function getRegistryOccupiedPorts(
+  currentSandboxName: string,
+  selectPort: (entry: SandboxRegistryEntry) => number | null | undefined,
+  listSandboxesFn?: ListSandboxesFn,
+): Map<string, string> {
+  const occupied = new Map<string, string>();
+  const list = listSandboxesFn ?? listHostRegistrySandboxes;
+  for (const entry of list().sandboxes) {
+    if (
+      entry.name === currentSandboxName &&
+      (entry.scopeGatewayPort === undefined || entry.scopeGatewayPort === GATEWAY_PORT)
+    )
+      continue;
+    const port = selectPort(entry);
+    if (typeof port !== "number" || !Number.isInteger(port) || port <= 0) continue;
+    const owner =
+      entry.scopeGatewayPort !== undefined && entry.scopeGatewayPort !== GATEWAY_PORT
+        ? `${entry.name} (gateway ${String(entry.scopeGatewayPort)})`
+        : entry.name;
+    occupied.set(String(port), owner);
+  }
+  return occupied;
+}
+
+/**
+ * Cross-gateway occupancy view for dashboard ports, keyed by port. See
+ * {@link getRegistryOccupiedPorts} for why the registry supplements the
+ * per-gateway forward list.
  */
 export function getRegistryOccupiedDashboardPorts(
   currentSandboxName: string,
   listSandboxesFn?: ListSandboxesFn,
 ): Map<string, string> {
-  const occupied = new Map<string, string>();
-  const list = listSandboxesFn ?? (require("../state/registry").listSandboxes as ListSandboxesFn);
+  return getRegistryOccupiedPorts(
+    currentSandboxName,
+    (entry) => entry.dashboardPort,
+    listSandboxesFn,
+  );
+}
+
+/**
+ * Dashboard port recorded in the registry for one sandbox on the selected
+ * gateway. The onboard resume path skips sandbox creation, which is the step
+ * that normally publishes the created sandbox's port through `CHAT_UI_URL`,
+ * so finalization re-reads the port that onboarding persisted (#8214).
+ * Returns null when the entry has no positive integer port. (#8970)
+ */
+export function getPersistedDashboardPort(
+  currentSandboxName: string,
+  listSandboxesFn?: ListSandboxesFn,
+): number | null {
+  const list = listSandboxesFn ?? listHostRegistrySandboxes;
   for (const entry of list().sandboxes) {
-    if (entry.name === currentSandboxName) continue;
+    if (entry.name !== currentSandboxName) continue;
+    if (entry.scopeGatewayPort !== undefined && entry.scopeGatewayPort !== GATEWAY_PORT) continue;
     const port = entry.dashboardPort;
-    if (typeof port !== "number" || !Number.isInteger(port) || port <= 0) continue;
-    occupied.set(String(port), entry.name);
+    if (typeof port === "number" && Number.isInteger(port) && port > 0) return port;
   }
-  return occupied;
+  return null;
+}
+
+/**
+ * Cross-gateway occupancy view for Hermes API ports. The API forward is a
+ * per-sandbox host resource just like the dashboard forward, so allocation
+ * needs the same host-wide registry view that `openshell forward list` cannot
+ * provide on its own.
+ */
+export function getRegistryOccupiedHermesApiPorts(
+  currentSandboxName: string,
+  listSandboxesFn?: ListSandboxesFn,
+): Map<string, string> {
+  return getRegistryOccupiedPorts(
+    currentSandboxName,
+    (entry) => entry.hermesApiPort,
+    listSandboxesFn,
+  );
+}
+
+/** A contiguous host-port range that one sandbox resource is allocated from. */
+export interface HostPortRange {
+  start: number;
+  end: number;
+  /** Names the resource in the range-exhausted error, e.g. "dashboard". */
+  label: string;
+  /** Operator remedy appended to the range-exhausted error. */
+  remedy: string;
+}
+
+const DASHBOARD_RANGE: HostPortRange = {
+  start: DASHBOARD_PORT_RANGE_START,
+  end: DASHBOARD_PORT_RANGE_END,
+  label: "dashboard",
+  remedy: "Free a sandbox or use --control-ui-port <N> with a port outside this range.",
+};
+
+/**
+ * Find the next available port in `range` for the given sandbox. Returns the
+ * preferred port when it is free or already owned by this sandbox, otherwise
+ * scans the range. Shared by the dashboard allocator and the Hermes API-port
+ * allocator so both apply the same forward-list, registry, and host-bind view.
+ */
+export function findAvailablePortInRange(
+  sandboxName: string,
+  preferredPort: number,
+  forwardListOutput: string | null,
+  range: HostPortRange,
+  isPortBoundCheck: (port: number) => boolean = isPortBoundOnHost,
+  registryOccupiedPorts: ReadonlyMap<string, string> = new Map(),
+): number {
+  const occupied = mergeOccupiedPorts(getOccupiedPorts(forwardListOutput), registryOccupiedPorts);
+  const hostBoundPorts: number[] = [];
+  // Try the preferred port first (it may be outside the range when a caller
+  // passes --control-ui-port), then the rest of the range. Each port is probed
+  // at most once so we don't pay for `lsof` + `sudo lsof` + Node bind multiple
+  // times per port.
+  const portsToScan = [
+    preferredPort,
+    ...Array.from({ length: range.end - range.start + 1 }, (_, i) => range.start + i).filter(
+      (p) => p !== preferredPort,
+    ),
+  ];
+  for (const p of portsToScan) {
+    const pStr = String(p);
+    const pOwner = occupied.get(pStr) ?? null;
+    if (pOwner === sandboxName) return p;
+    if (pOwner === null) {
+      if (!isPortBoundCheck(p)) return p;
+      hostBoundPorts.push(p);
+    }
+  }
+
+  const ownerLines = [...occupied.entries()]
+    .filter(([p]) => Number(p) >= range.start && Number(p) <= range.end)
+    .map(([p, s]) => `  ${p} → ${s}`);
+  const hostLines = hostBoundPorts
+    .filter((p) => p >= range.start && p <= range.end)
+    .map((p) => `  ${p} → non-OpenShell host listener`);
+  const lines = [...ownerLines, ...hostLines].join("\n");
+  throw new Error(
+    `All ${range.label} ports in range ${range.start}-${range.end} are occupied:\n${lines}\n` +
+      range.remedy,
+  );
 }
 
 export function findAvailableDashboardPort(
@@ -232,41 +395,13 @@ export function findAvailableDashboardPort(
   // explicit `getRegistryOccupiedDashboardPorts(sandboxName)` result.
   registryOccupiedPorts: ReadonlyMap<string, string> = new Map(),
 ): number {
-  const occupied = mergeOccupiedPorts(getOccupiedPorts(forwardListOutput), registryOccupiedPorts);
-  const hostBoundPorts: number[] = [];
-  // Try the preferred port first (it may be outside the dashboard range when
-  // a caller passes --control-ui-port), then the rest of the range. Each port
-  // is probed at most once so we don't pay for `lsof` + `sudo lsof` + Node
-  // bind multiple times per port.
-  const portsToScan = [
+  return findAvailablePortInRange(
+    sandboxName,
     preferredPort,
-    ...Array.from(
-      { length: DASHBOARD_PORT_RANGE_END - DASHBOARD_PORT_RANGE_START + 1 },
-      (_, i) => DASHBOARD_PORT_RANGE_START + i,
-    ).filter((p) => p !== preferredPort),
-  ];
-  for (const p of portsToScan) {
-    const pStr = String(p);
-    const pOwner = occupied.get(pStr) ?? null;
-    if (pOwner === sandboxName) return p;
-    if (pOwner === null) {
-      if (!isPortBoundCheck(p)) return p;
-      hostBoundPorts.push(p);
-    }
-  }
-
-  const ownerLines = [...occupied.entries()]
-    .filter(
-      ([p]) => Number(p) >= DASHBOARD_PORT_RANGE_START && Number(p) <= DASHBOARD_PORT_RANGE_END,
-    )
-    .map(([p, s]) => `  ${p} → ${s}`);
-  const hostLines = hostBoundPorts
-    .filter((p) => p >= DASHBOARD_PORT_RANGE_START && p <= DASHBOARD_PORT_RANGE_END)
-    .map((p) => `  ${p} → non-OpenShell host listener`);
-  const lines = [...ownerLines, ...hostLines].join("\n");
-  throw new Error(
-    `All dashboard ports in range ${DASHBOARD_PORT_RANGE_START}-${DASHBOARD_PORT_RANGE_END} are occupied:\n${lines}\n` +
-      `Free a sandbox or use --control-ui-port <N> with a port outside this range.`,
+    forwardListOutput,
+    DASHBOARD_RANGE,
+    isPortBoundCheck,
+    registryOccupiedPorts,
   );
 }
 
@@ -291,6 +426,20 @@ export interface CreateSandboxDashboardPortResult {
   preferredPort: number;
   effectivePort: number;
   chatUiUrl: string;
+}
+
+export interface DashboardPortReservation {
+  port: number;
+  release(): Promise<void>;
+}
+
+export interface DashboardPortReservationScope {
+  current: DashboardPortReservation | null;
+  release(): Promise<void>;
+}
+
+export interface ReservedCreateSandboxDashboardPortResult extends CreateSandboxDashboardPortResult {
+  reservation: DashboardPortReservation | null;
 }
 
 function normalizeChatUiUrlForParsing(chatUiUrl: string): string {
@@ -356,6 +505,183 @@ export function resolveCreateSandboxDashboardPort(
     preferredPort,
     effectivePort,
     chatUiUrl: buildCreateSandboxChatUiUrl(input.chatUiUrlEnv, input.controlUiPort, effectivePort),
+  };
+}
+
+/**
+ * Bind the selected host port until sandbox creation can start its OpenShell
+ * forward. The server closes attempted connections and does not keep the
+ * process alive. The reservation closes on normal release or process exit.
+ */
+export async function reserveDashboardPort(port: number): Promise<DashboardPortReservation> {
+  const server = createServer((socket) => socket.destroy());
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.removeListener("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.removeListener("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen({ host: "127.0.0.1", port, exclusive: true });
+  });
+  server.unref();
+
+  let released = false;
+  const closeOnExit = () => {
+    if (server.listening) server.close();
+  };
+  process.once("exit", closeOnExit);
+
+  return {
+    port,
+    async release() {
+      if (released) return;
+      released = true;
+      process.removeListener("exit", closeOnExit);
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+    },
+  };
+}
+
+function isAddressInUse(error: unknown): boolean {
+  return typeof error === "object" && error !== null && Reflect.get(error, "code") === "EADDRINUSE";
+}
+
+/**
+ * Select and bind a dashboard port before sandbox preparation begins. If a
+ * listener wins the gap between the allocation probe and bind, classify that
+ * port as occupied and select again before any sandbox side effect.
+ *
+ * A live forward owned by the target sandbox already holds its port while the
+ * caller decides whether to reuse or recreate that sandbox.
+ */
+export async function reserveCreateSandboxDashboardPort(
+  input: CreateSandboxDashboardPortInput,
+  reservePort: (port: number) => Promise<DashboardPortReservation> = reserveDashboardPort,
+): Promise<ReservedCreateSandboxDashboardPortResult> {
+  const occupied = new Map(
+    input.registryOccupiedPorts ?? getRegistryOccupiedDashboardPorts(input.sandboxName),
+  );
+  const forwardOwner = getOccupiedPorts(input.forwardListOutput);
+  while (true) {
+    const result = resolveCreateSandboxDashboardPort({
+      ...input,
+      registryOccupiedPorts: occupied,
+      warn: undefined,
+    });
+    if (forwardOwner.get(String(result.effectivePort)) === input.sandboxName) {
+      if (result.effectivePort !== result.preferredPort) {
+        input.warn?.(
+          `  ! Port ${result.preferredPort} is taken. Using port ${result.effectivePort} instead.`,
+        );
+      }
+      return { ...result, reservation: null };
+    }
+    try {
+      const reservation = await reservePort(result.effectivePort);
+      if (result.effectivePort !== result.preferredPort) {
+        input.warn?.(
+          `  ! Port ${result.preferredPort} is taken. Using port ${result.effectivePort} instead.`,
+        );
+      }
+      return { ...result, reservation };
+    } catch (error) {
+      if (!isAddressInUse(error)) throw error;
+      occupied.set(String(result.effectivePort), "non-OpenShell host listener");
+    }
+  }
+}
+
+/** Release a dashboard reservation after both successful and failed creation. */
+export async function withDashboardPortReservationScope<T>(
+  operation: (scope: DashboardPortReservationScope) => Promise<T>,
+): Promise<T> {
+  const scope: DashboardPortReservationScope = {
+    current: null,
+    release: async () => {
+      const reservation = scope.current;
+      scope.current = null;
+      await reservation?.release();
+    },
+  };
+  try {
+    return await operation(scope);
+  } finally {
+    await scope.release();
+  }
+}
+
+interface DashboardPortScopedSandboxEntryPointDeps<
+  Args extends unknown[],
+  Result,
+  BaseImageResolutionContext,
+  PortableRuntimeContext,
+  ComputePlan,
+> {
+  createBaseImageResolutionContext(): BaseImageResolutionContext;
+  createSandboxWithBaseImageResolution(
+    baseImageResolutionContext: BaseImageResolutionContext,
+    portableRuntimeContext: PortableRuntimeContext,
+    computePlan: ComputePlan,
+    managedWorkloadRebuild: null,
+    temporaryManagedRuntime: boolean,
+    temporaryManagedRuntimeCatalog: null,
+    dashboardPortReservationScope: DashboardPortReservationScope,
+    ...args: Args
+  ): Promise<Result>;
+  resolvePortableRuntimeContext(): PortableRuntimeContext;
+  resolveComputePlan(): ComputePlan;
+}
+
+export function createDashboardPortScopedSandboxEntryPoints<
+  Args extends unknown[],
+  Result,
+  BaseImageResolutionContext,
+  PortableRuntimeContext,
+  ComputePlan,
+>(
+  deps: DashboardPortScopedSandboxEntryPointDeps<
+    Args,
+    Result,
+    BaseImageResolutionContext,
+    PortableRuntimeContext,
+    ComputePlan
+  >,
+): {
+  createSandbox: (...args: Args) => Promise<Result>;
+  createSandboxWithTemporaryManagedRuntime: (...args: Args) => Promise<Result>;
+} {
+  const create = async (temporaryManagedRuntime: boolean, args: Args): Promise<Result> => {
+    const computePlan = deps.resolveComputePlan();
+    return withDashboardPortReservationScope((dashboardPortReservationScope) =>
+      deps.createSandboxWithBaseImageResolution(
+        deps.createBaseImageResolutionContext(),
+        deps.resolvePortableRuntimeContext(),
+        computePlan,
+        null,
+        temporaryManagedRuntime,
+        null,
+        dashboardPortReservationScope,
+        ...args,
+      ),
+    );
+  };
+
+  return {
+    createSandbox: (...args) => create(false, args),
+    createSandboxWithTemporaryManagedRuntime: (...args) => create(true, args),
   };
 }
 

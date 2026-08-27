@@ -2,18 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it, vi } from "vitest";
+import { managedSandboxEntry } from "../../../test/helpers/managed-policy-receipt-fixture";
 
 vi.mock("../state/registry", () => ({
   getSandbox: vi.fn(),
   getCustomPolicies: vi.fn(() => []),
+  getBaselineExclusions: vi.fn(() => []),
 }));
 
 vi.mock(".", () => ({
   getPresetEndpoints: vi.fn(),
   getGatewayPresets: vi.fn(() => null),
+  getSandboxBaselineEntryDigest: vi.fn(() => null),
+  inspectPolicyMutationAuthority: vi.fn(() => ({ authority: "nemoclaw-managed" })),
+  isAgentBasePreset: vi.fn(() => false),
   listCustomPresets: vi.fn(),
   listPresets: vi.fn(),
   loadPreset: vi.fn(),
+  loadPresetForSandbox: vi.fn(),
 }));
 
 vi.mock("./tiers", () => ({
@@ -22,8 +28,8 @@ vi.mock("./tiers", () => ({
 
 import * as registry from "../state/registry";
 import * as policies from ".";
-import { getTier } from "./tiers";
 import { classifyAccessFailure } from "./failure-classifier";
+import { getTier } from "./tiers";
 
 const SANDBOX = "alpha";
 
@@ -58,6 +64,9 @@ function mockBuiltinPresets() {
   ]);
   vi.mocked(policies.listCustomPresets).mockReturnValue([]);
   vi.mocked(policies.loadPreset).mockImplementation((name: string) => PRESET_CONTENT[name] ?? null);
+  vi.mocked(policies.loadPresetForSandbox).mockImplementation(
+    (_sandboxName: string, name: string) => PRESET_CONTENT[name] ?? null,
+  );
   vi.mocked(policies.getPresetEndpoints).mockImplementation((content: string) => {
     const hosts: string[] = [];
     const regex = /host:\s*(\S+)/g;
@@ -71,7 +80,7 @@ function mockBuiltinPresets() {
 
 function stubRegistry(entry: Partial<{ policies: string[]; policyTier: string }>) {
   vi.mocked(registry.getSandbox).mockReturnValue({
-    name: SANDBOX,
+    ...managedSandboxEntry(SANDBOX),
     policies: entry.policies,
     policyTier: entry.policyTier ?? null,
   } as ReturnType<typeof registry.getSandbox>);
@@ -93,9 +102,16 @@ function resetMocks() {
   vi.mocked(policies.listPresets).mockReset();
   vi.mocked(policies.listCustomPresets).mockReset();
   vi.mocked(policies.loadPreset).mockReset();
+  vi.mocked(policies.loadPresetForSandbox).mockReset();
   vi.mocked(policies.getPresetEndpoints).mockReset();
   vi.mocked(policies.getGatewayPresets).mockReset();
   vi.mocked(policies.getGatewayPresets).mockReturnValue(null);
+  vi.mocked(policies.inspectPolicyMutationAuthority).mockReset();
+  vi.mocked(policies.inspectPolicyMutationAuthority).mockReturnValue({
+    authority: "nemoclaw-managed",
+  } as ReturnType<typeof policies.inspectPolicyMutationAuthority>);
+  vi.mocked(policies.isAgentBasePreset).mockReset();
+  vi.mocked(policies.isAgentBasePreset).mockReturnValue(false);
   vi.mocked(getTier).mockReset();
 }
 
@@ -135,7 +151,7 @@ describe("classifyAccessFailure", () => {
     expect(result.matchedPreset).toBe("slack");
     expect(result.confidence).toBe("low");
     expect(result.reason).toContain("drift");
-    expect(result.nextStep).toContain("policy-list");
+    expect(result.nextStep).toContain("policy list");
   });
 
   it("downgrades a matched 401 to low confidence when the gateway is unavailable", () => {
@@ -187,7 +203,7 @@ describe("classifyAccessFailure", () => {
 
     expect(result.kind).toBe("blocked-by-policy");
     expect(result.matchedPreset).toBe("github");
-    expect(result.nextStep).toContain("policy-add github");
+    expect(result.nextStep).toContain("policy add github");
   });
 
   it("returns blocked-by-policy when no preset declares the host and the request is refused", () => {
@@ -292,6 +308,28 @@ describe("classifyAccessFailure", () => {
     expect(result.reason).toContain("upstream");
   });
 
+  it("treats an agent-base preset host hitting a network-block code as high-confidence upstream-unknown (#9079)", () => {
+    resetMocks();
+    mockBuiltinPresets();
+    stubTier();
+    // `slack` is enforced by the gateway via the agent base policy, not
+    // user-applied. Verification resolves to `agent-base`, which is enforced,
+    // so a block code is upstream (like `verified`), not a policy denial.
+    stubRegistry({ policies: [], policyTier: "restricted" });
+    vi.mocked(policies.isAgentBasePreset).mockReturnValue(true);
+
+    const result = classifyAccessFailure({
+      sandboxName: SANDBOX,
+      host: "api.slack.com",
+      error: { code: "EHOSTUNREACH" },
+      gatewayPresets: ["slack"],
+    });
+
+    expect(result.kind).toBe("unknown");
+    expect(result.matchedPreset).toBe("slack");
+    expect(result.confidence).toBe("high");
+  });
+
   it.each([
     "EHOSTUNREACH",
     "ENETUNREACH",
@@ -321,7 +359,7 @@ describe("classifyAccessFailure", () => {
     expect(result.matchedPreset).toBe("slack");
     expect(result.confidence).toBe("low");
     expect(result.reason).toContain(code);
-    expect(result.nextStep).toContain("policy-list");
+    expect(result.nextStep).toContain("policy list");
   });
 
   it("classifies a gateway-unavailable active-preset host hitting EHOSTUNREACH as blocked-by-policy advisory", () => {

@@ -1,41 +1,37 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { G, R, RD as _RD, YW } from "../../cli/terminal-style";
-import * as shields from "../../shields";
+import {
+  type BackupShieldsWindow,
+  openBackupShieldsWindow,
+  relockBackupShieldsWindow,
+} from "./backup-shields-window";
 
-export interface RebuildShieldsWindow {
-  relocked: boolean;
-  wasLocked: boolean;
+export type RebuildShieldsWindow = BackupShieldsWindow;
+
+function rebuildShieldsWindowOptions(sandboxName: string, cliName: string) {
+  return {
+    operation: "rebuild backup",
+    reason: "auto-unlock for rebuild",
+    retryCommand: `${cliName} ${sandboxName} rebuild`,
+    shieldsUpCommand: `${cliName} ${sandboxName} shields up`,
+    // The timer's deadline remains authoritative if rebuild dies, but it
+    // must not lock a replacement halfway through an active recreate. The
+    // exact rebuild PID/start identity acts as a renewable liveness lease;
+    // after owner death the timer retries until restoration can complete.
+    deferAutoRestoreWhileOwnerAlive: true,
+    // Existing Hermes sandboxes may predate the sealed root-guard protocol.
+    // Only the replacement flow may use this descriptor-safe compatibility
+    // transition; ordinary backup-all keeps the strict current protocol.
+    allowLegacyHermesProtocol: true,
+  };
 }
 
 export function openRebuildShieldsWindow(
   sandboxName: string,
   cliName: string,
 ): RebuildShieldsWindow | null {
-  const window = {
-    relocked: false,
-    wasLocked: !shields.isShieldsDown(sandboxName),
-  };
-  if (!window.wasLocked) return window;
-
-  console.log("");
-  console.log(`  ${YW}Shields are UP${R} — temporarily unlocking for rebuild backup...`);
-  try {
-    shields.shieldsDown(sandboxName, {
-      reason: "auto-unlock for rebuild",
-      skipTimer: true,
-      throwOnError: true,
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error("");
-    console.error(`  ${_RD}Failed to auto-unlock shields:${R} ${message}`);
-    console.error("  Sandbox is untouched — no data was lost.");
-    console.error(`  Run \`${cliName} ${sandboxName} shields down\` manually, then retry rebuild.`);
-    return null;
-  }
-  return window;
+  return openBackupShieldsWindow(sandboxName, rebuildShieldsWindowOptions(sandboxName, cliName));
 }
 
 export function printRebuildShieldsRecovery(
@@ -54,27 +50,10 @@ export function relockRebuildShieldsWindow(
   sandboxStillExists: boolean,
   cliName: string,
 ): boolean {
-  if (!window.wasLocked || window.relocked) return true;
-  if (!sandboxStillExists) {
-    console.warn("");
-    console.warn(`  ${YW}⚠${R} Cannot re-apply shields lockdown — sandbox no longer exists.`);
-    console.warn(
-      `  After recovery, run \`${cliName} ${sandboxName} shields up\` to restore lockdown.`,
-    );
-    return false;
-  }
-
-  console.log("");
-  console.log("  Re-applying shields lockdown...");
-  try {
-    shields.shieldsUp(sandboxName, { throwOnError: true });
-    console.log(`  ${G}✓${R} Shields restored to UP`);
-    window.relocked = true;
-    return true;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`  ${YW}⚠${R} Failed to re-apply shields lockdown: ${message}`);
-    console.error(`  Run \`${cliName} ${sandboxName} shields up\` manually to restore lockdown.`);
-    return false;
-  }
+  return relockBackupShieldsWindow(
+    sandboxName,
+    window,
+    sandboxStillExists,
+    rebuildShieldsWindowOptions(sandboxName, cliName),
+  );
 }

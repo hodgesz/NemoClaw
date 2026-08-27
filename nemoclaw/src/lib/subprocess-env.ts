@@ -40,13 +40,33 @@ const TLS = [
 
 const TOOLCHAIN = ["DOCKER_HOST", "KUBECONFIG", "SSH_AUTH_SOCK", "RUST_LOG", "RUST_BACKTRACE"];
 
-const ALLOWED_ENV_NAMES = new Set([...SYSTEM, ...TEMP, ...LOCALE, ...PROXY, ...TLS, ...TOOLCHAIN]);
+export const SUBPROCESS_ENV_ALLOWED_NAMES: readonly string[] = Object.freeze([
+  ...SYSTEM,
+  ...TEMP,
+  ...LOCALE,
+  ...PROXY,
+  ...TLS,
+  ...TOOLCHAIN,
+]);
+const ALLOWED_ENV_NAMES = new Set(SUBPROCESS_ENV_ALLOWED_NAMES);
 
 // ── Allowed prefixes ───────────────────────────────────────────
 
-const ALLOWED_ENV_PREFIXES = ["LC_", "XDG_", "OPENSHELL_", "GRPC_"];
+export const SUBPROCESS_ENV_ALLOWED_PREFIXES: readonly string[] = Object.freeze([
+  "LC_",
+  "XDG_",
+  "OPENSHELL_",
+  "GRPC_",
+]);
 
 // ── Public API ─────────────────────────────────────────────────
+
+export function isSubprocessEnvNameAllowed(name: string): boolean {
+  return (
+    ALLOWED_ENV_NAMES.has(name) ||
+    SUBPROCESS_ENV_ALLOWED_PREFIXES.some((prefix) => name.startsWith(prefix))
+  );
+}
 
 /**
  * When any HTTP proxy is forwarded, augment NO_PROXY so the host proxy is
@@ -73,36 +93,31 @@ const ALLOWED_ENV_PREFIXES = ["LC_", "XDG_", "OPENSHELL_", "GRPC_"];
 export function withLocalNoProxy(env: Record<string, string>): void {
   const hasProxy = env.HTTP_PROXY || env.HTTPS_PROXY || env.http_proxy || env.https_proxy;
   if (!hasProxy) return;
-  for (const key of ["NO_PROXY", "no_proxy"] as const) {
-    const current = env[key] ?? "";
-    const parts = current
+  // Canonicalize the union of both spellings, then write both, so a consumer's
+  // case precedence cannot discard exclusions configured through the other one.
+  const parts = new Set([
+    ...`${env.NO_PROXY ?? ""},${env.no_proxy ?? ""}`
       .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    let changed = false;
-    for (const host of [
-      "localhost",
-      "127.0.0.1",
-      "host.docker.internal",
-      "host.containers.internal",
-      "::1",
-      "0.0.0.0",
-      "inference.local",
-    ]) {
-      if (!parts.includes(host)) {
-        parts.push(host);
-        changed = true;
-      }
-    }
-    if (changed) env[key] = parts.join(",");
-  }
+      .map((entry) => entry.trim())
+      .filter(Boolean),
+    "localhost",
+    "127.0.0.1",
+    "host.docker.internal",
+    "host.containers.internal",
+    "::1",
+    "0.0.0.0",
+    "inference.local",
+  ]);
+  const noProxy = [...parts].join(",");
+  env.NO_PROXY = noProxy;
+  env.no_proxy = noProxy;
 }
 
 export function buildSubprocessEnv(extra?: Record<string, string>): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value === undefined) continue;
-    if (ALLOWED_ENV_NAMES.has(key) || ALLOWED_ENV_PREFIXES.some((p) => key.startsWith(p))) {
+    if (isSubprocessEnvNameAllowed(key)) {
       env[key] = value;
     }
   }

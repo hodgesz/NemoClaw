@@ -2,11 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { Flags } from "@oclif/core";
-
+import { TOOL_DISCLOSURE_VALUES, type ToolDisclosure } from "../tool-disclosure";
 import { describeAgentFlag } from "./agent-flag-help";
-import { NOTICE_ACCEPT_FLAG } from "./usage-notice";
-
-const acceptFlagName = NOTICE_ACCEPT_FLAG.replace(/^--/, "");
+import { PORTABLE_EXPERIMENTAL_PROFILE } from "./docker-driver-platform";
+import { NOTICE_ACCEPT_FLAG, NOTICE_ACCEPT_FLAG_NAME } from "./usage-notice";
 
 type AgentRegistryReader = () => readonly string[];
 
@@ -16,7 +15,7 @@ export function setAgentRegistryReaderForTest(reader: AgentRegistryReader | null
   agentRegistryReaderForTest = reader;
 }
 
-function readAgentRegistryNames(): readonly string[] {
+export function readAgentRegistryNames(): readonly string[] {
   if (agentRegistryReaderForTest) return agentRegistryReaderForTest();
   const { listAgents } = require("../agent/defs") as typeof import("../agent/defs");
   return listAgents();
@@ -48,7 +47,7 @@ function agentFlagDescription(): string {
 }
 
 export const onboardUsage = [
-  `onboard [--non-interactive] [--resume | --fresh] [--recreate-sandbox] [--gpu | --no-gpu] [--from <Dockerfile>] [--name <sandbox>] [--sandbox-gpu | --no-sandbox-gpu] [--sandbox-gpu-device <device>] [--agent <name>] [--agents <agents.yaml>] [--control-ui-port <N>] [--yes | -y] [--no-ollama-autostart] [${NOTICE_ACCEPT_FLAG}]`,
+  `onboard [--profile <name>] [--non-interactive] [--resume | --fresh] [--recreate-sandbox] [--apf-interceptor] [--gpu | --no-gpu] [--from <Dockerfile>] [--name <sandbox>] [--host-mount <host:/sandbox/path>] [--sandbox-gpu | --no-sandbox-gpu] [--sandbox-gpu-device <device>] [--vllm-gpu-device <index-or-uuid>] [--agent <name>] [--agents <agents.yaml>] [--tool-disclosure <progressive|direct>] [--observability | --no-observability] [--control-ui-port <N>] [--events=jsonl] [--yes | -y] [--no-ollama-autostart] [${NOTICE_ACCEPT_FLAG}]`,
 ];
 
 export const onboardExamples = [
@@ -56,34 +55,48 @@ export const onboardExamples = [
   "<%= config.bin %> onboard --name alpha",
   "<%= config.bin %> onboard --resume",
   "<%= config.bin %> onboard --fresh",
+  "<%= config.bin %> onboard --profile <profile-id>",
   "<%= config.bin %> onboard --from ./Dockerfile --name alpha",
+  "<%= config.bin %> onboard --name alpha --host-mount /home/user/project:/sandbox/project",
   "<%= config.bin %> onboard --agents ./agents.yaml",
   "<%= config.bin %> onboard --sandbox-gpu --sandbox-gpu-device nvidia.com/gpu=0",
   `<%= config.bin %> onboard --non-interactive --yes --name alpha ${NOTICE_ACCEPT_FLAG}`,
 ];
 
 export type OnboardFlags = {
+  "temp-managed-runtime"?: boolean;
+  "temp-managed-runtime-catalog"?: string;
   "non-interactive"?: boolean;
   resume?: boolean;
   fresh?: boolean;
   "recreate-sandbox"?: boolean;
+  "apf-interceptor"?: boolean;
   gpu?: boolean;
   "no-gpu"?: boolean;
   from?: string;
   name?: string;
+  "host-mount"?: string[];
   "sandbox-gpu"?: boolean;
   "no-sandbox-gpu"?: boolean;
   "sandbox-gpu-device"?: string;
+  "vllm-gpu-device"?: string;
   agent?: string;
   agents?: string;
+  "tool-disclosure"?: ToolDisclosure;
+  observability?: boolean;
   "control-ui-port"?: number;
+  events?: "jsonl";
   yes?: boolean;
   "no-ollama-autostart"?: boolean;
-  [acceptFlagName]?: boolean;
+  "experimental-profile"?: string;
+  profile?: string;
+  [NOTICE_ACCEPT_FLAG_NAME]?: boolean;
 };
 
-export function buildOnboardFlags(): Record<string, any> {
-  return {
+export function buildOnboardFlags(options: { includeEvents?: boolean } = {}): Record<string, any> {
+  const flags = {
+    "temp-managed-runtime": Flags.boolean({ hidden: true }),
+    "temp-managed-runtime-catalog": Flags.string({ hidden: true }),
     "non-interactive": Flags.boolean({ description: "Run without interactive prompts" }),
     resume: Flags.boolean({
       description: "Resume an interrupted onboarding session",
@@ -94,31 +107,56 @@ export function buildOnboardFlags(): Record<string, any> {
       exclusive: ["resume"],
     }),
     "recreate-sandbox": Flags.boolean({ description: "Delete and recreate an existing sandbox" }),
+    "apf-interceptor": Flags.boolean({
+      description:
+        "Create without a caller policy and require a contained sandbox-scoped policy without claiming its provenance",
+      exclusive: ["resume", "recreate-sandbox"],
+    }),
     gpu: Flags.boolean({
       description: "Require OpenShell GPU passthrough for the gateway and sandbox",
-      exclusive: ["no-gpu"],
+      exclusive: ["no-gpu", "no-sandbox-gpu"],
     }),
     "no-gpu": Flags.boolean({
       description: "Disable GPU passthrough even when an NVIDIA GPU is detected",
-      exclusive: ["gpu"],
+      exclusive: ["gpu", "sandbox-gpu"],
     }),
     from: Flags.string({ description: "Path to a Dockerfile to use as the sandbox image source" }),
     name: Flags.string({ description: "Sandbox name" }),
+    "host-mount": Flags.string({
+      description:
+        "Expose an existing absolute host directory read-only below /sandbox (repeatable)",
+      multiple: true,
+    }),
     "sandbox-gpu": Flags.boolean({
       description: "Enable direct NVIDIA GPU access inside the sandbox",
+      exclusive: ["no-gpu", "no-sandbox-gpu"],
     }),
     "no-sandbox-gpu": Flags.boolean({
       description:
         "Force CPU sandbox behavior (equivalent to NEMOCLAW_SANDBOX_GPU=0; alternative to --no-gpu when Docker Desktop WSL CDI injection fails)",
+      exclusive: ["gpu", "sandbox-gpu"],
     }),
     "sandbox-gpu-device": Flags.string({
-      description:
-        "OpenShell GPU device selector to pass to sandbox create; requires --sandbox-gpu",
+      description: "NVIDIA GPU index, UUID, or CDI device name; requires --sandbox-gpu",
+      dependsOn: ["sandbox-gpu"],
+    }),
+    "vllm-gpu-device": Flags.string({
+      description: "GPU index or UUID for the host-side vLLM container managed by NemoClaw",
     }),
     agent: Flags.string({ description: agentFlagDescription() }),
     agents: Flags.string({
       description:
         "Path to a YAML manifest declaring secondary OpenClaw agents, agents.defaults, and main-agent overrides; baked into the sandbox image",
+    }),
+    "tool-disclosure": Flags.string({
+      description:
+        "Choose progressive tool discovery or direct exposure of all session-authorized tools",
+      options: [...TOOL_DISCLOSURE_VALUES],
+    }),
+    observability: Flags.boolean({
+      allowNo: true,
+      description:
+        "Export bounded prompt, response, tool argument, and tool result content to a local OTLP collector (Deep Agents Code only)",
     }),
     "control-ui-port": Flags.integer({
       description: "Host port for the local control UI",
@@ -133,32 +171,24 @@ export function buildOnboardFlags(): Record<string, any> {
       description:
         "Skip the wizard's eager Ollama auto-start during inference-provider selection so onboard surfaces the unreachable-Ollama warning and the default fallback model; later setup steps still expect a reachable Ollama, and on Linux/systemd hosts the loopback-override path may still restart the daemon",
     }),
-    [acceptFlagName]: Flags.boolean({ description: "Accept the third-party software notice" }),
+    "experimental-profile": Flags.string({
+      hidden: true,
+      options: [PORTABLE_EXPERIMENTAL_PROFILE],
+      exclusive: ["profile"],
+    }),
+    profile: Flags.string({
+      description: "Select a serving profile shown by `nemoclaw profiles list`",
+      exclusive: ["experimental-profile"],
+    }),
+    [NOTICE_ACCEPT_FLAG_NAME]: Flags.boolean({
+      description: "Accept the third-party software notice",
+    }),
   } as Record<string, any>;
-}
-
-export function toLegacyOnboardArgs(flags: OnboardFlags): string[] {
-  const args: string[] = [];
-  if (flags["non-interactive"]) args.push("--non-interactive");
-  if (flags.resume) args.push("--resume");
-  if (flags.fresh) args.push("--fresh");
-  if (flags["recreate-sandbox"]) args.push("--recreate-sandbox");
-  if (flags.gpu) args.push("--gpu");
-  if (flags["no-gpu"]) args.push("--no-gpu");
-  if (flags.from !== undefined) args.push("--from", flags.from);
-  if (flags.name !== undefined) args.push("--name", flags.name);
-  if (flags["sandbox-gpu"]) args.push("--sandbox-gpu");
-  if (flags["no-sandbox-gpu"]) args.push("--no-sandbox-gpu");
-  if (flags["sandbox-gpu-device"] !== undefined) {
-    args.push("--sandbox-gpu-device", flags["sandbox-gpu-device"]);
+  if (options.includeEvents) {
+    flags.events = Flags.string({
+      description: "Emit versioned read-only onboarding events as JSON Lines on stdout",
+      options: ["jsonl"],
+    });
   }
-  if (flags.agent !== undefined) args.push("--agent", flags.agent);
-  if (flags.agents !== undefined) args.push("--agents", flags.agents);
-  if (flags["control-ui-port"] !== undefined) {
-    args.push("--control-ui-port", String(flags["control-ui-port"]));
-  }
-  if (flags.yes) args.push("--yes");
-  if (flags["no-ollama-autostart"]) args.push("--no-ollama-autostart");
-  if (flags[acceptFlagName]) args.push(NOTICE_ACCEPT_FLAG);
-  return args;
+  return flags;
 }

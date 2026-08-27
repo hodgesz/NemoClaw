@@ -1,30 +1,34 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { runOpenshell } from "../adapters/openshell/runtime";
 import {
   type GarbageCollectImagesOptions,
   type UpgradeSandboxesOptions,
 } from "../domain/lifecycle/options";
 import { recoverNamedGatewayRuntime as recoverNamedGatewayRuntimeAction } from "../gateway-runtime-action";
+import type { OnboardFlags } from "../onboard/command-support";
 import { runDeployAction as executeDeployAction } from "./deploy";
 import {
   backupAll as executeBackupAllAction,
   garbageCollectImages as executeGarbageCollectImagesAction,
 } from "./maintenance";
-import {
-  runOnboardAction as executeOnboardAction,
-  runSetupAction as executeSetupAction,
-  runSetupSparkAction as executeSetupSparkAction,
-} from "./onboard";
+import { runOnboardAction as executeOnboardAction, type OnboardActionRuntimeDeps } from "./onboard";
 import { help, version } from "./root-help";
 
 type GatewayRecovery = { recovered: boolean };
 
+export type ManagedMcpCredentialReservation = {
+  sandboxName: string;
+  server: string;
+  credentialKeys: readonly string[];
+};
+
 type GlobalCliActionRuntimeHooks = {
   recoverNamedGatewayRuntime?: () => Promise<GatewayRecovery>;
-  runOpenshell?: typeof runOpenshell;
   upgradeSandboxes?: (options?: string[] | UpgradeSandboxesOptions) => Promise<void>;
+  recordExtraProvider?: (name: string) => boolean;
+  forgetExtraProvider?: (name: string) => boolean;
+  listManagedMcpCredentialReservations?: () => readonly ManagedMcpCredentialReservation[];
 };
 
 let runtimeHooks: GlobalCliActionRuntimeHooks = {};
@@ -33,16 +37,11 @@ export function setGlobalCliActionRuntimeHooksForTest(hooks: GlobalCliActionRunt
   runtimeHooks = hooks;
 }
 
-export async function runOnboardAction(args: string[] = []): Promise<void> {
-  await executeOnboardAction(args);
-}
-
-export async function runSetupAction(args: string[] = []): Promise<void> {
-  await executeSetupAction(args);
-}
-
-export async function runSetupSparkAction(args: string[] = []): Promise<void> {
-  await executeSetupSparkAction(args);
+export async function runOnboardAction(
+  flags: OnboardFlags,
+  runtimeDeps: OnboardActionRuntimeDeps = {},
+): Promise<void> {
+  await executeOnboardAction(flags, runtimeDeps);
 }
 
 export async function runDeployAction(instanceName?: string): Promise<void> {
@@ -87,17 +86,33 @@ export async function recoverNamedGatewayRuntime(): Promise<GatewayRecovery> {
   return recoverNamedGatewayRuntimeAction();
 }
 
-export function runOpenshellProviderCommand(
-  args: string[],
-  opts?: {
-    env?: Record<string, string | undefined>;
-    ignoreError?: boolean;
-    stdio?: import("node:child_process").StdioOptions;
-    timeout?: number;
-  },
-) {
-  if (typeof runtimeHooks.runOpenshell === "function") {
-    return runtimeHooks.runOpenshell(args, opts);
+export function recordExtraProvider(name: string): boolean {
+  if (typeof runtimeHooks.recordExtraProvider === "function") {
+    return runtimeHooks.recordExtraProvider(name);
   }
-  return runOpenshell(args, opts);
+  const { addExtraProvider } = require("../state/registry/extra-providers") as {
+    addExtraProvider: (name: string) => boolean;
+  };
+  return addExtraProvider(name);
+}
+
+export function forgetExtraProvider(name: string): boolean {
+  if (typeof runtimeHooks.forgetExtraProvider === "function") {
+    return runtimeHooks.forgetExtraProvider(name);
+  }
+  const { removeExtraProvider } = require("../state/registry/extra-providers") as {
+    removeExtraProvider: (name: string) => boolean;
+  };
+  return removeExtraProvider(name);
+}
+
+export function listManagedMcpCredentialReservations(): readonly ManagedMcpCredentialReservation[] {
+  if (typeof runtimeHooks.listManagedMcpCredentialReservations === "function") {
+    return runtimeHooks.listManagedMcpCredentialReservations();
+  }
+  const { listManagedMcpCredentialReservations: queryReservations } =
+    require("../state/registry/mcp-credential-reservations") as {
+      listManagedMcpCredentialReservations: () => readonly ManagedMcpCredentialReservation[];
+    };
+  return queryReservations();
 }

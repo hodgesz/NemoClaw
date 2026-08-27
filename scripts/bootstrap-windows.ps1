@@ -37,6 +37,9 @@
 
 .PARAMETER Resume
     Internal switch used by the one-time RunOnce reboot continuation.
+
+.PARAMETER ElevatedChild
+    Internal switch used by the administrator child process.
 #>
 
 [CmdletBinding()]
@@ -46,7 +49,8 @@ param(
     [string]$InstallerArgs = '',
     [bool]$InstallDockerDesktop = $true,
     [switch]$AutoReboot,
-    [switch]$Resume
+    [switch]$Resume,
+    [switch]$ElevatedChild
 )
 
 Set-StrictMode -Version Latest
@@ -58,11 +62,25 @@ if (-not $env:SystemRoot) {
 
 $script:RunOnceKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
 $script:RunOnceValueName = 'NVIDIA.NemoClaw.WindowsBootstrap'
-$script:DockerDesktopExe = 'C:\Program Files\Docker\Docker\Docker Desktop.exe'
-$script:DockerCli = 'C:\Program Files\Docker\Docker\resources\bin\docker.exe'
+$programFilesRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
+$script:DockerDesktopMachineRoot = if ($programFilesRoot) {
+    "$programFilesRoot\Docker\Docker"
+} else {
+    'C:\Program Files\Docker\Docker'
+}
+$script:DockerDesktopUserRoot = if ($env:LOCALAPPDATA) {
+    "$env:LOCALAPPDATA\Programs\DockerDesktop"
+} else {
+    $null
+}
+$script:DockerDesktopApprovedSignerNames = @('Docker Inc')
+$script:DeferredDockerSetupExitCode = 82
+$script:CompleteDeferredDockerSetup = $false
 $script:WingetDockerId = 'Docker.DockerDesktop'
 $script:InstallerWindowTitle = "NVIDIA NemoClaw Installer ($PID)"
 $script:InstallDistroAtHandoff = $false
+$script:WslOfflineInstallDocsUrl = 'https://learn.microsoft.com/en-us/windows/wsl/install#offline-install'
+$script:WslLatestReleaseUrl = 'https://github.com/microsoft/WSL/releases/latest'
 
 function Write-Status {
     param(
@@ -90,7 +108,10 @@ function ConvertTo-PowerShellLiteral {
 }
 
 function Get-ScriptInvocationArguments {
-    param([switch]$ResumeRun)
+    param(
+        [switch]$ResumeRun,
+        [switch]$ElevatedChildRun
+    )
 
     $args = @(
         '-NoLogo',
@@ -114,6 +135,9 @@ function Get-ScriptInvocationArguments {
     if ($ResumeRun) {
         $args += '-Resume'
     }
+    if ($ElevatedChildRun) {
+        $args += '-ElevatedChild'
+    }
     return $args
 }
 
@@ -129,14 +153,18 @@ function Invoke-SelfElevation {
     }
 
     if ($Resume) {
-        $args = Get-ScriptInvocationArguments -ResumeRun
+        $args = Get-ScriptInvocationArguments -ResumeRun -ElevatedChildRun
     } else {
-        $args = Get-ScriptInvocationArguments
+        $args = Get-ScriptInvocationArguments -ElevatedChildRun
     }
 
     Write-Host 'Requesting Administrator privileges to enable WSL...' -ForegroundColor Yellow
     $argumentLine = ($args | ForEach-Object { ConvertTo-ProcessArgument -Value $_ }) -join ' '
     $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentLine -Verb RunAs -Wait -PassThru
+    if ($proc.ExitCode -eq $script:DeferredDockerSetupExitCode) {
+        $script:CompleteDeferredDockerSetup = $true
+        return
+    }
     exit $proc.ExitCode
 }
 
@@ -246,6 +274,88 @@ function Test-DockerDesktopRunning {
     } catch {
         return $false
     }
+}
+
+function Get-DockerDesktopCandidatePath {
+    param([Parameter(Mandatory)] [ValidateSet('Desktop', 'Cli')] [string]$Component)
+
+    $relativePath = if ($Component -eq 'Desktop') { 'Docker Desktop.exe' } else { 'resources\bin\docker.exe' }
+    $roots = @($script:DockerDesktopMachineRoot, $script:DockerDesktopUserRoot) | Where-Object { $_ }
+    return @($roots | ForEach-Object { "$_\$relativePath" })
+}
+
+function Format-DockerDesktopCandidatePath {
+    param([Parameter(Mandatory)] [ValidateSet('Desktop', 'Cli')] [string]$Component)
+
+    return ((Get-DockerDesktopCandidatePath -Component $Component) -join '; ')
+}
+
+function Resolve-DockerDesktopPath {
+    param(
+        [Parameter(Mandatory)] [ValidateSet('Desktop', 'Cli')] [string]$Component,
+        [switch]$RequireTrusted
+    )
+
+    foreach ($candidate in (Get-DockerDesktopCandidatePath -Component $Component)) {
+        if ((Test-Path -LiteralPath $candidate) -and
+            (-not $RequireTrusted -or (Test-DockerDesktopExecutableTrusted -Path $candidate))) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function Test-DockerDesktopExecutableTrusted {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    try {
+        $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    } catch {
+        return $false
+    }
+    if (-not $signature -or
+        $signature.Status -ne 'Valid' -or
+        -not $signature.SignerCertificate) {
+        return $false
+    }
+    try {
+        $signerName = $signature.SignerCertificate.GetNameInfo(
+            [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+            $false
+        )
+    } catch {
+        return $false
+    }
+    return $script:DockerDesktopApprovedSignerNames -contains $signerName
+}
+
+function Test-DockerDesktopUserPath {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    if (-not $script:DockerDesktopUserRoot) {
+        return $false
+    }
+    $userRootPrefix = $script:DockerDesktopUserRoot.TrimEnd('\') + '\'
+    return $Path.StartsWith($userRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-DockerDesktopUserOperationRequired {
+    foreach ($component in @('Desktop', 'Cli')) {
+        $path = Resolve-DockerDesktopPath -Component $component -RequireTrusted
+        if ($path -and (Test-DockerDesktopUserPath -Path $path)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-DockerDesktopExecutionAllowed {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    if (-not (Test-DockerDesktopUserPath -Path $Path)) {
+        return $true
+    }
+    return -not (Test-IsAdministrator)
 }
 
 function Resolve-WslExe {
@@ -398,6 +508,22 @@ function Write-NativeOutput {
     }
 }
 
+function Write-CompactNativeOutput {
+    param([AllowNull()] $Value)
+    if ($null -eq $Value) {
+        return
+    }
+
+    $text = [string]$Value
+    $normalized = $text -replace "`r`n", "`n" -replace "`r", "`n"
+    foreach ($line in ($normalized -split "`n")) {
+        $display = ([string]$line).Replace([string][char]0, '').TrimEnd()
+        if ($display.Trim().Length -gt 0) {
+            Write-Host $display
+        }
+    }
+}
+
 function Invoke-NativeCommandOutput {
     param(
         [Parameter(Mandatory)] [string]$FilePath,
@@ -428,7 +554,7 @@ function Install-DockerDesktop {
         Write-Status 'InstallDockerDesktop=$false; skipping Docker Desktop install.'
         return
     }
-    if (Test-Path -LiteralPath $script:DockerDesktopExe) {
+    if (Resolve-DockerDesktopPath -Component 'Desktop' -RequireTrusted) {
         Write-Status 'Docker Desktop already installed.'
         return
     }
@@ -458,22 +584,32 @@ function Install-DockerDesktop {
         throw "Docker Desktop winget install failed with exit code $LASTEXITCODE"
     }
 
-    if (-not (Test-Path -LiteralPath $script:DockerDesktopExe)) {
-        Write-Status -Level WARN "Docker Desktop binary not found at $script:DockerDesktopExe after winget install."
+    if (-not (Resolve-DockerDesktopPath -Component 'Desktop' -RequireTrusted)) {
+        Write-Status -Level WARN "Docker Desktop not found after the winget install. Checked: $(Format-DockerDesktopCandidatePath -Component 'Desktop')."
     }
 }
 
 function Wait-DockerDesktopEngine {
     param([int]$TimeoutSeconds = 120)
-    if (-not (Test-Path -LiteralPath $script:DockerCli)) {
-        Write-Status -Level WARN "Docker CLI not found at $script:DockerCli; skipping Docker readiness wait."
+    $dockerCli = Resolve-DockerDesktopPath -Component 'Cli' -RequireTrusted
+    if (-not $dockerCli) {
+        $candidate = Resolve-DockerDesktopPath -Component 'Cli'
+        if ($candidate) {
+            Write-Status -Level ERROR "Docker CLI at $candidate is not signed by a trusted publisher. The script skips the Docker engine readiness check."
+        } else {
+            Write-Status -Level WARN "Docker CLI not found. The script skips the Docker engine readiness check. Checked: $(Format-DockerDesktopCandidatePath -Component 'Cli')."
+        }
+        return $false
+    }
+    if (-not (Test-DockerDesktopExecutionAllowed -Path $dockerCli)) {
+        Write-Status -Level ERROR "Docker CLI at $dockerCli is installed for the current user. Refusing to run it from this elevated process. Rerun the bootstrap from a non-elevated PowerShell window."
         return $false
     }
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         try {
-            & $script:DockerCli info *> $null
+            & $dockerCli info *> $null
             if ($LASTEXITCODE -eq 0) {
                 Write-Status 'Docker engine is responsive.'
                 return $true
@@ -492,8 +628,18 @@ function Start-DockerDesktop {
     if (-not $InstallDockerDesktop) {
         return
     }
-    if (-not (Test-Path -LiteralPath $script:DockerDesktopExe)) {
-        Write-Status -Level WARN 'Docker Desktop is not installed; cannot start it.'
+    $dockerDesktopExe = Resolve-DockerDesktopPath -Component 'Desktop' -RequireTrusted
+    if (-not $dockerDesktopExe) {
+        $candidate = Resolve-DockerDesktopPath -Component 'Desktop'
+        if ($candidate) {
+            Write-Status -Level ERROR "Docker Desktop at $candidate is not signed by a trusted publisher. Refusing to launch it."
+        } else {
+            Write-Status -Level WARN "Docker Desktop not found. The script cannot start it. Checked: $(Format-DockerDesktopCandidatePath -Component 'Desktop')."
+        }
+        return
+    }
+    if (-not (Test-DockerDesktopExecutionAllowed -Path $dockerDesktopExe)) {
+        Write-Status -Level ERROR "Docker Desktop at $dockerDesktopExe is installed for the current user. Refusing to launch it from this elevated process. Rerun the bootstrap from a non-elevated PowerShell window."
         return
     }
 
@@ -503,12 +649,7 @@ function Start-DockerDesktop {
     } else {
         Write-Status 'Launching Docker Desktop...'
     }
-    Start-Process -FilePath $script:DockerDesktopExe | Out-Null
-
-    if (-not (Test-Path -LiteralPath $script:DockerCli)) {
-        Write-Status -Level WARN "Docker CLI not found at $script:DockerCli; skipping Docker readiness wait."
-        return
-    }
+    Start-Process -FilePath $dockerDesktopExe | Out-Null
 
     Wait-DockerDesktopEngine -TimeoutSeconds 120 | Out-Null
     if ($wasRunning) {
@@ -521,14 +662,24 @@ function Start-DockerDesktop {
 }
 
 function Restart-DockerDesktop {
-    if (-not (Test-Path -LiteralPath $script:DockerCli)) {
-        Write-Status -Level WARN "Docker CLI not found at $script:DockerCli; cannot restart Docker Desktop."
+    $dockerCli = Resolve-DockerDesktopPath -Component 'Cli' -RequireTrusted
+    if (-not $dockerCli) {
+        $candidate = Resolve-DockerDesktopPath -Component 'Cli'
+        if ($candidate) {
+            Write-Status -Level ERROR "Docker CLI at $candidate is not signed by a trusted publisher. The script cannot restart Docker Desktop."
+        } else {
+            Write-Status -Level WARN "Docker CLI not found. The script cannot restart Docker Desktop. Checked: $(Format-DockerDesktopCandidatePath -Component 'Cli')."
+        }
+        return
+    }
+    if (-not (Test-DockerDesktopExecutionAllowed -Path $dockerCli)) {
+        Write-Status -Level ERROR "Docker CLI at $dockerCli is installed for the current user. Refusing to run it from this elevated process. Rerun the bootstrap from a non-elevated PowerShell window."
         return
     }
 
     Write-Status 'Restarting Docker Desktop...'
     try {
-        & $script:DockerCli desktop restart *> $null
+        & $dockerCli desktop restart *> $null
         if ($LASTEXITCODE -ne 0) {
             Write-Status -Level WARN "docker desktop restart exited with code $LASTEXITCODE."
         }
@@ -591,11 +742,15 @@ function Register-ResumeRunOnce {
     if (-not (Test-Path -LiteralPath $script:RunOnceKey)) {
         New-Item -Path $script:RunOnceKey -Force | Out-Null
     }
-    $argumentLine = (Get-ScriptInvocationArguments -ResumeRun | ForEach-Object { ConvertTo-ProcessArgument -Value $_ }) -join ' '
-    $cmd = "powershell.exe $argumentLine"
+    $cmd = Get-ManualResumeCommand
     New-ItemProperty -Path $script:RunOnceKey -Name $script:RunOnceValueName `
         -Value "!$cmd" -PropertyType String -Force | Out-Null
-    Write-Status "Registered reboot resume command."
+    Write-Status "Registered best-effort reboot resume command."
+}
+
+function Get-ManualResumeCommand {
+    $argumentLine = (Get-ScriptInvocationArguments -ResumeRun | ForEach-Object { ConvertTo-ProcessArgument -Value $_ }) -join ' '
+    return "powershell.exe $argumentLine"
 }
 
 function Unregister-ResumeRunOnce {
@@ -611,7 +766,16 @@ function Unregister-ResumeRunOnce {
 
 function Request-Reboot {
     Register-ResumeRunOnce
+    $manualResumeCommand = Get-ManualResumeCommand
     Write-Status -Level WARN 'A reboot is required to finish enabling WSL 2.'
+    Write-Host ''
+    Write-Host 'This bootstrap may resume automatically the next time you sign in.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'After reboot/sign-in, if no bootstrap window opens, rerun this command from an elevated PowerShell window:' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host "  $manualResumeCommand" -ForegroundColor White
+    Write-Host ''
+
     if ($AutoReboot) {
         Write-Status -Level WARN 'AutoReboot specified; restarting in 10 seconds. Save your work.'
         Start-Sleep -Seconds 10
@@ -620,7 +784,7 @@ function Request-Reboot {
     }
 
     Write-Host ''
-    Write-Host 'Please reboot now. This bootstrap will resume automatically the next time you sign in.' -ForegroundColor Yellow
+    Write-Host 'Please reboot now.' -ForegroundColor Yellow
     Write-Host ''
     $answer = Read-Host 'Reboot now? [Y/n]'
     if ([string]::IsNullOrWhiteSpace($answer) -or $answer.Trim().ToLowerInvariant().StartsWith('y')) {
@@ -663,6 +827,178 @@ function Enable-WslFeatures {
         Request-Reboot
     }
 
+}
+
+function Test-WslStatusReportsMissingRuntime {
+    param([AllowNull()] [string]$Output)
+
+    if (-not $Output) {
+        return $false
+    }
+    return $Output -match 'Windows Subsystem for Linux is not installed'
+}
+
+function Test-WslStatusReportsStartupBlocked {
+    param([AllowNull()] [string]$Output)
+
+    if (-not $Output) {
+        return $false
+    }
+    return ($Output -match 'WSL2 is unable to start since virtualization is not enabled') -or
+        (($Output -match 'Virtual Machine Platform') -and ($Output -match 'enablevirtualization'))
+}
+
+function Write-WslManualInstallGuidance {
+    Write-Host 'Manual WSL install links:' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host "  Offline install docs: $script:WslOfflineInstallDocsUrl" -ForegroundColor Yellow
+    Write-Host "  Latest WSL release:  $script:WslLatestReleaseUrl" -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'Download the matching .x64.msi or .arm64.msi, install it, reboot if required, then rerun this script.' -ForegroundColor Yellow
+}
+
+function Write-WslStartupBlockedNotice {
+    Write-Host ''
+    Write-Host 'Windows reports that WSL 2 cannot start yet.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'This script will try to repair the required WSL components automatically.' -ForegroundColor Yellow
+    Write-Host 'If this persists after repair and reboot, enable virtualization in firmware and confirm Virtual Machine Platform is enabled.' -ForegroundColor Yellow
+}
+
+function Write-WslStatusUnavailableNotice {
+    param([Parameter(Mandatory)] [int]$ExitCode)
+
+    Write-Host ''
+    Write-Host 'Windows Subsystem for Linux could not be verified.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host "The command 'wsl --status' exited with code $ExitCode, so this script cannot safely install or run the $DistroName WSL distro yet." -ForegroundColor Yellow
+    Write-Host 'This script will try to repair the required WSL components automatically.' -ForegroundColor Yellow
+}
+
+function Test-WslRepairOutputReportsForbidden {
+    param([AllowNull()] [string]$Output)
+
+    if (-not $Output) {
+        return $false
+    }
+    return $Output -match 'Forbidden\s*\(403\)'
+}
+
+function Test-WslOutputRequiresReboot {
+    param([AllowNull()] [string]$Output)
+
+    if (-not $Output) {
+        return $false
+    }
+    return $Output -match 'Changes will not be effective until the system is rebooted'
+}
+
+function Write-WslRepairInstructions {
+    param(
+        [Parameter(Mandatory)] [int]$ExitCode,
+        [AllowNull()] [string]$Output
+    )
+
+    Write-Host ''
+    Write-Host 'Automatic WSL repair did not complete.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host "The command 'wsl --install --no-distribution' exited with code $ExitCode." -ForegroundColor Yellow
+    if (Test-WslRepairOutputReportsForbidden -Output $Output) {
+        Write-Host 'The online WSL installer returned Forbidden (403), so this machine may require the manual/offline WSL install path.' -ForegroundColor Yellow
+    }
+    Write-Host ''
+    Write-Host 'Repair WSL, then rerun this script:' -ForegroundColor Yellow
+    Write-Host '  1. Check VPN, proxy, firewall, or Windows image policy that may block the online WSL installer.' -ForegroundColor Yellow
+    Write-Host '  2. Run: wsl --install --no-distribution' -ForegroundColor Yellow
+    Write-Host '  3. Reboot if Windows requests it.' -ForegroundColor Yellow
+    Write-Host '  4. If the online installer returns Forbidden (403) or remains blocked, install WSL manually.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-WslManualInstallGuidance
+    Write-Host ''
+}
+
+function Write-WslRepairDidNotVerifyInstructions {
+    param(
+        [Parameter(Mandatory)] [int]$StatusExitCode,
+        [AllowNull()] [string]$StatusOutput
+    )
+
+    Write-Host ''
+    Write-Host 'Automatic WSL repair completed, but WSL still could not be verified.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host "After repair, 'wsl --status' exited with code $StatusExitCode." -ForegroundColor Yellow
+    if (-not [string]::IsNullOrWhiteSpace($StatusOutput)) {
+        Write-Host ''
+        Write-Host 'wsl --status output:' -ForegroundColor Yellow
+        Write-CompactNativeOutput -Value $StatusOutput
+    }
+    Write-Host ''
+    Write-Host 'Repair WSL, then rerun this script:' -ForegroundColor Yellow
+    Write-Host '  1. Reboot if Windows requested it.' -ForegroundColor Yellow
+    Write-Host '  2. Run: wsl --status' -ForegroundColor Yellow
+    Write-Host '  3. If WSL remains unavailable, run: wsl --install --no-distribution' -ForegroundColor Yellow
+    Write-Host '  4. If the online installer returns Forbidden (403) or remains blocked, install WSL manually.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-WslManualInstallGuidance
+    Write-Host ''
+}
+
+function Invoke-WslNoDistributionInstallRepair {
+    $wsl = Resolve-WslExe
+    Write-Host ''
+    Write-Host "Attempting WSL repair: wsl --install --no-distribution" -ForegroundColor Yellow
+    Write-Host ''
+    $repairResult = Invoke-NativeCommandOutput -FilePath $wsl -ArgumentList @('--install', '--no-distribution') -MergeError
+    Write-CompactNativeOutput -Value $repairResult.Output
+
+    if ($repairResult.ExitCode -eq 0) {
+        Write-Status 'WSL repair command completed successfully.'
+        if (Test-WslOutputRequiresReboot -Output $repairResult.Output) {
+            Request-Reboot
+            return
+        }
+
+        $statusResult = Invoke-NativeCommandOutput -FilePath $wsl -ArgumentList @('--status') -MergeError
+        $statusOutput = [string]$statusResult.Output
+        if (
+            $statusResult.ExitCode -eq 0 -and
+            -not (Test-WslStatusReportsMissingRuntime -Output $statusOutput) -and
+            -not (Test-WslStatusReportsStartupBlocked -Output $statusOutput)
+        ) {
+            Write-Status 'WSL status verified after repair.'
+            return
+        }
+
+        Write-WslRepairDidNotVerifyInstructions -StatusExitCode $statusResult.ExitCode -StatusOutput $statusResult.Output
+        throw "wsl --install --no-distribution completed, but 'wsl --status' still exited with code $($statusResult.ExitCode). Repair WSL, then rerun this script."
+    }
+
+    Write-WslRepairInstructions -ExitCode $repairResult.ExitCode -Output $repairResult.Output
+    throw "wsl --install --no-distribution failed with exit code $($repairResult.ExitCode). Repair WSL, then rerun this script."
+}
+
+function Assert-WslRuntimeAvailable {
+    $wsl = Resolve-WslExe
+    $result = Invoke-NativeCommandOutput -FilePath $wsl -ArgumentList @('--status') -MergeError
+    $statusOutput = [string]$result.Output
+
+    if (Test-WslStatusReportsMissingRuntime -Output $statusOutput) {
+        Write-WslSubsystemMissingNotice -Name $DistroName
+        Invoke-WslNoDistributionInstallRepair
+        return
+    }
+
+    if (Test-WslStatusReportsStartupBlocked -Output $statusOutput) {
+        Write-WslStartupBlockedNotice
+        Invoke-WslNoDistributionInstallRepair
+        return
+    }
+
+    if ($result.ExitCode -ne 0) {
+        Write-WslStatusUnavailableNotice -ExitCode $result.ExitCode
+        Invoke-WslNoDistributionInstallRepair
+        return
+    }
 }
 
 function Get-WslDistros {
@@ -745,23 +1081,6 @@ function Get-WslInstallCommandText {
     return "wsl --install -d $Name"
 }
 
-function Wait-WslDistroRegistration {
-    param(
-        [Parameter(Mandatory)] [string]$Name,
-        [int]$TimeoutSeconds = 300
-    )
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        if ((Get-WslDistros) -contains $Name) {
-            return $true
-        }
-        Start-Sleep -Seconds 5
-    }
-
-    return $false
-}
-
 function Get-WslDistroRegistryProperties {
     param([Parameter(Mandatory)] [string]$Name)
 
@@ -822,7 +1141,29 @@ function Start-WslInstallInPowerShellWindow {
     param([Parameter(Mandatory)] [string]$Name)
 
     $wsl = Resolve-WslExe
-    $installCommand = '& {0} --install -d {1}' -f (ConvertTo-PowerShellLiteral -Value $wsl), (ConvertTo-PowerShellLiteral -Value $Name)
+    $statusPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('nemoclaw-wsl-install-{0}-{1}.status' -f $PID, [guid]::NewGuid().ToString('N'))
+    $logPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('nemoclaw-wsl-install-{0}-{1}.log' -f $PID, [guid]::NewGuid().ToString('N'))
+    $failurePrefix = "wsl --install -d $Name failed with exit code "
+    $successMessage = "Ubuntu installer command exited. This window will close automatically."
+    $installCommand = @(
+        '$ErrorActionPreference = ''Continue'''
+        ('$statusPath = {0}' -f (ConvertTo-PowerShellLiteral -Value $statusPath))
+        ('$logPath = {0}' -f (ConvertTo-PowerShellLiteral -Value $logPath))
+        '$transcriptStarted = $false'
+        'try { Start-Transcript -Path $logPath -Force | Out-Null; $transcriptStarted = $true } catch { }'
+        ('& {0} --install -d {1}' -f (ConvertTo-PowerShellLiteral -Value $wsl), (ConvertTo-PowerShellLiteral -Value $Name))
+        '$wslExitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }'
+        "Write-Host ''"
+        'if ($wslExitCode -ne 0) {'
+        ('    Write-Host ({0} + $wslExitCode) -ForegroundColor Red' -f (ConvertTo-PowerShellLiteral -Value $failurePrefix))
+        '    Write-Host ''Resolve the error above, then rerun the NemoClaw Windows bootstrap.'' -ForegroundColor Yellow'
+        '} else {'
+        ('    Write-Host {0} -ForegroundColor Cyan' -f (ConvertTo-PowerShellLiteral -Value $successMessage))
+        '}'
+        'if ($transcriptStarted) { try { Stop-Transcript | Out-Null } catch { } }'
+        'try { [System.IO.File]::WriteAllText($statusPath, [string]$wslExitCode) } catch { }'
+        'if ($wslExitCode -ne 0) { exit $wslExitCode }'
+    ) -join "`n"
     $installArguments = @(
         '-NoLogo',
         '-NoProfile',
@@ -833,7 +1174,259 @@ function Start-WslInstallInPowerShellWindow {
     )
     $installArgumentLine = ($installArguments | ForEach-Object { ConvertTo-ProcessArgument -Value $_ }) -join ' '
 
-    Start-Process -FilePath 'powershell.exe' -ArgumentList $installArgumentLine | Out-Null
+    $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $installArgumentLine -PassThru
+    $processId = $null
+    if ($process) {
+        $idProperty = $process.PSObject.Properties['Id']
+        if ($null -ne $idProperty -and $null -ne $idProperty.Value) {
+            $processId = [int]$idProperty.Value
+        }
+    }
+
+    return [pscustomobject]@{
+        StatusPath = $statusPath
+        LogPath = $logPath
+        ProcessId = $processId
+    }
+}
+
+function Get-WslInstallExitCode {
+    param([AllowNull()] [string]$StatusPath)
+
+    if ([string]::IsNullOrWhiteSpace($StatusPath)) {
+        return $null
+    }
+
+    try {
+        if (-not (Test-Path -LiteralPath $StatusPath)) {
+            return $null
+        }
+        $rawStatus = (Get-Content -LiteralPath $StatusPath -Raw).Trim()
+        if ([string]::IsNullOrWhiteSpace($rawStatus)) {
+            return $null
+        }
+        return [int]$rawStatus
+    } catch {
+        Write-Status -Level WARN "Could not read WSL install status file: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Wait-WslDistroRegistrationOrInstallExit {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [AllowNull()] [string]$StatusPath,
+        [int]$TimeoutSeconds = 300
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if ((Get-WslDistros) -contains $Name) {
+            return [pscustomobject]@{
+                Registered = $true
+                ExitCode = Get-WslInstallExitCode -StatusPath $StatusPath
+            }
+        }
+
+        $exitCode = Get-WslInstallExitCode -StatusPath $StatusPath
+        if ($null -ne $exitCode) {
+            return [pscustomobject]@{
+                Registered = (Get-WslDistros) -contains $Name
+                ExitCode = $exitCode
+            }
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    $finalExitCode = Get-WslInstallExitCode -StatusPath $StatusPath
+    return [pscustomobject]@{
+        Registered = (Get-WslDistros) -contains $Name
+        ExitCode = $finalExitCode
+    }
+}
+
+function Get-WslInstallLog {
+    param(
+        [AllowNull()] [string]$LogPath,
+        [switch]$SuppressWarnings
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LogPath)) {
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath $LogPath)) {
+        return $null
+    }
+
+    try {
+        return Get-Content -LiteralPath $LogPath -Raw
+    } catch {
+        if (-not $SuppressWarnings) {
+            Write-Status -Level WARN "Could not read WSL install log: $($_.Exception.Message)"
+        }
+        return $null
+    }
+}
+
+function Convert-WslInstallLogForDisplay {
+    param(
+        [AllowNull()] [string]$Log,
+        [AllowNull()] [string[]]$SensitivePaths = @()
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Log)) {
+        return $Log
+    }
+
+    $redactedMarker = '[PowerShell transcript metadata redacted.]'
+    $lines = (($Log -replace "`r`n", "`n") -replace "`r", "`n") -split "`n"
+    $separatorPattern = '^[\s\uFEFF]*\*{6,}\s*$'
+    $firstSeparator = -1
+
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match $separatorPattern) {
+            $firstSeparator = $i
+            break
+        }
+    }
+
+    if ($firstSeparator -lt 0) {
+        $transcriptEvidencePatterns = @(
+            '(?im)^\s*(?:Windows\s+)?PowerShell transcript (?:start|end)\s*$',
+            '(?i)\b(?:Start|Stop)-Transcript\b',
+            '(?i)\$transcriptStarted\b'
+        )
+        foreach ($pattern in $transcriptEvidencePatterns) {
+            if ($Log -match $pattern) {
+                return $redactedMarker
+            }
+        }
+        foreach ($path in $SensitivePaths) {
+            if (
+                -not [string]::IsNullOrWhiteSpace($path) -and
+                $Log.IndexOf($path, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            ) {
+                return $redactedMarker
+            }
+        }
+        return $Log
+    }
+
+    $headerEnd = -1
+    for ($i = $firstSeparator + 1; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match $separatorPattern) {
+            $headerEnd = $i
+            break
+        }
+    }
+
+    if ($headerEnd -lt 0) {
+        return $redactedMarker
+    }
+
+    if (($headerEnd + 1) -lt $lines.Count) {
+        $bodyLines = @($lines[($headerEnd + 1)..($lines.Count - 1)])
+    } else {
+        $bodyLines = @()
+    }
+
+    $bodySeparators = @()
+    for ($i = 0; $i -lt $bodyLines.Count; $i++) {
+        if ($bodyLines[$i] -match $separatorPattern) {
+            $bodySeparators += $i
+        }
+    }
+
+    $footerStart = -1
+    if ($bodySeparators.Count -ge 2) {
+        $footerStart = $bodySeparators[$bodySeparators.Count - 2]
+    } elseif ($bodySeparators.Count -eq 1) {
+        $footerStart = $bodySeparators[0]
+    }
+
+    if ($footerStart -ge 0) {
+        if ($footerStart -eq 0) {
+            $bodyLines = @()
+        } else {
+            $bodyLines = @($bodyLines[0..($footerStart - 1)])
+        }
+    }
+
+    $filteredBodyLines = @()
+    foreach ($line in $bodyLines) {
+        $containsSensitivePath = $false
+        foreach ($path in $SensitivePaths) {
+            if (
+                -not [string]::IsNullOrWhiteSpace($path) -and
+                $line.IndexOf($path, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            ) {
+                $containsSensitivePath = $true
+                break
+            }
+        }
+        if (-not $containsSensitivePath) {
+            $filteredBodyLines += $line
+        }
+    }
+    $bodyLines = $filteredBodyLines
+
+    $bodyStart = 0
+    $bodyEnd = $bodyLines.Count - 1
+    while ($bodyStart -le $bodyEnd -and [string]::IsNullOrWhiteSpace($bodyLines[$bodyStart])) {
+        $bodyStart++
+    }
+    while ($bodyEnd -ge $bodyStart -and [string]::IsNullOrWhiteSpace($bodyLines[$bodyEnd])) {
+        $bodyEnd--
+    }
+    if ($bodyStart -le $bodyEnd) {
+        $bodyLines = @($bodyLines[($bodyStart)..($bodyEnd)])
+    } else {
+        $bodyLines = @()
+    }
+
+    return (@($redactedMarker) + $bodyLines) -join "`n"
+}
+
+function Write-WslInstallLog {
+    param(
+        [AllowNull()] [string]$LogPath,
+        [AllowNull()] [string]$StatusPath
+    )
+
+    $log = Get-WslInstallLog -LogPath $LogPath
+    if ([string]::IsNullOrWhiteSpace($log)) {
+        return
+    }
+    $displayLog = Convert-WslInstallLogForDisplay -Log $log -SensitivePaths @($StatusPath, $LogPath)
+    if ([string]::IsNullOrWhiteSpace($displayLog)) {
+        return
+    }
+
+    Write-Host ''
+    Write-Host 'WSL install output:' -ForegroundColor Yellow
+    Write-NativeOutput -Value $displayLog
+    Write-Host ''
+}
+
+function Test-WslInstallLogRequiresReboot {
+    param([AllowNull()] [string]$LogPath)
+
+    $log = Get-WslInstallLog -LogPath $LogPath -SuppressWarnings
+    return Test-WslOutputRequiresReboot -Output $log
+}
+
+function Remove-WslInstallArtifacts {
+    param(
+        [AllowNull()] [string]$StatusPath,
+        [AllowNull()] [string]$LogPath
+    )
+
+    foreach ($path in @($StatusPath, $LogPath)) {
+        if (-not [string]::IsNullOrWhiteSpace($path)) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Stop-WslDistroForDockerIntegration {
@@ -904,21 +1497,63 @@ function Ensure-UbuntuWsl {
     if ($distros -notcontains $DistroName) {
         Write-Host ''
         Write-Host "$DistroName is not registered yet. Installing it in a separate PowerShell window..." -ForegroundColor Cyan
-        Write-Host 'Create the Unix user in that window. This script will continue automatically after setup completes.' -ForegroundColor Cyan
+        Write-Host 'Create the Unix user in that window if prompted. This script will continue after setup completes.' -ForegroundColor Cyan
         Write-Host ''
-        Start-WslInstallInPowerShellWindow -Name $DistroName
+        $installResult = Start-WslInstallInPowerShellWindow -Name $DistroName
+        $installArtifactsRemoved = $false
+        $registrationResult = Wait-WslDistroRegistrationOrInstallExit -Name $DistroName -StatusPath $installResult.StatusPath
 
-        if (-not (Wait-WslDistroRegistration -Name $DistroName)) {
+        if ($null -ne $registrationResult.ExitCode -and $registrationResult.ExitCode -ne 0) {
+            Write-WslInstallLog -LogPath $installResult.LogPath -StatusPath $installResult.StatusPath
+            Remove-WslInstallArtifacts -StatusPath $installResult.StatusPath -LogPath $installResult.LogPath
+            $installArtifactsRemoved = $true
+            Write-WslUbuntuRequiredNotice -Name $DistroName
+            throw "WSL distro install command failed with exit code $($registrationResult.ExitCode)."
+        }
+
+        if (-not $registrationResult.Registered) {
+            if ($null -ne $registrationResult.ExitCode) {
+                $installRequiresReboot = Test-WslInstallLogRequiresReboot -LogPath $installResult.LogPath
+                Write-WslInstallLog -LogPath $installResult.LogPath -StatusPath $installResult.StatusPath
+                Remove-WslInstallArtifacts -StatusPath $installResult.StatusPath -LogPath $installResult.LogPath
+                $installArtifactsRemoved = $true
+                Write-Status -Level WARN "$DistroName install command completed, but the distro is not registered yet."
+                if ($installRequiresReboot) {
+                    Write-Status -Level WARN 'A reboot is required before WSL can finish registering the distro.'
+                    Request-Reboot
+                    return
+                }
+
+                Write-Status -Level WARN 'The install output did not report that a reboot is required.'
+                Write-WslUbuntuRequiredNotice -Name $DistroName
+                throw "WSL distro '$DistroName' is still not registered after install."
+            }
+
+            Remove-WslInstallArtifacts -StatusPath $installResult.StatusPath -LogPath $installResult.LogPath
+            $installArtifactsRemoved = $true
             Write-WslUbuntuRequiredNotice -Name $DistroName
             throw "WSL distro '$DistroName' is still not registered after install."
+        }
+
+        if ($null -ne $registrationResult.ExitCode) {
+            Remove-WslInstallArtifacts -StatusPath $installResult.StatusPath -LogPath $installResult.LogPath
+            $installArtifactsRemoved = $true
         }
 
         Write-Status "WSL distro registered: $DistroName"
         $defaultUid = Wait-WslDefaultUserReady -Name $DistroName
         if ($null -eq $defaultUid) {
+            if (-not $installArtifactsRemoved) {
+                Remove-WslInstallArtifacts -StatusPath $installResult.StatusPath -LogPath $installResult.LogPath
+                $installArtifactsRemoved = $true
+            }
             throw "Timed out waiting for $DistroName first-run user creation."
         }
 
+        if (-not $installArtifactsRemoved) {
+            Remove-WslInstallArtifacts -StatusPath $installResult.StatusPath -LogPath $installResult.LogPath
+            $installArtifactsRemoved = $true
+        }
         Write-Status "$DistroName first-run user is registered (UID $defaultUid)."
         Stop-WslDistroForDockerIntegration -Name $DistroName -Reason 'after first-run setup so Docker Desktop sees a settled user profile'
     } else {
@@ -938,16 +1573,16 @@ function Write-WslSubsystemMissingNotice {
     Write-Host ''
     Write-Host 'Windows Subsystem for Linux is not fully installed.' -ForegroundColor Yellow
     Write-Host ''
-    Write-Host "The required Windows optional features are enabled, but Windows could not install or run the $Name WSL distro automatically." -ForegroundColor Yellow
-    Write-Host 'Rerun this script after WSL is available on this machine.' -ForegroundColor Yellow
-    Write-Host ''
+    Write-Host "Windows reports that the WSL runtime is not installed, so this script cannot install or run the $Name WSL distro yet." -ForegroundColor Yellow
+    Write-Host 'This script will try to repair the required WSL components automatically.' -ForegroundColor Yellow
 }
 
 function Write-DockerDesktopNotice {
-    if ((Test-Path -LiteralPath $script:DockerDesktopExe) -or (Test-Path -LiteralPath $script:DockerCli)) {
+    if ((Resolve-DockerDesktopPath -Component 'Desktop' -RequireTrusted) -or
+        (Resolve-DockerDesktopPath -Component 'Cli' -RequireTrusted)) {
         return
     }
-    Write-Status -Level WARN 'Docker Desktop was not detected. The standard installer/onboard flow will need Docker available from WSL.'
+    Write-Status -Level WARN "Docker Desktop was not detected. Checked Desktop: $(Format-DockerDesktopCandidatePath -Component 'Desktop'). Checked CLI: $(Format-DockerDesktopCandidatePath -Component 'Cli'). The standard installer/onboard flow will need Docker available from WSL."
 }
 
 function Escape-BashArgument {
@@ -1085,15 +1720,33 @@ function Write-InstallerHandoff {
 function Invoke-Main {
     Invoke-SelfElevation
     Initialize-InstallerWindowTitle
+    if ($script:CompleteDeferredDockerSetup) {
+        Start-DockerDesktop
+        if ($script:InstallDistroAtHandoff) {
+            Write-Status "Skipping Docker-in-WSL verification until $DistroName first-run setup completes."
+        } else {
+            Ensure-DockerWslIntegration
+        }
+        Write-DockerDesktopNotice
+        Write-Status 'Windows preparation completed successfully.'
+        Write-InstallerHandoff
+        return
+    }
     if ($Resume) {
         Unregister-ResumeRunOnce
         Write-Status 'Resuming after reboot...'
     }
 
     Enable-WslFeatures
+    Assert-WslRuntimeAvailable
     Ensure-UbuntuWsl
     Install-DockerDesktop
     Enable-DockerDesktopWslIntegration -Name $DistroName
+    if ($ElevatedChild -and (Test-DockerDesktopUserOperationRequired)) {
+        Unregister-ResumeRunOnce
+        Write-Status 'Administrator preparation is complete. Returning to the original PowerShell process to start Docker Desktop.'
+        exit $script:DeferredDockerSetupExitCode
+    }
     Start-DockerDesktop
     if ($script:InstallDistroAtHandoff) {
         Write-Status "Skipping Docker-in-WSL verification until $DistroName first-run setup completes."

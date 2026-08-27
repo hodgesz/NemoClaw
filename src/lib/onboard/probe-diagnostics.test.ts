@@ -33,6 +33,7 @@ describe("summarizeProbeForDisplay", () => {
           httpStatus: 0,
           curlStatus: 28,
           message: "curl failed (exit 28): operation timed out with token secret-key",
+          diagnosticCodes: ["anthropic-streaming-missing-message-stop"],
         },
       ],
     });
@@ -42,6 +43,47 @@ describe("summarizeProbeForDisplay", () => {
     expect(summary).not.toContain("operation timed out with token");
   });
 
+  it("surfaces allowlisted streaming diagnostics without raw provider text (#6289)", () => {
+    const summary = summarizeProbeForDisplay({
+      message: "raw provider response with secret-key",
+      failures: [
+        {
+          name: "Anthropic Messages API (streaming)",
+          httpStatus: 200,
+          curlStatus: 0,
+          message: "raw provider response with secret-key",
+          diagnosticCodes: [
+            "anthropic-streaming-duplicate-message-start",
+            "provider-controlled-diagnostic",
+          ],
+        },
+      ],
+    });
+
+    expect(summary).toBe("Anthropic Messages API (streaming): duplicate message_start");
+    expect(summary).not.toContain("secret-key");
+    expect(summary).not.toContain("provider-controlled-diagnostic");
+  });
+
+  it("preserves streaming timeout recovery when a partial HTTP 200 stream times out", () => {
+    const summary = summarizeProbeForDisplay({
+      message: "partial stream with secret-key",
+      failures: [
+        {
+          name: "Anthropic Messages API (streaming)",
+          httpStatus: 200,
+          curlStatus: 28,
+          message: "partial stream with secret-key",
+          diagnosticCodes: ["anthropic-streaming-missing-message-stop"],
+        },
+      ],
+    });
+
+    expect(summary).toBe("Anthropic Messages API (streaming): curl exit 28");
+    expect(summary).not.toContain("secret-key");
+    expect(summary).not.toContain("partial stream");
+  });
+
   it("falls back to coarse message classification", () => {
     expect(summarizeProbeForDisplay({ message: "HTTP 404: not found for secret-key" })).toBe(
       "HTTP 404",
@@ -49,5 +91,66 @@ describe("summarizeProbeForDisplay", () => {
     expect(summarizeProbeForDisplay({ message: "request timed out with secret-key" })).toBe(
       "timeout",
     );
+  });
+  it("surfaces a missing structured tool call without raw provider text (#8714)", () => {
+    const summary = summarizeProbeForDisplay({
+      message: "raw provider response with secret-key",
+      failures: [
+        {
+          name: "Chat Completions API",
+          httpStatus: 200,
+          curlStatus: 0,
+          message: "raw provider response with secret-key",
+          body: "raw provider response with secret-key",
+          diagnosticCodes: ["openai-chat-missing-structured-tool-call"],
+        },
+      ],
+    });
+
+    expect(summary).toBe("Chat Completions API: missing structured tool call");
+    expect(summary).not.toContain("secret-key");
+    expect(summary).not.toContain("raw provider response");
+  });
+
+  it("surfaces an exhausted reasoning budget without raw provider text (#8714)", () => {
+    const summary = summarizeProbeForDisplay({
+      failures: [
+        {
+          name: "Chat Completions API",
+          httpStatus: 200,
+          curlStatus: 0,
+          message: "raw provider response with secret-key",
+          body: "raw provider response with secret-key",
+          diagnosticCodes: [
+            "openai-chat-missing-structured-tool-call",
+            "openai-chat-reasoning-budget-exhausted",
+          ],
+        },
+      ],
+    });
+
+    expect(summary).toBe(
+      "Chat Completions API: missing structured tool call; " +
+        "reasoning used the full output-token budget before a tool call",
+    );
+    expect(summary).not.toContain("secret-key");
+  });
+
+  it("surfaces a leaked plain-text tool call without raw provider text (#8714)", () => {
+    const summary = summarizeProbeForDisplay({
+      failures: [
+        {
+          name: "Chat Completions API",
+          httpStatus: 200,
+          curlStatus: 0,
+          message: "raw provider response with secret-key",
+          body: "raw provider response with secret-key",
+          diagnosticCodes: ["openai-chat-tool-call-leak"],
+        },
+      ],
+    });
+
+    expect(summary).toBe("Chat Completions API: tool call leaked into plain text content");
+    expect(summary).not.toContain("secret-key");
   });
 });

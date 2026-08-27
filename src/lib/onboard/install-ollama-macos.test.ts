@@ -3,10 +3,8 @@
 
 import { describe, expect, it, vi } from "vitest";
 
-import {
-  installOllamaOnMacOS,
-  type InstallOllamaMacOSOptions,
-} from "../../../dist/lib/onboard/install-ollama-macos";
+import { MIN_HERMES_OLLAMA_CONTEXT_WINDOW } from "../inference/ollama-runtime-context";
+import { type InstallOllamaMacOSOptions, installOllamaOnMacOS } from "./install-ollama-macos";
 
 function makeOpts(overrides: Partial<InstallOllamaMacOSOptions>): InstallOllamaMacOSOptions {
   return {
@@ -54,7 +52,24 @@ describe("installOllamaOnMacOS", () => {
       (call) => typeof call[0] === "string" && call[0].includes("ollama serve"),
     );
     expect(serveCall).toBeDefined();
+    expect(serveCall?.[0]).not.toContain("OLLAMA_CONTEXT_LENGTH=");
     expect(sleepSecondsImpl).toHaveBeenCalled();
+  });
+
+  it("starts Ollama with the requested Hermes context floor", () => {
+    const runShellImpl = vi.fn();
+    const result = installOllamaOnMacOS(
+      makeOpts({
+        runShellImpl,
+        isUpgrade: false,
+        contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+      }),
+    );
+    expect(result.ok).toBe(true);
+    const serveCall = runShellImpl.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("ollama serve"),
+    );
+    expect(serveCall?.[0]).toContain(`OLLAMA_CONTEXT_LENGTH=${MIN_HERMES_OLLAMA_CONTEXT_WINDOW}`);
   });
 
   it("does not stop a daemon on a fresh install", () => {

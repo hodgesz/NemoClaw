@@ -1,11 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawnSync } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { expect } from "vitest";
+import { afterEach, expect } from "vitest";
+import {
+  LAUNCH_READINESS_FIXTURE_POLICY,
+  LAUNCH_READINESS_PAIRING_QUALIFICATION_OUTPUT,
+  launchReadinessRegistryFixture,
+} from "../helpers/launch-readiness-fixture";
+import { nonWslPlatformNodeOptions } from "../helpers/platform-override-node-options";
 import { execTimeout } from "../helpers/timeouts";
 
 /**
@@ -17,6 +23,7 @@ import { execTimeout } from "../helpers/timeouts";
 
 export type SandboxEntryFixture = {
   name: string;
+  dashboardPort?: number;
   model?: string | null;
   provider?: string | null;
   nimContainer?: string | null;
@@ -33,7 +40,85 @@ export type SetupFixtureOptions = {
   inferenceProbeResponses?: string[];
   inferenceSetStatus?: number;
   writeOllamaProxyState?: boolean;
+  gatewaySupervisorRecovery?: boolean;
+  launchReadinessRegistry?: boolean;
 };
+
+const fixtureForwardListeners = new Map<string, ChildProcess>();
+
+// A fixture can invoke runConnect more than once. Keep its advertised forward
+// live for the whole test, then tear down the child and temp tree together.
+function startFixtureForwardListener(tmpDir: string): number {
+  const readyPath = path.join(tmpDir, "forward-listener-ready");
+  const errorPath = path.join(tmpDir, "forward-listener-error");
+  const listener = spawn(
+    process.execPath,
+    [
+      "-e",
+      [
+        'const fs = require("node:fs");',
+        'const net = require("node:net");',
+        `const readyPath = ${JSON.stringify(readyPath)};`,
+        `const readyTempPath = ${JSON.stringify(`${readyPath}.tmp`)};`,
+        `const errorPath = ${JSON.stringify(errorPath)};`,
+        "const server = net.createServer((socket) => socket.end());",
+        "server.on('error', (error) => { fs.writeFileSync(errorPath, String(error)); process.exit(1); });",
+        "server.listen(0, '127.0.0.1', () => { fs.writeFileSync(readyTempPath, String(server.address().port)); fs.renameSync(readyTempPath, readyPath); });",
+        "const stop = () => server.close(() => process.exit(0));",
+        "process.on('SIGTERM', stop);",
+        "process.on('SIGINT', stop);",
+        "setTimeout(() => process.exit(0), 60000).unref();",
+      ].join("\n"),
+    ],
+    { stdio: "ignore" },
+  );
+  fixtureForwardListeners.set(tmpDir, listener);
+
+  const waitCell = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + 5_000;
+  while (!fs.existsSync(readyPath) && !fs.existsSync(errorPath) && Date.now() < deadline) {
+    Atomics.wait(waitCell, 0, 0, 10);
+  }
+  if (!fs.existsSync(readyPath)) {
+    listener.kill("SIGTERM");
+    const detail = fs.existsSync(errorPath) ? fs.readFileSync(errorPath, "utf-8") : "timeout";
+    throw new Error(`Fixture forward listener failed to start: ${detail}`);
+  }
+
+  const port = Number(fs.readFileSync(readyPath, "utf-8"));
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    listener.kill("SIGTERM");
+    throw new Error(`Fixture forward listener returned invalid port: ${String(port)}`);
+  }
+  return port;
+}
+
+async function stopFixtureForwardListener(tmpDir: string): Promise<void> {
+  const listener = fixtureForwardListeners.get(tmpDir);
+  fixtureForwardListeners.delete(tmpDir);
+  if (!listener || listener.exitCode !== null) return;
+
+  await new Promise<void>((resolve) => {
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(forceTimer);
+      clearTimeout(abandonTimer);
+      resolve();
+    };
+    const forceTimer = setTimeout(() => listener.kill("SIGKILL"), 1_000);
+    const abandonTimer = setTimeout(finish, 3_000);
+    listener.once("exit", finish);
+    listener.kill("SIGTERM");
+  });
+}
+
+afterEach(async () => {
+  const fixtureDirs = [...fixtureForwardListeners.keys()];
+  await Promise.all(fixtureDirs.map((tmpDir) => stopFixtureForwardListener(tmpDir)));
+  for (const tmpDir of fixtureDirs) fs.rmSync(tmpDir, { recursive: true, force: true });
+});
 
 export function isHostWsl() {
   return (
@@ -54,7 +139,12 @@ function writeRegistryState(
     path.join(registryDir, "sandboxes.json"),
     JSON.stringify({
       defaultSandbox: sandboxName,
-      sandboxes: { [sandboxName]: sandboxEntry },
+      sandboxes: {
+        [sandboxName]: {
+          ...(options.launchReadinessRegistry ? launchReadinessRegistryFixture() : {}),
+          ...sandboxEntry,
+        },
+      },
     }),
     { mode: 0o600 },
   );
@@ -92,10 +182,15 @@ function initStateFile(stateFile: string, options: SetupFixtureOptions) {
       curlCalls: [],
       curlEnvs: [],
       inferenceProbeExitStatuses: options.inferenceProbeExitStatuses ?? [],
-      inferenceProbeResponses: options.inferenceProbeResponses ?? ["OK 200"],
+      inferenceProbeResponses: options.inferenceProbeResponses ?? ["OK 200", "OK 200"],
+      inferenceGetCalls: [],
       inferenceSetCalls: [],
       sandboxConnectCalls: [],
       sandboxExecCalls: [],
+      sandboxExecInputs: [],
+      gatewayControlCalls: [],
+      gatewaySupervisorRecovery: options.gatewaySupervisorRecovery ?? false,
+      gatewayRunning: options.gatewaySupervisorRecovery !== true,
     }),
   );
 }
@@ -109,6 +204,7 @@ function writeOpenshellStub(
   stateFile: string,
   sandboxName: string,
   inferenceBlock: string,
+  dashboardPort: number,
   options: SetupFixtureOptions,
 ) {
   writeExecutable(
@@ -129,7 +225,11 @@ if (args[0] === "gateway" && args[1] === "info") {
   process.exit(0);
 }
 
-if (args[0] === "sandbox" && args[1] === "get" && args[2] === ${JSON.stringify(sandboxName)}) {
+if (
+  args[0] === "sandbox" &&
+  args[1] === "get" &&
+  args[args.length - 1] === ${JSON.stringify(sandboxName)}
+) {
   process.stdout.write("Sandbox:\\n\\n  \\x1b[2mId:\\x1b[0m abc\\n  Name: ${sandboxName}\\n  Phase: Ready\\n");
   process.exit(0);
 }
@@ -140,26 +240,23 @@ if (args[0] === "sandbox" && args[1] === "list") {
 }
 
 if (args[0] === "sandbox" && args[1] === "exec") {
+  const input = fs.readFileSync(0, "utf8");
   state.sandboxExecCalls.push(args);
-  const command = args.join(" ");
+  state.sandboxExecInputs.push(input);
+  const command = [args.join(" "), input].filter(Boolean).join("\\n");
   if (!command.includes("inference.local/v1/models")) {
     fs.writeFileSync(stateFile, JSON.stringify(state));
+    if (input.includes("NEMOCLAW_OPENCLAW_STATE_DIR_B64=")) {
+      process.stdout.write(${JSON.stringify(`${LAUNCH_READINESS_PAIRING_QUALIFICATION_OUTPUT}\n`)});
+      process.exit(0);
+    }
     // Test hook (#4263 / CodeRabbit): when the connect-time auto-pair
     // approval pass is specifically targeted, simulate the failure
-    // path the production code must tolerate. The approval-pass script is
-    // base64-wrapped for OpenShell exec, so decode the payload first; it is
-    // identifiable by its embedded \`openclaw devices approve\` call.
-    let approvalCmd = command;
-    const wrapMatch = command.match(/printf %s '([A-Za-z0-9+/=]+)' \\| base64 -d/);
-    if (wrapMatch) {
-      try {
-        approvalCmd = Buffer.from(wrapMatch[1], "base64").toString("utf8");
-      } catch (_err) {
-        approvalCmd = command;
-      }
-    }
+    // path the production code must tolerate. The approval program is carried
+    // on stdin so it does not exceed OpenShell command-argument transport.
+    const approvalCmd = input;
     if (
-      process.env.NEMOCLAW_TEST_FAIL_APPROVAL_PASS === "1" &&
+      process.env.OPENSHELL_TEST_FAIL_APPROVAL_PASS === "1" &&
       approvalCmd.includes("openclaw") &&
       approvalCmd.includes("devices") &&
       approvalCmd.includes("approve")
@@ -171,14 +268,15 @@ if (args[0] === "sandbox" && args[1] === "exec") {
     // STOPPED so the probe path takes the not-running branch and (when recovery
     // also fails) the probe-failure exit — where the approval sweep must NOT run.
     if (
-      process.env.NEMOCLAW_TEST_GATEWAY_DOWN === "1" &&
+      process.env.OPENSHELL_TEST_GATEWAY_DOWN === "1" &&
       command.includes("/health") &&
       command.includes("HTTP_CODE")
     ) {
       process.stdout.write("__NEMOCLAW_SANDBOX_EXEC_STARTED__\\nSTOPPED\\n");
       process.exit(0);
     }
-    process.stdout.write("__NEMOCLAW_SANDBOX_EXEC_STARTED__\\nRUNNING\\n");
+    const gatewayStatus = state.gatewayRunning === false ? "STOPPED" : "RUNNING";
+    process.stdout.write("__NEMOCLAW_SANDBOX_EXEC_STARTED__\\n" + gatewayStatus + "\\n");
     process.exit(0);
   }
   const response = state.inferenceProbeResponses.length
@@ -198,7 +296,14 @@ if (args[0] === "sandbox" && args[1] === "connect") {
 }
 
 if (args[0] === "inference" && args[1] === "get") {
+  state.inferenceGetCalls.push(args.slice(2));
+  fs.writeFileSync(stateFile, JSON.stringify(state));
   process.stdout.write(${JSON.stringify(inferenceBlock.replace(/\\n/g, "\n"))});
+  process.exit(0);
+}
+
+if (args[0] === "policy" && args[1] === "get") {
+  process.stdout.write(${JSON.stringify(LAUNCH_READINESS_FIXTURE_POLICY)});
   process.exit(0);
 }
 
@@ -209,6 +314,11 @@ if (args[0] === "inference" && args[1] === "set") {
 }
 
 if (args[0] === "logs") {
+  process.exit(0);
+}
+
+if (args[0] === "forward" && args[1] === "list") {
+  process.stdout.write("${sandboxName} 127.0.0.1 ${dashboardPort} 12345 running\\n");
   process.exit(0);
 }
 
@@ -233,9 +343,56 @@ const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
 state.dockerCalls.push(args);
 fs.writeFileSync(stateFile, JSON.stringify(state));
 const cmd = args.join(" ");
+const userIndex = args.indexOf("--user");
+const sanitizedPrefix =
+  userIndex > 1 &&
+  (userIndex - 1) % 2 === 0 &&
+  args.slice(1, userIndex).every((value, index) =>
+    index % 2 === 0 ? value === "--env" : /^[A-Z0-9_]+=.*$/.test(value)
+  );
+
+const isDirectSandboxDiscovery =
+  args[0] === "ps" &&
+  args.includes("--no-trunc") &&
+  args.includes("label=openshell.ai/managed-by=openshell") &&
+  args.includes("label=openshell.ai/sandbox-name=${sandboxName}") &&
+  args.includes("{{.ID}}\\t{{.Names}}");
+
+if (isDirectSandboxDiscovery) {
+  const directContainer = state.gatewaySupervisorRecovery
+    ? "sandbox-container-id\\topenshell-${sandboxName}-fixture\\n"
+    : "";
+  process.stdout.write(directContainer);
+  process.exit(0);
+}
 
 if (args[0] === "ps") {
   process.stdout.write("openshell-cluster-nemoclaw\\n");
+  process.exit(0);
+}
+
+if (
+  args[0] === "exec" &&
+  sanitizedPrefix &&
+  args.includes("LD_PRELOAD=") &&
+  args.includes("PYTHONUSERBASE=") &&
+  args.includes("PYTHONNOUSERSITE=1") &&
+  args.length === userIndex + 6 &&
+  args[userIndex + 1] === "root" &&
+  args[userIndex + 2] === "sandbox-container-id" &&
+  args[userIndex + 3] === "/usr/local/bin/nemoclaw-gateway-control" &&
+  args[userIndex + 4] === "recover"
+) {
+  state.gatewayControlCalls.push(args);
+  const nonce = args[userIndex + 5] || "";
+  if (!state.gatewaySupervisorRecovery || !/^[0-9a-f]{64}$/.test(nonce)) {
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+    process.stderr.write("PRIVILEGED_CONTROL_UNAVAILABLE\\n");
+    process.exit(65);
+  }
+  state.gatewayRunning = true;
+  fs.writeFileSync(stateFile, JSON.stringify(state));
+  process.stdout.write("GATEWAY_PID=4242\\n");
   process.exit(0);
 }
 
@@ -357,14 +514,19 @@ export function setupFixture(
   const curlPath = path.join(homeLocalBin, "curl");
   const psPath = path.join(homeLocalBin, "ps");
   const sandboxName = String(sandboxEntry.name);
+  // The OpenShell stub advertises this forward as running. Back that claim
+  // with a real listener so probe-only forward ownership checks behave the
+  // same on Linux and macOS, not according to whether a host happens to have
+  // the historical default port open.
+  const dashboardPort = startFixtureForwardListener(tmpDir);
 
   fs.mkdirSync(homeLocalBin, { recursive: true });
   fs.mkdirSync(registryDir, { recursive: true });
 
   const inferenceBlock = buildInferenceBlock(liveInferenceProvider, liveInferenceModel);
-  writeRegistryState(registryDir, sandboxName, sandboxEntry, options);
+  writeRegistryState(registryDir, sandboxName, { ...sandboxEntry, dashboardPort }, options);
   initStateFile(stateFile, options);
-  writeOpenshellStub(openshellPath, stateFile, sandboxName, inferenceBlock, options);
+  writeOpenshellStub(openshellPath, stateFile, sandboxName, inferenceBlock, dashboardPort, options);
   writeDockerStub(dockerPath, stateFile, sandboxName);
   writeCurlStub(curlPath, stateFile);
   writePsStub(psPath);
@@ -412,6 +574,14 @@ export function runConnect(
   connectArgs: string[] = [],
 ) {
   const repoRoot = path.join(import.meta.dirname, "..", "..");
+  const state = JSON.parse(fs.readFileSync(path.join(tmpDir, "state.json"), "utf-8"));
+  const recoveryEnv = state.gatewaySupervisorRecovery
+    ? {
+        NEMOCLAW_GATEWAY_RECOVERY_WAIT_SECONDS: "2",
+        NEMOCLAW_GATEWAY_RECOVERY_POLL_INTERVAL_SECONDS: "0",
+        NEMOCLAW_GATEWAY_RECOVERY_SETTLE_SECONDS: "0",
+      }
+    : {};
   return spawnSync(
     process.execPath,
     [path.join(repoRoot, "bin", "nemoclaw.js"), sandboxName, "connect", ...connectArgs],
@@ -420,49 +590,36 @@ export function runConnect(
       encoding: "utf-8",
       env: {
         HOME: tmpDir,
+        NODE_OPTIONS: nonWslPlatformNodeOptions(tmpDir, ""),
         PATH: `${path.join(tmpDir, ".local", "bin")}:/usr/bin:/bin`,
         NEMOCLAW_DISABLE_GATEWAY_DRIFT_PREFLIGHT: "1",
         NEMOCLAW_NO_CONNECT_HINT: "1",
         NEMOCLAW_OLLAMA_PORT: "11434",
         NEMOCLAW_OLLAMA_PROXY_PORT: "11435",
         VITEST: "true",
+        ...recoveryEnv,
         ...extraEnv,
       },
-      timeout: execTimeout(15_000),
+      timeout: execTimeout(30_000),
     },
   );
 }
 
 export function extractApprovalPassScript(stateFile: string, sandboxName: string): string {
   const state = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
-  // The approval pass is base64-wrapped so it survives OpenShell exec's
-  // no-newline-in-args rule (see wrapSandboxShellScript), so identify the call
-  // by its decoded payload, not by literal segments.
-  const approvalExec = (state.sandboxExecCalls as string[][]).find((call) => {
-    if (!call.includes("--")) return false;
-    const inner = decodeWrappedSandboxScript(call[call.length - 1] || "");
-    return inner.includes("openclaw") && inner.includes("devices") && inner.includes("approve");
-  });
+  const approvalIndex = (state.sandboxExecInputs as string[]).findIndex(
+    (input) => input.includes("openclaw") && input.includes("devices") && input.includes("approve"),
+  );
+  const approvalExec = (state.sandboxExecCalls as string[][])[approvalIndex];
+  const approvalScript = (state.sandboxExecInputs as string[])[approvalIndex];
   expect(approvalExec).toBeDefined();
   expect(approvalExec).toContain("sandbox");
   expect(approvalExec).toContain("exec");
   expect(approvalExec).toContain("--name");
   expect(approvalExec).toContain(sandboxName);
-  const lastArg = approvalExec?.[approvalExec.length - 1] || "";
-  // Decode it back to the literal payload so callers can assert on/run the
-  // real script.
-  return decodeWrappedSandboxScript(lastArg);
-}
-
-/**
- * Reverse `wrapSandboxShellScript`: extract the base64 payload from a
- * `printf %s '<b64>' | base64 -d` wrapper and decode it. Returns the input
- * unchanged when it is not wrapped.
- */
-export function decodeWrappedSandboxScript(wrapped: string): string {
-  const match = wrapped.match(/printf %s '([A-Za-z0-9+/=]+)' \| base64 -d/);
-  if (!match) return wrapped;
-  return Buffer.from(match[1], "base64").toString("utf-8");
+  expect(approvalExec?.slice(-2)).toEqual(["sh", "-s"]);
+  expect(approvalExec?.join(" ")).not.toContain("PYAPPROVE");
+  return approvalScript || "";
 }
 
 export function runApprovalPassScript(

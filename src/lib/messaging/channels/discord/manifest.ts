@@ -28,7 +28,6 @@ export const discordManifest = {
       kind: "config",
       required: false,
       envKey: "DISCORD_SERVER_ID",
-      envAliases: ["DISCORD_SERVER_IDS"],
       statePath: "discordGuilds.serverId",
       prompt: {
         label: "Discord Server ID (for guild workspace access)",
@@ -55,7 +54,6 @@ export const discordManifest = {
       kind: "config",
       required: false,
       envKey: "DISCORD_USER_ID",
-      envAliases: ["DISCORD_ALLOWED_IDS"],
       statePath: "discordGuilds.userIds",
       promptWhenInput: "serverId",
       prompt: {
@@ -77,6 +75,10 @@ export const discordManifest = {
   policyPresets: [
     {
       name: "discord",
+      // The Discord policy owns the credential binding that sets
+      // DISCORD_BOT_TOKEN to a revision-scoped placeholder. The sandbox process
+      // reads that environment at boot, so applying this preset afterwards is too late.
+      requiredAtCreate: true,
       validationWarningLines: [
         "For Discord preset validation, do not use curl as the success signal:",
         "curl is not in the preset binary allowlist, so curl probes can fail even",
@@ -99,7 +101,9 @@ export const discordManifest = {
           enabled: true,
           accounts: {
             default: {
-              token: "{{credential.discordBotToken.placeholder}}",
+              // OpenShell sets DISCORD_BOT_TOKEN to the current revision-scoped
+              // placeholder. Persisting the canonical placeholder here shadows
+              // that process value and is rejected by the credential endpoint.
               enabled: true,
               healthMonitor: {
                 enabled: false,
@@ -196,28 +200,16 @@ export const discordManifest = {
       manager: "openclaw-plugin",
       spec: "npm:@openclaw/discord@{{openclaw.version}}",
       pin: true,
+      integrityByVersion: {
+        "2026.7.1":
+          "sha512-tZfdC1YA8oVLvc2BK1w0F6rUljS5ugCOp2uWe0vPsbG1fbzVVIO4V32RoqZznGHe5u2R9u4n1aV5Z/qa1m2oFg==",
+      },
+      tarballUrlByVersion: {
+        "2026.7.1": "https://registry.npmjs.org/@openclaw/discord/-/discord-2026.7.1.tgz",
+      },
       required: true,
     },
   ],
-  state: {
-    persist: {
-      discordGuilds: ["serverId", "requireMention", "userId"],
-    },
-    rebuildHydration: [
-      {
-        statePath: "discordGuilds.serverId",
-        env: "DISCORD_SERVER_ID",
-      },
-      {
-        statePath: "discordGuilds.requireMention",
-        env: "DISCORD_REQUIRE_MENTION",
-      },
-      {
-        statePath: "discordGuilds.userIds",
-        env: "DISCORD_USER_ID",
-      },
-    ],
-  },
   hooks: [
     {
       id: "discord-openclaw-bridge-health",

@@ -14,18 +14,27 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Import from compiled dist/ so coverage is attributed correctly.
-import { resolveDefaultSandboxName } from "../../../dist/lib/tunnel/service-command";
+import { testTimeoutOptions } from "../../../test/helpers/timeouts";
+
+// Import source directly so tests cannot pass against a stale build.
+import { registerTunnelOrigin } from "./allowed-origins";
+import { resolveDefaultSandboxName } from "./service-command";
 import {
   getServiceStatuses,
   getTunnelUrl,
+  type ProcessControl,
   readCloudflaredState,
   showStatus,
   startAll,
   stopAll,
-} from "../../../dist/lib/tunnel/services";
+} from "./services";
+
+// startAll's tunnel-origin registration performs real host→sandbox config
+// writes; stub it so these tests exercise only the wiring (tunnel-URL and
+// sandbox-name discovery plus the skip/guard branches), never openshell/docker.
+vi.mock("./allowed-origins", () => ({ registerTunnelOrigin: vi.fn() }));
 
 const INTEGRATION_ENV_SANDBOX = "nc1077-env-sandbox";
 const INTEGRATION_REGISTRY_SANDBOX = "nc1077-registry-sandbox";
@@ -43,17 +52,7 @@ function seedAliveCloudflaredPid(pidDir: string): void {
   writeFileSync(join(pidDir, "cloudflared.pid"), String(process.pid), { mode: 0o600 });
 }
 
-const ollamaProxyDistPath = resolve(
-  import.meta.dirname,
-  "..",
-  "..",
-  "..",
-  "dist",
-  "lib",
-  "inference",
-  "ollama",
-  "proxy.js",
-);
+const ollamaProxySourcePath = resolve(import.meta.dirname, "..", "inference", "ollama", "proxy.ts");
 
 describe("getTunnelUrl", () => {
   let pidDir: string;
@@ -101,10 +100,10 @@ describe("getServiceStatuses", () => {
   it("returns stopped status when no PID files exist", () => {
     const statuses = getServiceStatuses({ pidDir });
     expect(statuses).toHaveLength(1);
-    for (const s of statuses) {
+    statuses.forEach((s) => {
       expect(s.running).toBe(false);
       expect(s.pid).toBeNull();
-    }
+    });
   });
 
   it("returns service name cloudflared", () => {
@@ -153,11 +152,16 @@ describe("sandbox name validation", () => {
   });
 
   it("accepts valid alphanumeric names", () => {
-    expect(() => getServiceStatuses({ sandboxName: "my-sandbox.1" })).not.toThrow();
+    const pidDir = mkdtempSync(join(tmpdir(), "nemoclaw-svc-valid-name-test-"));
+    try {
+      expect(() => getServiceStatuses({ pidDir, sandboxName: "my-sandbox.1" })).not.toThrow();
+    } finally {
+      rmSync(pidDir, { recursive: true, force: true });
+    }
   });
 });
 
-describe("#1077 — status host service PID dir matches start/stop env", () => {
+describe("status host service PID dir matches start/stop env (#1077)", () => {
   const savedSandboxName = process.env.SANDBOX_NAME;
   const savedNemoclawSandbox = process.env.NEMOCLAW_SANDBOX;
   const savedNemoclawSandboxName = process.env.NEMOCLAW_SANDBOX_NAME;
@@ -443,9 +447,7 @@ describe("stopAll", () => {
   let spawnSyncCalls: Array<{ command: string; args: readonly string[] }>;
   let originalSpawnSync: typeof childProcess.spawnSync;
 
-  beforeEach(() => {
-    pidDir = mkdtempSync(join(tmpdir(), "nemoclaw-svc-test-"));
-    spawnSyncCalls = [];
+  beforeAll(() => {
     originalSpawnSync = childProcess.spawnSync;
     // @ts-expect-error — partial mock signature is intentional.
     childProcess.spawnSync = (command: string, args: readonly string[]) => {
@@ -465,17 +467,114 @@ describe("stopAll", () => {
       }
       return reply;
     };
-    // The dist Ollama proxy module destructures `spawnSync` at
-    // require time, so to make `stopAll` pick up the patched function we
-    // bust its cache. `services.ts` requires the proxy lazily, so the
-    // next call sees the freshly-loaded module.
-    delete require.cache[require.resolve(ollamaProxyDistPath)];
+    // The Ollama proxy source module destructures `spawnSync` at
+    // require time. Load it once with the stable suite-level mock instead of
+    // re-evaluating the large module under coverage for every stopAll test.
+    delete require.cache[require.resolve(ollamaProxySourcePath)];
+    require(ollamaProxySourcePath);
+  });
+
+  beforeEach(() => {
+    pidDir = mkdtempSync(join(tmpdir(), "nemoclaw-svc-test-"));
+    spawnSyncCalls = [];
   });
 
   afterEach(() => {
-    childProcess.spawnSync = originalSpawnSync;
-    delete require.cache[require.resolve(ollamaProxyDistPath)];
     rmSync(pidDir, { recursive: true, force: true });
+  });
+
+  afterAll(() => {
+    childProcess.spawnSync = originalSpawnSync;
+    delete require.cache[require.resolve(ollamaProxySourcePath)];
+  });
+
+  // A scripted ProcessControl models PID identity/liveness/signalling without
+  // touching the host, so the recycled-PID paths are deterministic and portable
+  // (no real process, no /proc, no signals). `alive`/`cmdlines` are consumed in
+  // call order, repeating the last entry.
+  function scriptedControl(script: { alive: boolean[]; cmdlines: Array<string | null> }): {
+    control: ProcessControl;
+    signals: Array<{ pid: number; sig: string }>;
+  } {
+    const signals: Array<{ pid: number; sig: string }> = [];
+    let aliveIdx = 0;
+    let cmdIdx = 0;
+    const control: ProcessControl = {
+      isAlive: () => script.alive[Math.min(aliveIdx++, script.alive.length - 1)],
+      commandLine: () => script.cmdlines[Math.min(cmdIdx++, script.cmdlines.length - 1)],
+      signal: (pid, sig) => {
+        signals.push({ pid, sig });
+      },
+    };
+    return { control, signals };
+  }
+
+  // The first stopAll call instruments the lazily loaded Ollama proxy dependency
+  // graph. Loaded coverage shards can exceed the unit-test default here.
+  it(
+    "does not signal a live PID recycled to a non-cloudflared process",
+    testTimeoutOptions(15_000),
+    () => {
+      const { control, signals } = scriptedControl({
+        alive: [true],
+        cmdlines: ["/usr/bin/node vitest"],
+      });
+      writeFileSync(join(pidDir, "cloudflared.pid"), "4242", { mode: 0o600 });
+
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        stopAll({ pidDir, processControl: control });
+      } finally {
+        logSpy.mockRestore();
+      }
+
+      expect(signals).toEqual([]);
+      expect(existsSync(join(pidDir, "cloudflared.pid"))).toBe(false);
+    },
+  );
+
+  it("does not escalate to SIGKILL when the PID is recycled during the poll", () => {
+    const { control, signals } = scriptedControl({
+      // Alive pre-SIGTERM; the poll observes exit; a live PID reappears at the
+      // pre-SIGKILL re-check.
+      alive: [true, false, true],
+      // Ours pre-SIGTERM, then recycled to a bystander before escalation.
+      cmdlines: ["cloudflared tunnel run", "/usr/bin/node vitest"],
+    });
+    writeFileSync(join(pidDir, "cloudflared.pid"), "4242", { mode: 0o600 });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      stopAll({ pidDir, processControl: control });
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(signals.map((entry) => entry.sig)).toEqual(["SIGTERM"]);
+    expect(existsSync(join(pidDir, "cloudflared.pid"))).toBe(false);
+  });
+
+  it("escalates to SIGKILL when cloudflared remains live after the grace period (#7644)", () => {
+    const { control, signals } = scriptedControl({
+      alive: [true, true],
+      cmdlines: ["cloudflared tunnel run", "cloudflared tunnel run"],
+    });
+    writeFileSync(join(pidDir, "cloudflared.pid"), "4242", { mode: 0o600 });
+
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValue(3000);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      stopAll({ pidDir, processControl: control });
+    } finally {
+      nowSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+
+    expect(signals).toEqual([
+      { pid: 4242, sig: "SIGTERM" },
+      { pid: 4242, sig: "SIGKILL" },
+    ]);
+    expect(existsSync(join(pidDir, "cloudflared.pid"))).toBe(false);
   });
 
   it("removes stale PID files", () => {
@@ -503,15 +602,128 @@ describe("stopAll", () => {
     logSpy.mockRestore();
   });
 
-  it("unloads Ollama models before reporting services stopped", () => {
+  it("runs injected Ollama cleanup before reporting services stopped", () => {
+    const cleanup = vi.fn();
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    stopAll({ pidDir });
+    stopAll({ pidDir, unloadOllamaModels: cleanup });
+    const stoppedCallIndex = logSpy.mock.calls.findIndex(([message]) =>
+      String(message).includes("All services stopped"),
+    );
+    const stoppedCallOrder = logSpy.mock.invocationCallOrder[stoppedCallIndex];
     logSpy.mockRestore();
 
-    const psCall = spawnSyncCalls.find(
-      (c) => c.command === "curl" && c.args.some((a) => a.endsWith("/api/ps")),
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(cleanup.mock.invocationCallOrder[0]).toBeLessThan(stoppedCallOrder ?? 0);
+  });
+});
+
+// #6212: after cloudflared yields a public URL, startAll must register that
+// origin in the sandbox gateway's allowedOrigins. These tests cover the wiring
+// in startAll (URL + sandbox-name discovery, skip/guard branches). The
+// registration module itself is mocked (see vi.mock at the top of this file),
+// so no host→sandbox config write or gateway reload runs here.
+describe("startAll tunnel-origin registration (#6212)", () => {
+  let tmpDir: string;
+  let pidDir: string;
+
+  function writeFakeCloudflared(lines: string[]): void {
+    const binDir = join(tmpDir, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const fakeCloudflared = join(binDir, "cloudflared");
+    writeFileSync(fakeCloudflared, ["#!/usr/bin/env sh", ...lines].join("\n"));
+    chmodSync(fakeCloudflared, 0o700);
+    vi.stubEnv("PATH", `${binDir}:${process.env.PATH ?? ""}`);
+  }
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "nemoclaw-svc-register-test-"));
+    pidDir = join(tmpDir, "pids");
+    vi.stubEnv("CLOUDFLARE_TUNNEL_TOKEN", undefined);
+    vi.stubEnv("NEMOCLAW_SANDBOX_NAME", undefined);
+    vi.stubEnv("NEMOCLAW_SANDBOX", undefined);
+    vi.stubEnv("SANDBOX_NAME", undefined);
+    vi.mocked(registerTunnelOrigin).mockReset();
+  });
+
+  afterEach(() => {
+    const state = readCloudflaredState(pidDir);
+    const runningPid = state.kind === "running" ? state.pid : Number.NaN;
+    try {
+      process.kill(runningPid, "SIGTERM");
+    } catch {
+      // Not running (NaN pid throws) or already exited.
+    }
+    vi.unstubAllEnvs();
+    rmSync(tmpDir, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  // Scenario 14
+  it("calls registration with the raw discovered URL and the opts sandbox name", async () => {
+    writeFakeCloudflared(["echo 'https://good.trycloudflare.com/route'", "sleep 20"]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await startAll({ pidDir, dashboardPort: 12345, sandboxName: "my-sandbox" });
+    logSpy.mockRestore();
+
+    expect(registerTunnelOrigin).toHaveBeenCalledTimes(1);
+    // The raw URL (path intact) is passed through; origin conversion happens
+    // inside registerTunnelOrigin, not here.
+    expect(registerTunnelOrigin).toHaveBeenCalledWith(
+      "my-sandbox",
+      "https://good.trycloudflare.com/route",
+      expect.objectContaining({ info: expect.any(Function), warn: expect.any(Function) }),
     );
-    expect(psCall).toBeDefined();
-    expect(psCall?.args).toContain("--max-time");
+  });
+
+  // Scenario 15
+  it("skips registration and warns when no sandbox name is available", async () => {
+    writeFakeCloudflared(["echo 'https://good.trycloudflare.com/route'", "sleep 20"]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await startAll({ pidDir, dashboardPort: 12345 });
+    const output = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    logSpy.mockRestore();
+
+    expect(registerTunnelOrigin).not.toHaveBeenCalled();
+    expect(output).toContain("No sandbox name available — skipping tunnel-origin registration");
+  });
+
+  // Scenario 16
+  it("does not register when no tunnel URL is produced, but still prints the banner", async () => {
+    // A present-but-URL-less cloudflared would force startAll's 15s URL-wait
+    // poll and exceed the 5s test budget, so drive the same tunnelUrl==="" branch
+    // with cloudflared absent from PATH (the "cloudflared not found" path).
+    const emptyBin = join(tmpDir, "empty-bin");
+    mkdirSync(emptyBin, { recursive: true });
+    vi.stubEnv("PATH", emptyBin);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await startAll({ pidDir, dashboardPort: 12345, sandboxName: "my-sandbox" });
+    const output = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    logSpy.mockRestore();
+
+    expect(registerTunnelOrigin).not.toHaveBeenCalled();
+    expect(output).toContain("Services");
+    expect(output).not.toContain("Public URL");
+  });
+
+  // Scenario 17 — guard-rail for Decision 6: startAll must stay resilient even
+  // if registration escapes its own try/catch.
+  it("still resolves and prints the Public URL banner when registration throws", async () => {
+    writeFakeCloudflared(["echo 'https://good.trycloudflare.com/route'", "sleep 20"]);
+    vi.mocked(registerTunnelOrigin).mockImplementation(() => {
+      throw new Error("registration blew up");
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(
+      startAll({ pidDir, dashboardPort: 12345, sandboxName: "my-sandbox" }),
+    ).resolves.toBeUndefined();
+    const output = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    logSpy.mockRestore();
+
+    expect(output).toContain("Public URL");
+    expect(output).toContain("https://good.trycloudflare.com/route");
   });
 });

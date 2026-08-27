@@ -2,28 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
-// Import through compiled dist output so coverage lands on the file measured
-// by the ratchet: dist/lib/onboard/preflight.js.
+// Import source directly so tests cannot pass against a stale build.
 import {
   assessHost,
   checkPortAvailable,
+  dnsProbeName,
+  ensureProbeImageCached,
+  ensureSwap,
   getDockerBridgeGatewayIp,
   getMemoryInfo,
-  ensureSwap,
   isDockerUnderProvisioned,
+  isFatalContainerDnsProbeFailure,
   MIN_RECOMMENDED_DOCKER_CPUS,
   MIN_RECOMMENDED_DOCKER_MEM_GIB,
   parseDockerInfoCpus,
   parseDockerInfoMemTotalBytes,
   parseDockerStorageDriver,
   parseDockerUsesContainerdSnapshotter,
-  planHostRemediation,
-  dnsProbeName,
-  ensureProbeImageCached,
-  isFatalContainerDnsProbeFailure,
+  planHostAdvisories,
   probeContainerDns,
   probeDockerBridgeContainerStart,
-} from "../../../dist/lib/onboard/preflight";
+} from "./preflight";
 
 function requireMemoryInfo(result: ReturnType<typeof getMemoryInfo>) {
   expect(result).not.toBeNull();
@@ -31,6 +30,10 @@ function requireMemoryInfo(result: ReturnType<typeof getMemoryInfo>) {
     throw new Error("Expected memory info to be present");
   }
   return result;
+}
+
+function advisoryCommands(advisory: { commands?: readonly string[] } | undefined) {
+  return advisory?.commands ?? [];
 }
 
 describe("checkPortAvailable", () => {
@@ -160,7 +163,7 @@ describe("checkPortAvailable", () => {
 
 describe("probePortAvailability", () => {
   // Import probePortAvailability directly for targeted testing
-  const { probePortAvailability } = require("../../../dist/lib/onboard/preflight");
+  const { probePortAvailability } = require("./preflight");
 
   it("returns ok when port is free (real net probe)", async () => {
     // Use a high ephemeral port unlikely to be in use
@@ -319,8 +322,8 @@ describe("assessHost", () => {
       env: {},
       dockerInfoOutput: "Podman Engine",
       commandExistsImpl: (name: string) => name === "docker",
+      runCaptureImpl: () => "",
     });
-
     expect(result.runtime).toBe("podman");
     expect(result.isUnsupportedRuntime).toBe(true);
     expect(result.dockerReachable).toBe(true);
@@ -332,8 +335,8 @@ describe("assessHost", () => {
       env: {},
       dockerInfoOutput: "Podman Engine",
       commandExistsImpl: (name: string) => name === "docker",
+      runCaptureImpl: () => "",
     });
-
     expect(result.runtime).toBe("podman");
     expect(result.isUnsupportedRuntime).toBe(true);
     expect(result.dockerReachable).toBe(true);
@@ -506,7 +509,7 @@ describe("assessHost", () => {
   //
   // The fixtures here explicitly pin `release` and override `readFileImpl`
   // for /proc/version so the underlying `detectWsl` heuristic does not
-  // pick up the test runner's actual environment (e.g. the wsl-e2e job
+  // pick up the test runner's actual environment (e.g. the platform WSL job
   // running on real WSL would otherwise see kernel 5.15.x-microsoft-WSL
   // and flip isWsl true, gating off the conflict).
   it("flags Docker 26+ containerd-snapshotter overlayfs as a nested overlay conflict", () => {
@@ -637,10 +640,10 @@ describe("parseDockerUsesContainerdSnapshotter", () => {
   });
 });
 
-describe("planHostRemediation", () => {
+describe("planHostAdvisories", () => {
   function baseAssessment(
-    overrides: Partial<Parameters<typeof planHostRemediation>[0]> = {},
-  ): Parameters<typeof planHostRemediation>[0] {
+    overrides: Partial<Parameters<typeof planHostAdvisories>[0]> = {},
+  ): Parameters<typeof planHostAdvisories>[0] {
     return {
       platform: "linux",
       isWsl: false,
@@ -671,7 +674,7 @@ describe("planHostRemediation", () => {
   }
 
   it("recommends starting docker when installed but unreachable and service inactive", () => {
-    const actions = planHostRemediation({
+    const actions = planHostAdvisories({
       platform: "linux",
       isWsl: false,
       runtime: "unknown",
@@ -699,12 +702,12 @@ describe("planHostRemediation", () => {
     });
 
     expect(actions[0].id).toBe("start_docker");
-    expect(actions[0].blocking).toBe(true);
-    expect(actions[0].commands).toContain("sudo systemctl start docker");
+    expect(actions[0].severity).toBe("blocking");
+    expect(advisoryCommands(actions[0])).toContain("sudo systemctl start docker");
   });
 
   it("recommends Docker Desktop WSL integration when docker is missing inside WSL", () => {
-    const actions = planHostRemediation(
+    const actions = planHostAdvisories(
       baseAssessment({
         isWsl: true,
         dockerInstalled: false,
@@ -714,16 +717,16 @@ describe("planHostRemediation", () => {
 
     expect(actions[0].id).toBe("enable_docker_desktop_wsl_integration");
     expect(actions[0].title).toBe("Enable Docker Desktop WSL integration");
-    expect(actions[0].blocking).toBe(true);
-    expect(actions[0].commands.join("\n")).toContain(
+    expect(actions[0].severity).toBe("blocking");
+    expect(advisoryCommands(actions[0]).join("\n")).toContain(
       "Docker Desktop → Settings → Resources → WSL integration",
     );
-    expect(actions[0].commands.join("\n")).toContain("wsl --shutdown");
-    expect(actions[0].commands.join("\n")).toContain("docker info");
+    expect(advisoryCommands(actions[0]).join("\n")).toContain("wsl --shutdown");
+    expect(advisoryCommands(actions[0]).join("\n")).toContain("docker info");
   });
 
   it("recommends Docker Desktop WSL integration when docker is unreachable inside WSL", () => {
-    const actions = planHostRemediation(
+    const actions = planHostAdvisories(
       baseAssessment({
         isWsl: true,
         dockerInstalled: true,
@@ -734,13 +737,13 @@ describe("planHostRemediation", () => {
 
     expect(actions[0].id).toBe("enable_docker_desktop_wsl_integration");
     expect(actions[0].reason).toContain("WSL distro cannot reach the Docker daemon");
-    expect(actions[0].commands.join("\n")).toContain("Start Docker Desktop");
-    expect(actions[0].commands.join("\n")).toContain("wsl --shutdown");
-    expect(actions[0].commands.join("\n")).not.toContain("sudo systemctl start docker");
+    expect(advisoryCommands(actions[0]).join("\n")).toContain("Start Docker Desktop");
+    expect(advisoryCommands(actions[0]).join("\n")).toContain("wsl --shutdown");
+    expect(advisoryCommands(actions[0]).join("\n")).not.toContain("sudo systemctl start docker");
   });
 
   it("suggests usermod when docker service is active but daemon is unreachable", () => {
-    const actions = planHostRemediation({
+    const actions = planHostAdvisories({
       platform: "linux",
       isWsl: false,
       runtime: "unknown",
@@ -769,50 +772,15 @@ describe("planHostRemediation", () => {
 
     expect(actions[0].id).toBe("docker_group_permission");
     expect(actions[0].kind).toBe("sudo");
-    expect(actions[0].blocking).toBe(true);
-    expect(actions[0].commands[0]).toBe("sudo usermod -aG docker $USER");
-    expect(actions[0].commands[1]).toContain("newgrp docker");
-    expect(actions[0].commands[2]).toBe("nemoclaw onboard");
+    expect(actions[0].severity).toBe("blocking");
+    expect(advisoryCommands(actions[0])[0]).toBe("sudo usermod -aG docker $USER");
+    expect(advisoryCommands(actions[0])[1]).toContain("newgrp docker");
+    expect(advisoryCommands(actions[0])[2]).toBe("nemoclaw onboard");
     expect(actions[0].reason).toContain("docker group");
   });
 
-  it("warns that podman is unsupported on macOS without blocking onboarding", () => {
-    const actions = planHostRemediation({
-      platform: "darwin",
-      isWsl: false,
-      runtime: "podman",
-      packageManager: "brew",
-      systemctlAvailable: false,
-      dockerServiceActive: null,
-      dockerServiceEnabled: null,
-      dockerInstalled: true,
-      dockerRunning: true,
-      dockerReachable: true,
-      nodeInstalled: true,
-      openshellInstalled: true,
-      dockerCgroupVersion: "unknown",
-      dockerDefaultCgroupnsMode: "unknown",
-      isContainerRuntimeUnderProvisioned: false,
-      hasNestedOverlayConflict: false,
-      requiresHostCgroupnsFix: false,
-      isUnsupportedRuntime: true,
-      isHeadlessLikely: false,
-      hasNvidiaGpu: false,
-      dockerCdiSpecDirs: [],
-      cdiNvidiaGpuSpecMissing: false,
-      nvidiaContainerToolkitInstalled: true,
-      notes: [],
-    });
-
-    const action = actions.find(
-      (entry: { id: string }) => entry.id === "unsupported_runtime_warning",
-    );
-    expect(action).toBeTruthy();
-    expect(action?.blocking).toBe(false);
-  });
-
   it("recommends installing Docker with a generic Linux hint when it is missing", () => {
-    const actions = planHostRemediation({
+    const actions = planHostAdvisories({
       platform: "linux",
       isWsl: false,
       runtime: "unknown",
@@ -840,11 +808,11 @@ describe("planHostRemediation", () => {
     });
 
     expect(actions[0].id).toBe("install_docker");
-    expect(actions[0].commands[0]).toContain("Install Docker Engine");
+    expect(advisoryCommands(actions[0])[0]).toContain("Install Docker Engine");
   });
 
   it("recommends installing openshell when missing", () => {
-    const actions = planHostRemediation({
+    const actions = planHostAdvisories({
       platform: "linux",
       isWsl: false,
       runtime: "docker",
@@ -1041,7 +1009,7 @@ describe("probeContainerDns", () => {
     expect(isFatalContainerDnsProbeFailure(result)).toBe(true);
   });
 
-  it("downgrades unrelated docker output (no resolver evidence) from fatal resolution_failed to inconclusive error (#3630 CodeRabbit)", () => {
+  it("downgrades unrelated docker output without resolver evidence from fatal resolution_failed to an inconclusive error per CodeRabbit review (#3630)", () => {
     // No "Server:" header — nslookup never produced a resolver response.
     // The output is some docker-side message unrelated to DNS, so we
     // must not abort onboarding with the systemd-resolved remediation.
@@ -1184,7 +1152,7 @@ describe("probeContainerDns", () => {
     expect(isFatalContainerDnsProbeFailure(result)).toBe(true);
   });
 
-  it("classifies a wedged Docker daemon (inspect_unavailable) as fatal docker_daemon_unreachable (#3630 codex review)", () => {
+  it("classifies a wedged Docker daemon with inspect_unavailable as fatal docker_daemon_unreachable per Codex review (#3630)", () => {
     const result = probeContainerDns({
       ensureImageCachedOverride: {
         ok: false,
@@ -1197,7 +1165,7 @@ describe("probeContainerDns", () => {
     expect(isFatalContainerDnsProbeFailure(result)).toBe(true);
   });
 
-  it("does not treat a registry TCP timeout (i/o timeout on :443) as a fatal DNS failure (#3630 codex review)", () => {
+  it("does not treat a registry TCP timeout on port 443 as a fatal DNS failure per Codex review (#3630)", () => {
     // dial tcp <ip>:443 errors are TCP connectivity, NOT DNS — must not
     // be routed to UDP:53/systemd-resolved remediation.
     const result = probeContainerDns({
@@ -1304,20 +1272,20 @@ describe("probeContainerDns", () => {
     expect(seenScript).toContain("nslookup pinned-test.invalid");
   });
 
-  it("rejects shell metacharacters in probeName to prevent sh -c injection (#3630 CodeRabbit)", () => {
-    const injections = [
-      "x; touch /tmp/pwned",
-      "x && touch /tmp/pwned",
-      "x`whoami`",
-      "x$(whoami)",
-      "x|whoami",
-      "x\nwhoami",
-      'x "; rm -rf /"',
-    ];
-    for (const probeName of injections) {
+  it.each([
+    "x; touch /tmp/pwned",
+    "x && touch /tmp/pwned",
+    "x`whoami`",
+    "x$(whoami)",
+    "x|whoami",
+    "x\nwhoami",
+    'x "; rm -rf /"',
+  ])(
+    "rejects shell metacharacters in probeName to prevent sh -c injection per CodeRabbit review [%s] (#3630)",
+    (probeName) => {
       expect(() => probeContainerDns({ probeName })).toThrow(/probeName must be a plain DNS name/);
-    }
-  });
+    },
+  );
 
   it("accepts plain DNS labels (RFC 1035 chars only) as probeName", () => {
     expect(() =>
@@ -1416,7 +1384,7 @@ describe("probeDockerBridgeContainerStart", () => {
     expect(result.exitCode).toBe(125);
   });
 
-  it("does not misclassify unrelated 'veth' mentions as fatal veth_unsupported (#3630 CodeRabbit)", () => {
+  it("does not misclassify unrelated 'veth' mentions as fatal veth_unsupported per CodeRabbit review (#3630)", () => {
     // Output references "veth" in passing — without the bridge-create
     // signature, it must stay on the generic-error path, not the fatal
     // Jetson remediation path.
@@ -1433,7 +1401,7 @@ describe("probeDockerBridgeContainerStart", () => {
     expect(result.reason).not.toBe("veth_unsupported");
   });
 
-  it("does not misclassify generic 'operation not supported' errors as veth_unsupported (#3630 CodeRabbit)", () => {
+  it("does not misclassify generic 'operation not supported' errors as veth_unsupported per CodeRabbit review (#3630)", () => {
     // Generic OS-level "operation not supported" (e.g., from a cgroup
     // mount or unrelated syscall) must not be promoted to fatal veth.
     const result = probeDockerBridgeContainerStart({
@@ -1449,7 +1417,7 @@ describe("probeDockerBridgeContainerStart", () => {
     expect(result.reason).not.toBe("veth_unsupported");
   });
 
-  it("flags bridge container kill-by-signal (no timeout) as reason 'killed' (#3630 CodeRabbit)", () => {
+  it("flags a bridge container killed by signal without a timeout as reason 'killed' per CodeRabbit review (#3630)", () => {
     const result = probeDockerBridgeContainerStart({
       executionOverride: {
         stdout: "",
@@ -1508,7 +1476,7 @@ describe("probeDockerBridgeContainerStart", () => {
     expect(seenOpts?.timeout).toBe(20_000);
   });
 
-  it("reports image_pull_failed (not bridge timeout) when the busybox pre-pull times out (#3630 codex review)", () => {
+  it("reports image_pull_failed instead of bridge timeout when the busybox pre-pull times out per Codex review (#3630)", () => {
     const result = probeDockerBridgeContainerStart({
       ensureImageCachedOverride: {
         ok: false,
@@ -1534,7 +1502,7 @@ describe("probeDockerBridgeContainerStart", () => {
     expect(result.ok).toBe(true);
   });
 
-  it("reports a wedged Docker daemon (inspect_unavailable) as fatal docker_daemon_unreachable (#3630 codex review)", () => {
+  it("reports a wedged Docker daemon with inspect_unavailable as fatal docker_daemon_unreachable per Codex review (#3630)", () => {
     const result = probeDockerBridgeContainerStart({
       ensureImageCachedOverride: {
         ok: false,
@@ -1566,7 +1534,7 @@ describe("ensureProbeImageCached", () => {
     expect(result.alreadyCached).toBe(true);
   });
 
-  it("classifies an inspect spawn timeout (ETIMEDOUT) as inspect_unavailable without falling through to pull (#3630 CodeRabbit)", () => {
+  it("classifies an ETIMEDOUT inspect spawn as inspect_unavailable without falling through to pull per CodeRabbit review (#3630)", () => {
     const result = ensureProbeImageCached("busybox:latest", {
       inspectProbeImpl: () => ({
         stdout: "",
@@ -1585,7 +1553,7 @@ describe("ensureProbeImageCached", () => {
     expect(result.reason).toBe("inspect_unavailable");
   });
 
-  it("classifies 'Cannot connect to the Docker daemon' inspect stderr as inspect_unavailable (#3630 codex review)", () => {
+  it("classifies 'Cannot connect to the Docker daemon' inspect stderr as inspect_unavailable per Codex review (#3630)", () => {
     const result = ensureProbeImageCached("busybox:latest", {
       inspectProbeImpl: () => ({
         stdout: "",
@@ -1800,7 +1768,7 @@ describe("isDockerUnderProvisioned", () => {
   });
 });
 
-describe("assessHost — container runtime resource detection (regression #2514)", () => {
+describe("assessHost container runtime resource detection (#2514)", () => {
   it("flags default Colima (2 CPU / 2 GiB) as under-provisioned", () => {
     const result = assessHost({
       platform: "darwin",
@@ -1849,7 +1817,7 @@ describe("assessHost — container runtime resource detection (regression #2514)
   });
 });
 
-describe("planHostRemediation — under-provisioned runtime", () => {
+describe("planHostAdvisories — under-provisioned runtime", () => {
   it("emits a Colima-specific resize action when runtime is colima", () => {
     const assessment = assessHost({
       platform: "darwin",
@@ -1862,11 +1830,11 @@ describe("planHostRemediation — under-provisioned runtime", () => {
       }),
       commandExistsImpl: (name: string) => name === "docker",
     });
-    const actions = planHostRemediation(assessment);
+    const actions = planHostAdvisories(assessment);
     const action = actions.find((a) => a.id === "container_runtime_under_provisioned");
     expect(action).toBeDefined();
-    expect(action?.blocking).toBe(false);
-    expect(action?.commands.some((c) => c.startsWith("colima start"))).toBe(true);
+    expect(action?.severity).toBe("warning");
+    expect(advisoryCommands(action).some((c) => c.startsWith("colima start"))).toBe(true);
   });
 
   it("emits a Docker Desktop hint when runtime is docker-desktop", () => {
@@ -1881,10 +1849,12 @@ describe("planHostRemediation — under-provisioned runtime", () => {
       }),
       commandExistsImpl: (name: string) => name === "docker",
     });
-    const actions = planHostRemediation(assessment);
+    const actions = planHostAdvisories(assessment);
     const action = actions.find((a) => a.id === "container_runtime_under_provisioned");
     expect(action).toBeDefined();
-    expect(action?.commands.some((c) => c.toLowerCase().includes("docker desktop"))).toBe(true);
+    expect(advisoryCommands(action).some((c) => c.toLowerCase().includes("docker desktop"))).toBe(
+      true,
+    );
   });
 
   it("emits no resource action when runtime is properly sized", () => {
@@ -1899,7 +1869,7 @@ describe("planHostRemediation — under-provisioned runtime", () => {
       }),
       commandExistsImpl: (name: string) => name === "docker",
     });
-    const actions = planHostRemediation(assessment);
+    const actions = planHostAdvisories(assessment);
     expect(actions.find((a) => a.id === "container_runtime_under_provisioned")).toBeUndefined();
   });
 });

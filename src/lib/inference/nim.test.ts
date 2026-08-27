@@ -4,13 +4,12 @@
 import { createRequire } from "module";
 import type { Mock } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-// Import from compiled dist/ for coverage attribution.
-import * as nim from "../../../dist/lib/inference/nim";
+// Import source directly so tests cannot pass against a stale build.
+import * as nim from "./nim";
 
 const require = createRequire(import.meta.url);
-const NIM_DIST_PATH = require.resolve("../../../dist/lib/inference/nim");
-const RUNNER_PATH = require.resolve("../../../dist/lib/runner");
+const NIM_DIST_PATH = require.resolve("./nim");
+const RUNNER_PATH = require.resolve("../runner");
 const fs = require("fs");
 const NIM_API_KEY_ENV_KEYS = ["NGC_API_KEY", "NVIDIA_INFERENCE_API_KEY", "NVIDIA_API_KEY"];
 function clearNimApiKeyEnv(): Array<[string, string | undefined]> {
@@ -98,13 +97,11 @@ describe("nim", () => {
       expect(nim.listModels().length).toBe(5);
     });
 
-    it("each model has name, image, and minGpuMemoryMB", () => {
-      for (const m of nim.listModels()) {
-        expect(m.name).toBeTruthy();
-        expect(m.image).toBeTruthy();
-        expect(typeof m.minGpuMemoryMB === "number").toBeTruthy();
-        expect(m.minGpuMemoryMB > 0).toBeTruthy();
-      }
+    it.each(nim.listModels())("model $name has an image and positive GPU memory", (model) => {
+      expect(model.name).toBeTruthy();
+      expect(model.image).toBeTruthy();
+      expect(typeof model.minGpuMemoryMB === "number").toBeTruthy();
+      expect(model.minGpuMemoryMB > 0).toBeTruthy();
     });
   });
 
@@ -406,25 +403,23 @@ describe("nim", () => {
       }
     }
 
-    it("classifies explicit DGX Station identifiers as station", () => {
-      for (const model of ["NVIDIA DGX Station GB300", "DGX-Station", "P3830"]) {
+    it.each(["NVIDIA DGX Station GB300", "DGX-Station", "P3830"])(
+      "classifies explicit DGX Station identifier %s as station",
+      (model) => {
         withFirmwareModel(model, () => {
           expect(nim.detectNvidiaPlatform()).toBe("station");
         });
-      }
-    });
+      },
+    );
 
-    it("does not classify unrelated Galaxy or P3830 substrings as Station", () => {
-      for (const model of [
-        "Samsung Galaxy Book4 Ultra",
-        "Acme Galaxy Rack Server",
-        "Acme XP3830 Workstation",
-      ]) {
+    it.each(["Samsung Galaxy Book4 Ultra", "Acme Galaxy Rack Server", "Acme XP3830 Workstation"])(
+      "does not classify unrelated model %s as DGX Station",
+      (model) => {
         withFirmwareModel(model, () => {
           expect(nim.detectNvidiaPlatform()).toBe("linux");
         });
-      }
-    });
+      },
+    );
 
     it("falls back to devicetree when DMI is unreadable", () => {
       withDmiUnavailableAndDevicetreeModel("NVIDIA DGX Spark", () => {
@@ -434,6 +429,13 @@ describe("nim", () => {
   });
 
   describe("detectGpu", () => {
+    const proveArm64WslDockerDesktopGpu = vi.fn(() => ({
+      passed: true,
+      timedOut: false,
+      exitCode: 0,
+      diagnostic: "",
+    }));
+
     function withGenericLinuxFirmware(fn: () => void): void {
       const fs = require("fs");
       const origReadFileSync = fs.readFileSync;
@@ -632,7 +634,7 @@ describe("nim", () => {
     // hosts, so mixed-GPU machines (RTX PRO 6000 + GB300 on the QA verification
     // host) dropped the model info entirely. We keep `name` undefined to avoid
     // misattribution but now surface the per-GPU breakdown via `gpus`.
-    it("drops name and populates gpus breakdown on mixed-model hosts (regression #2669)", () => {
+    it("drops name and populates the gpus breakdown on mixed-model hosts (#2669)", () => {
       const runCapture = vi.fn((cmd: string | string[]) => {
         if (!Array.isArray(cmd)) throw new Error("expected argv array");
         if (cmd[0] === "nvidia-smi" && cmd.some((a: string) => a.includes("name,memory.total"))) {
@@ -684,7 +686,7 @@ describe("nim", () => {
 
       try {
         withFirmwareModel("Microsoft Corporation Virtual Machine", () => {
-          expect(nimModule.detectGpu()).toBeNull();
+          expect(nimModule.detectGpu({ proveArm64WslDockerDesktopGpu: null })).toBeNull();
         });
       } finally {
         restore();
@@ -707,55 +709,48 @@ describe("nim", () => {
 
       try {
         withFirmwareModel("Microsoft Corporation Virtual Machine", () => {
-          expect(nimModule.detectGpu()).toBeNull();
+          expect(nimModule.detectGpu({ proveArm64WslDockerDesktopGpu })).toBeNull();
         });
       } finally {
         restore();
       }
     });
 
-    // #4565: a real Windows-ARM N1X + WSL2 + Docker Desktop host reports the
-    // same `JMJWOA-Generic-*` placeholder as the Snapdragon shim, but it can
-    // pass a bounded Docker `--gpus` CUDA proof. When the injected prover
-    // confirms the proof, the denylisted name is accepted and the detection is
-    // tagged so the sandbox preflight reaches the Docker Desktop WSL branch.
-    it("accepts a denylisted ARM64 GPU when the bounded Docker GPU proof passes (#4565)", () => {
+    // A passing proof accepts the raw name, but terminal formatting must escape it.
+    it("escapes terminal controls after a denylisted ARM64 GPU proof passes (#4565)", () => {
+      const gpuName = "JMJWOA-Generic-\u001b\u0085\u200d\u2028\u2029GPU";
       const runCapture = vi.fn((cmd: string | string[]) => {
         if (!Array.isArray(cmd)) throw new Error("expected argv array");
         if (cmd[0] === "nvidia-smi" && cmd.some((a: string) => a.includes("name,memory.total"))) {
-          return "JMJWOA-Generic-GPU, 65471, 65000\n";
+          return `${gpuName}, 65471, 65000\n`;
         }
         return "";
       });
       const { nimModule, restore } = loadNimWithMockedRunner(runCapture);
-      const proveArm64WslDockerDesktopGpu = vi.fn(() => ({
-        passed: true,
-        timedOut: false,
-        exitCode: 0,
-        diagnostic: "",
-      }));
-
       try {
         withFirmwareModel("Microsoft Corporation Virtual Machine", () => {
           const result = nimModule.detectGpu({ proveArm64WslDockerDesktopGpu });
           expect(result).toMatchObject({
             type: "nvidia",
-            name: "JMJWOA-Generic-GPU",
+            name: gpuName,
             count: 1,
             totalMemoryMB: 65471,
             wslDockerDesktopGpuProofPassed: true,
           });
-          expect(proveArm64WslDockerDesktopGpu).toHaveBeenCalledWith(["JMJWOA-Generic-GPU"]);
+          expect(proveArm64WslDockerDesktopGpu).toHaveBeenCalledWith([gpuName]);
+          expect(nimModule.formatNvidiaGpuPreflightLines(result)).toEqual([
+            "NVIDIA GPU detected (JMJWOA-Generic-\\u{001b}\\u{0085}\\u{200d}\\u{2028}\\u{2029}GPU, 65471 MB)",
+          ]);
         });
       } finally {
         restore();
       }
     });
 
-    // Snapdragon WoA fail-closed: the same placeholder name, but the bounded
-    // CUDA proof fails because there is no usable NVIDIA device. The detection
-    // must stay null so #3988/#4424 is not reopened.
-    it("keeps rejecting a denylisted ARM64 GPU when the Docker GPU proof fails (#4565/#3988)", () => {
+    // A generic ARM64 host can be native Linux or Windows on ARM with WSL2.
+    // When the bounded CUDA proof fails, public detection must return null so
+    // the native Linux path does not reopen #3988/#4424.
+    it("rejects a denylisted generic ARM64 GPU when the Docker proof fails (#4565/#8096/#3988)", () => {
       const runCapture = vi.fn((cmd: string | string[]) => {
         if (!Array.isArray(cmd)) throw new Error("expected argv array");
         if (cmd[0] === "nvidia-smi" && cmd.some((a: string) => a.includes("name,memory.total"))) {
@@ -809,10 +804,10 @@ describe("nim", () => {
 
     // Trust-tier gate: on ARM64 Linux with generic firmware, the absence of
     // `/proc/driver/nvidia/` is the Windows-on-ARM WSL shim profile and must
-    // be rejected even when the nvidia-smi probe returns a plausible-looking
-    // NVIDIA name. The shim was QA-confirmed to emit format-valid
-    // `uuid`/`compute_cap`/`vbios_version` triples but never populates the
-    // kernel-driver path.
+    // be rejected on a plausible-looking NVIDIA name; the only escape is a
+    // passing bounded CUDA proof (#9000), so with no prover available the
+    // gate stays fail-closed. The QA-confirmed shim emits format-valid
+    // triples but never populates the kernel-driver path.
     it("rejects when /proc/driver/nvidia/ is absent on ARM64 generic firmware", () => {
       const runCapture = vi.fn((cmd: string | string[]) => {
         if (!Array.isArray(cmd)) throw new Error("expected argv array");
@@ -827,7 +822,7 @@ describe("nim", () => {
         withFirmwareModel("Microsoft Corporation Virtual Machine", () => {
           withLinuxArm64(() => {
             withNvidiaKernelInterface(false, () => {
-              expect(nimModule.detectGpu()).toBeNull();
+              expect(nimModule.detectGpu({ proveArm64WslDockerDesktopGpu: null })).toBeNull();
             });
           });
         });
@@ -838,8 +833,8 @@ describe("nim", () => {
 
     // Fail-closed contract: the trust-tier helper wraps the `fs.existsSync`
     // probe in a try/catch so a hardened sandbox or seccomp policy that
-    // refuses the syscall cannot mask the gate. When the probe throws on
-    // ARM64 generic firmware, the host must be rejected — never trusted.
+    // refuses the syscall cannot mask the gate. A probe that throws on ARM64
+    // generic firmware with no CUDA proof available must be rejected.
     it("rejects when /proc/driver/nvidia/ probe throws on ARM64 generic firmware", () => {
       const runCapture = vi.fn((cmd: string | string[]) => {
         if (!Array.isArray(cmd)) throw new Error("expected argv array");
@@ -860,7 +855,7 @@ describe("nim", () => {
       try {
         withFirmwareModel("Microsoft Corporation Virtual Machine", () => {
           withLinuxArm64(() => {
-            expect(nimModule.detectGpu()).toBeNull();
+            expect(nimModule.detectGpu({ proveArm64WslDockerDesktopGpu: null })).toBeNull();
           });
         });
       } finally {
@@ -1826,8 +1821,9 @@ describe("nim", () => {
       }
     });
 
-    it("uses published docker port when no port is provided", () => {
-      for (const mapping of ["0.0.0.0:9000", "127.0.0.1:9000", "[::]:9000", ":::9000"]) {
+    it.each(["0.0.0.0:9000", "127.0.0.1:9000", "[::]:9000", ":::9000"])(
+      "uses published Docker port mapping %s when no port is provided",
+      (mapping) => {
         const runCapture = vi.fn((cmd: string | string[]) => {
           if (!Array.isArray(cmd)) throw new Error("expected argv array");
           if (cmd[0] === "docker" && cmd.includes("inspect")) return "running";
@@ -1865,8 +1861,8 @@ describe("nim", () => {
         } finally {
           restore();
         }
-      }
-    });
+      },
+    );
 
     it("falls back to 8000 when docker port lookup fails", () => {
       const runCapture = vi.fn((cmd: string | string[]) => {

@@ -24,6 +24,12 @@ describe("normalizeArgv", () => {
     expect(
       normalizeArgv(["--dump-commands"], { globalCommands, isSandboxConnectFlag: isConnectFlag }),
     ).toEqual({ kind: "dumpCommands" });
+    expect(
+      normalizeArgv(["--dump-command-flags"], {
+        globalCommands,
+        isSandboxConnectFlag: isConnectFlag,
+      }),
+    ).toEqual({ kind: "dumpCommandFlags" });
   });
 
   it("normalizes global commands", () => {
@@ -71,6 +77,18 @@ describe("normalizeArgv", () => {
   it("tracks connect help requests", () => {
     expect(
       normalizeArgv(["alpha", "connect", "--help"], {
+        globalCommands,
+        isSandboxConnectFlag: isConnectFlag,
+      }),
+    ).toMatchObject({
+      kind: "sandbox",
+      sandboxName: "alpha",
+      action: "connect",
+      actionArgs: ["--help"],
+      connectHelpRequested: true,
+    });
+    expect(
+      normalizeArgv(["alpha", "--help"], {
         globalCommands,
         isSandboxConnectFlag: isConnectFlag,
       }),

@@ -13,11 +13,14 @@ import {
   getMessagingPolicyPresetValidationWarnings,
   getMessagingProviderSuffixesByChannel,
   listAvailableMessagingChannelIds,
+  listBuiltInMessagingChannelManifests,
   listMessagingChannelsWithoutCredentials,
   listMessagingConfigEnvKeys,
+  listMessagingCredentialEnvAssignments,
   listMessagingPackageInstallSpecs,
   listMessagingProviderNamesForChannel,
   listOpenClawManagedChannelNames,
+  listOpenClawPluginExtensionIds,
   listOpenClawRuntimeChannelMetadata,
   listRequiredCreateTimeMessagingPolicyPresetNames,
 } from "./metadata";
@@ -31,6 +34,7 @@ describe("built-in messaging channel metadata", () => {
       "slack",
       "whatsapp",
       "teams",
+      "googlechat",
     ]);
     expect(listAvailableMessagingChannelIds({ agent: "hermes" })).toEqual([
       "telegram",
@@ -39,6 +43,7 @@ describe("built-in messaging channel metadata", () => {
       "slack",
       "whatsapp",
       "teams",
+      "googlechat",
     ]);
   });
 
@@ -64,10 +69,38 @@ describe("built-in messaging channel metadata", () => {
       "demo-slack-bridge",
       "demo-slack-app",
     ]);
-    expect(listMessagingChannelsWithoutCredentials()).toEqual(["whatsapp"]);
+    expect(listMessagingChannelsWithoutCredentials()).toEqual(["whatsapp", "googlechat"]);
   });
 
-  it("resolves config env keys and aliases from manifest inputs", () => {
+  it("derives credential environment assignments from manifest render metadata", () => {
+    expect(
+      listMessagingCredentialEnvAssignments({ agent: "hermes" })
+        .filter(({ sourceEnvKey, targetEnvKey }) => sourceEnvKey !== targetEnvKey)
+        .map(({ channelId, sourceEnvKey, targetEnvKey }) => ({
+          channelId,
+          sourceEnvKey,
+          targetEnvKey,
+        })),
+    ).toEqual([
+      {
+        channelId: "wechat",
+        sourceEnvKey: "WECHAT_BOT_TOKEN",
+        targetEnvKey: "WEIXIN_TOKEN",
+      },
+      {
+        channelId: "teams",
+        sourceEnvKey: "MSTEAMS_APP_PASSWORD",
+        targetEnvKey: "TEAMS_CLIENT_SECRET",
+      },
+    ]);
+    expect(
+      listMessagingCredentialEnvAssignments({ agent: "openclaw" }).filter(
+        ({ channelId }) => channelId === "teams",
+      ),
+    ).toEqual([]);
+  });
+
+  it("resolves config env keys from manifests and compatibility aliases from metadata", () => {
     expect(listMessagingConfigEnvKeys()).toEqual([
       "TELEGRAM_ALLOWED_IDS",
       "TELEGRAM_REQUIRE_MENTION",
@@ -81,12 +114,19 @@ describe("built-in messaging channel metadata", () => {
       "WECHAT_ALLOWED_IDS",
       "SLACK_ALLOWED_USERS",
       "SLACK_ALLOWED_CHANNELS",
+      "WHATSAPP_MODE",
       "WHATSAPP_ALLOWED_IDS",
       "MSTEAMS_APP_ID",
       "MSTEAMS_TENANT_ID",
       "TEAMS_ALLOWED_USERS",
       "MSTEAMS_PORT",
       "TEAMS_REQUIRE_MENTION",
+      "GOOGLECHAT_AUDIENCE_TYPE",
+      "GOOGLECHAT_AUDIENCE",
+      "GOOGLECHAT_APP_PRINCIPAL",
+      "GOOGLECHAT_ALLOWED_USERS",
+      "GOOGLE_CHAT_PROJECT_ID",
+      "GOOGLE_CHAT_SUBSCRIPTION_NAME",
     ]);
     expect(getMessagingConfigEnvAliases()).toEqual({
       DISCORD_SERVER_ID: ["DISCORD_SERVER_IDS"],
@@ -115,7 +155,7 @@ describe("built-in messaging channel metadata", () => {
       whatsapp: ["whatsapp"],
       teams: ["teams"],
     });
-    expect(listRequiredCreateTimeMessagingPolicyPresetNames()).toEqual(["slack"]);
+    expect(listRequiredCreateTimeMessagingPolicyPresetNames()).toEqual(["discord", "slack"]);
     expect(getMessagingPolicyPresetValidationWarnings().discord).toContain(
       "https://discord.com/api/v10/gateway or validate the configured",
     );
@@ -126,6 +166,15 @@ describe("built-in messaging channel metadata", () => {
       "slack",
       "whatsapp",
       "msteams",
+      "googlechat",
+    ]);
+    expect(listOpenClawPluginExtensionIds()).toEqual([
+      "discord",
+      "openclaw-weixin",
+      "slack",
+      "whatsapp",
+      "msteams",
+      "googlechat",
     ]);
     expect(
       Object.fromEntries(
@@ -166,7 +215,79 @@ describe("built-in messaging channel metadata", () => {
         packageId: "hermesAiohttpPackage",
         agents: ["hermes"],
         manager: "hermes-uv-pip",
-        spec: "aiohttp==3.14.1",
+        spec: "aiohttp==3.14.3",
+      },
+      {
+        channelId: "googlechat",
+        packageId: "hermesGooglePubsubPackage",
+        agents: ["hermes"],
+        manager: "hermes-uv-pip",
+        spec: "google-cloud-pubsub==2.39.0",
+      },
+      {
+        channelId: "googlechat",
+        packageId: "hermesGoogleApiClientPackage",
+        agents: ["hermes"],
+        manager: "hermes-uv-pip",
+        spec: "google-api-python-client==2.194.0",
+      },
+      {
+        channelId: "googlechat",
+        packageId: "hermesGoogleAuthPackage",
+        agents: ["hermes"],
+        manager: "hermes-uv-pip",
+        spec: "google-auth==2.55.1",
+      },
+    ]);
+  });
+
+  it("requires committed npm integrity pins for built-in OpenClaw plugin installs", () => {
+    const npmPluginInstalls = listBuiltInMessagingChannelManifests({ agent: "openclaw" }).flatMap(
+      (manifest) =>
+        (manifest.agentPackages ?? [])
+          .filter(
+            (agentPackage) =>
+              agentPackage.agent === "openclaw" &&
+              agentPackage.manager === "openclaw-plugin" &&
+              agentPackage.spec.startsWith("npm:"),
+          )
+          .map((agentPackage) => ({
+            packageKey: `${manifest.id}/${agentPackage.id}`,
+            committedIntegrity:
+              agentPackage.integrity ?? agentPackage.integrityByVersion?.["2026.7.1"],
+          })),
+    );
+
+    expect(npmPluginInstalls).toEqual([
+      {
+        packageKey: "discord/openclawPluginPackage",
+        committedIntegrity:
+          "sha512-tZfdC1YA8oVLvc2BK1w0F6rUljS5ugCOp2uWe0vPsbG1fbzVVIO4V32RoqZznGHe5u2R9u4n1aV5Z/qa1m2oFg==",
+      },
+      {
+        packageKey: "wechat/openclawPluginPackage",
+        committedIntegrity:
+          "sha512-dPQbidUNWigC6V10vGW4i+GLH09x+6zUhafZRjuxkJ9GDu8o62WBsnUTojp4KqUH756hz+t2v9khiCRSi0dBDw==",
+      },
+      {
+        packageKey: "slack/openclawPluginPackage",
+        committedIntegrity:
+          "sha512-dwVGEVCmoTQrOIeZaSCIOPg8pT7hB883QQEXdp9EZUDzTGuvSc+KxH2iERSOV/59hROQctYdcobGn/vdB1H4XA==",
+      },
+      {
+        packageKey: "whatsapp/openclawPluginPackage",
+        committedIntegrity:
+          "sha512-wLY/Omc5fleRpl2lKGN8sxt/8hYfHGwLRezmWsk8oCbea5pRKUPE6ZX+wJO1O52NOJkAGCuiXvS7x0qIeKxXbQ==",
+      },
+      {
+        packageKey: "teams/openclawPluginPackage",
+        committedIntegrity:
+          "sha512-gG/Yk6HZAguHwrmKjsqdONbFz5WNy126PEAXQWNW/TulO1kIifQ6tktM16BQPNLnkmWqLbj+TrrO55Cjas1aFg==",
+      },
+      {
+        packageKey: "googlechat/openclawPluginPackage",
+        committedIntegrity:
+          "sha512-Dv0xOmcxAThEr6hoK+ioofHNu18hfbIceQrEHX3AHZPpOUiTJvToVpA5eX87NQINewwfSJf0gVhE6kSbSk2Aew==",
       },
     ]);
   });
@@ -296,7 +417,6 @@ function manifestWithPreset(id: string, preset: ChannelPolicyPresetReference): C
     credentials: [],
     policyPresets: [preset],
     render: [],
-    state: {},
     hooks: [],
   };
 }

@@ -6,7 +6,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   type OnboardEntryOptionsDeps,
   resolveOnboardEntryOptions,
-} from "../../../dist/lib/onboard/entry-options";
+  resolveOnboardRunOptions,
+  withNonInteractiveEnvironment,
+} from "./entry-options";
 
 class ExitError extends Error {
   constructor(readonly code: number) {
@@ -28,6 +30,44 @@ function createDeps(overrides: Partial<OnboardEntryOptionsDeps> = {}): OnboardEn
     ...overrides,
   };
 }
+
+describe("resolveOnboardRunOptions", () => {
+  it.each([
+    [false, true],
+    [false, false],
+  ])(
+    "treats auto-yes resume as non-interactive when stdin=%s and stdout=%s",
+    (stdinIsTty, stdoutIsTty) => {
+      expect(
+        resolveOnboardRunOptions({ autoYes: true, resume: true }, {}, null, () => false, {
+          stdinIsTty,
+          stdoutIsTty,
+        }).nonInteractive,
+      ).toBe(true);
+    },
+  );
+
+  it.each([
+    [true, true],
+    [true, false],
+  ])("keeps auto-yes resume interactive when stdin=%s and stdout=%s", (stdinIsTty, stdoutIsTty) => {
+    expect(
+      resolveOnboardRunOptions({ autoYes: true, resume: true }, {}, null, () => false, {
+        stdinIsTty,
+        stdoutIsTty,
+      }).nonInteractive,
+    ).toBe(false);
+  });
+
+  it("keeps fresh no-TTY auto-yes interactive", () => {
+    expect(
+      resolveOnboardRunOptions({ autoYes: true }, {}, null, () => false, {
+        stdinIsTty: false,
+        stdoutIsTty: false,
+      }).nonInteractive,
+    ).toBe(false);
+  });
+});
 
 describe("resolveOnboardEntryOptions", () => {
   it("rejects mutually exclusive resume and fresh flags", () => {
@@ -156,6 +196,23 @@ describe("resolveOnboardEntryOptions", () => {
     expect(deps.error).not.toHaveBeenCalled();
   });
 
+  it("does not auto-resume a rejected non-resumable session", () => {
+    const deps = createDeps();
+
+    const result = resolveOnboardEntryOptions(
+      {
+        opts: {},
+        env: {},
+        stdinIsTty: true,
+        stdoutIsTty: true,
+        persistedSessionStatus: "failed",
+      },
+      deps,
+    );
+
+    expect(result.resume).toBe(false);
+  });
+
   it("does not auto-resume when --fresh is set even with an in_progress session (#5470)", () => {
     const deps = createDeps();
 
@@ -177,16 +234,16 @@ describe("resolveOnboardEntryOptions", () => {
     expect(deps.error).not.toHaveBeenCalled();
   });
 
-  it("does not auto-resume when the persisted session is not in_progress (#5470)", () => {
+  it.each(
+    Array.from(["complete", "failed", "pending", "", null, undefined] as const, (value) => [value]),
+  )("does not auto-resume from persisted session state %s (#5470)", (status) => {
     const deps = createDeps();
 
-    for (const status of ["complete", "failed", "pending", "", null, undefined] as const) {
-      const result = resolveOnboardEntryOptions(
-        { opts: {}, env: {}, stdinIsTty: true, stdoutIsTty: true, persistedSessionStatus: status },
-        deps,
-      );
-      expect(result.resume).toBe(false);
-    }
+    const result = resolveOnboardEntryOptions(
+      { opts: {}, env: {}, stdinIsTty: true, stdoutIsTty: true, persistedSessionStatus: status },
+      deps,
+    );
+    expect(result.resume).toBe(false);
   });
 
   it("prints validation guidance for invalid sandbox names", () => {
@@ -209,5 +266,48 @@ describe("resolveOnboardEntryOptions", () => {
     ).toThrow(ExitError);
     expect(deps.error).toHaveBeenCalledWith("  Invalid sandbox name");
     expect(deps.error).toHaveBeenCalledWith("  Use lowercase letters, numbers, and hyphens.");
+  });
+});
+
+describe("withNonInteractiveEnvironment", () => {
+  it.each([
+    { label: "an unset value", env: {} as NodeJS.ProcessEnv, restored: undefined },
+    {
+      label: "an existing value",
+      env: { NEMOCLAW_NON_INTERACTIVE: "existing" } as NodeJS.ProcessEnv,
+      restored: "existing",
+    },
+  ])("sets the compatibility flag and restores $label", async ({ env, restored }) => {
+    const run = vi.fn(async () => {
+      expect(env.NEMOCLAW_NON_INTERACTIVE).toBe("1");
+    });
+
+    await withNonInteractiveEnvironment(run, env)({ nonInteractive: true });
+
+    expect(run).toHaveBeenCalledOnce();
+    expect(env.NEMOCLAW_NON_INTERACTIVE).toBe(restored);
+  });
+
+  it("restores the compatibility flag when onboarding rejects", async () => {
+    const env = {} as NodeJS.ProcessEnv;
+    const run = vi.fn(async () => {
+      throw new Error("onboarding failed");
+    });
+
+    await expect(withNonInteractiveEnvironment(run, env)({ nonInteractive: true })).rejects.toThrow(
+      "onboarding failed",
+    );
+    expect(env.NEMOCLAW_NON_INTERACTIVE).toBeUndefined();
+  });
+
+  it("passes options through without changing the environment when the flag is absent", async () => {
+    const env = { NEMOCLAW_NON_INTERACTIVE: "existing" } as NodeJS.ProcessEnv;
+    const options = { nonInteractive: false, marker: "unchanged" };
+    const run = vi.fn(async () => {});
+
+    await withNonInteractiveEnvironment(run, env)(options);
+
+    expect(run).toHaveBeenCalledWith(options);
+    expect(env.NEMOCLAW_NON_INTERACTIVE).toBe("existing");
   });
 });

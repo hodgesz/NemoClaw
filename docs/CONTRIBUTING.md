@@ -5,11 +5,18 @@
 
 # Contributing to NemoClaw Documentation
 
-This guide covers how to write, edit, and review documentation for NemoClaw. If you change code that affects user-facing behavior, update the relevant docs in the same PR.
+This guide owns the public-facing documentation procedure and rules for NemoClaw.
+Code-changing pull requests (PRs) may defer public `docs/**`, `fern/docs.yml`, and `fern/assets/**` updates to `Docs / Post-Merge Catch-Up`.
+The workflow maintains one cumulative draft documentation PR for merged changes after the latest release tag.
+The PR title names the next patch tag after that release tag.
+The PR body names both tags and explains the development and release-cutoff procedures.
+Each later push to `main` that changes a path outside `docs/**`, `fern/docs.yml`, and `fern/assets/**` refreshes the same PR with an independently reviewed cumulative patch.
+The publisher fast-forwards the branch and stops if a person changes the branch or PR metadata.
+The publisher never force-pushes.
 
 ## When to Update Docs
 
-Update documentation when your change:
+The post-merge workflow updates documentation when a merged change:
 
 - Adds, removes, or renames a CLI command or flag.
 - Changes default behavior or configuration.
@@ -17,17 +24,16 @@ Update documentation when your change:
 - Fixes a bug that the docs describe incorrectly.
 - Changes an API, protocol, or policy schema.
 
-## Update Docs with Contributor Skills
+## Confirm Product Scope Before Writing Docs
 
-If you use an AI coding agent (Cursor, Claude Code, Codex, etc.), the repo includes the `nemoclaw-contributor-update-docs` skill that automates doc work.
-Use it before writing from scratch.
+Canonical documentation describes behavior that NemoClaw has chosen to support and maintain.
+A documentation PR must not establish a new supported integration, solution workflow, custom image, third-party stack, or product surface by itself.
 
-The skill scans recent commits for user-facing changes and drafts doc updates.
-Run it after landing features, before a release, or to find doc gaps.
-For example, ask your agent to "catch up the docs for the changes I made in this PR".
-During release prep, run the skill first, make any doc version bumps, then open the docs refresh PR.
+Technical correctness, successful builds, and working examples are necessary evidence, but they are not product approval.
+Before documenting a new surface, confirm that an accepted issue or design decision defines ownership, compatibility and upgrade expectations, security review, lifecycle support, and validation.
 
-The skill lives in `.agents/skills/nemoclaw-contributor-update-docs/` and follows the style guide below automatically.
+Route independent solutions, complete use-case examples, and third-party integrations through [Community Solutions](resources/community-contributions.mdx).
+If the correct destination is unclear, request maintainer direction before drafting the page.
 
 ## Markdown Docs for AI Agents
 
@@ -54,7 +60,7 @@ To print the pinned Fern CLI version, run:
 npm run docs:deps
 ```
 
-To validate the Fern configuration and migrated MDX pages, run:
+To validate the Fern configuration and MDX pages, run:
 
 ```bash
 npm run docs
@@ -73,25 +79,119 @@ npm run docs:preview:watch
 ```
 
 The preview watcher uses the current Git branch name as the Fern preview ID and watches the `docs/` and `fern/` directories.
+By default, it publishes to the `nvidia-nemoclaw-staging.docs.buildwithfern.com/nemoclaw` Fern docs instance.
+Set `FERN_STAGING_INSTANCE` to a `<hostname>/<path>` value when you need to target a different Fern docs instance.
+The watcher rejects blank or malformed overrides before it starts Fern.
 
-Fern `.mdx` pages are the canonical docs source.
+Fern `.mdx` pages are the docs source.
 Fern publishes Markdown routes for AI agents from the same source pages.
+
+## Updating the Changelog
+
+The native Fern changelog under `docs/changelog/` is the release history.
+One source directory is shared across the OpenClaw, Hermes, and Deep Agents user-guide variants.
+The end-of-day flow merges the planned release entry.
+A docs-only merge does not start another catch-up run. The tag skill shows the latest cumulative
+docs PR, its automated coverage point, later commits and PRs, review and check state, changed paths,
+and open managed docs PRs. The maintainer then decides whether to proceed, request another docs PR,
+or stop tagging.
+
+For each release:
+
+- Add the complete release entry to `docs/changelog/YYYY-MM-DD.mdx`, using the release date as the filename.
+- Start the entry with an H2 version heading such as `## v0.0.83`.
+- If more than one release ships on the same date, put each version in the same file with the newest version first.
+- Include the summary and detailed bullets in the dated file; do not create separate variant-specific Release Notes pages.
+- Use literal CLI names instead of the `$$nemoclaw` variant placeholder because native changelog files do not pass through agent-variant generation.
+- Use root-absolute published routes for internal links in dated entries.
+  Generic links should target the OpenClaw route under `/user-guide/openclaw/`; agent-specific links should target the corresponding Hermes or Deep Agents route.
+- Use MDX comment syntax (`{/* ... */}`) for the SPDX header; HTML comments do not parse in Fern changelog entries.
+- Keep every dated entry directly under `docs/changelog/`; Fern does not support subdirectories there.
+
+Follow [Doc-Only PR Verification](#doc-only-pr-verification) after adding or changing the release entry.
+
+## Publishing Docs
+
+GitHub Actions publishes Fern docs from the same source files that `npm run docs` validates locally.
+
+Docs PRs get Fern previews when they change `docs/`, `fern/`, or docs build inputs.
+The preview workflow publishes to the staging Fern instance with a `pr-<number>` preview ID and posts the preview URL on the PR when `FERN_TOKEN` is available.
+
+After a docs PR merges, pushes to `main` publish the affected docs to the staging Fern instance.
+The staging publish job regenerates agent variants, validates Fern docs, publishes staging, and deletes the merged PR preview when it can map the merge commit back to a PR.
+
+Public docs publish automatically when a `v*.*.*` release tag is pushed.
+The public publish job runs in the `docs-public` environment, verifies that the tag commit is reachable from `origin/main`, regenerates agent variants, validates Fern docs, and publishes to the public Fern instance.
+If the tag does not point to a commit on `main`, the job stops before installing dependencies or running Fern.
+
+## Starter Prompt Generation
+
+The coding-agent installation prompt lives in `docs/resources/starter-prompt.md`.
+Edit that Markdown file instead of placing prompt text in a React component.
+Keep conditional platform instructions in focused Markdown files under `docs/resources/prompt-assets/` and link to their raw GitHub URLs from the starter prompt.
+The main prompt should tell the coding agent when to load each asset and should not repeat the asset's detailed instructions.
+Use one shared immutable commit SHA for every platform-asset URL in a starter-prompt revision.
+The contributor who changes any platform asset owns the corresponding pin update.
+First commit the updated assets, starter-prompt behavior, and related tests without changing the existing URLs, `promptAssetRevision`, or pinned SHA-256 values.
+Then use that commit's SHA in every platform-asset URL, update `promptAssetRevision` and every pinned SHA-256 value in `test/generation/starter-prompt-docs.test.ts`, and commit the repin as one atomic follow-up.
+Never mix asset URLs from different revisions or point an asset URL at a commit that predates its content.
+The asset test compares each local file byte-for-byte with its Git blob at `promptAssetRevision`, so the intermediate content commit intentionally fails until the atomic repin follow-up points every URL, revision, and digest at that content commit.
+Updating only a local digest does not prove what the pinned revision contains.
+Downstream consumers can pin the source with a raw URL such as
+`https://raw.githubusercontent.com/NVIDIA/NemoClaw/<commit-sha>/docs/resources/starter-prompt.md`.
+The Markdown SPDX comment is part of that raw file but does not appear when Markdown is rendered.
+
+The `scripts/generate-starter-prompt.mts` script removes the Markdown SPDX preamble and writes `docs/_build/StarterPrompt.generated.mdx`.
+The generated snippet wraps the prompt in Fern's native visible `Prompt` component, which displays the prompt body and supplies the copy button.
+The generated file is ignored by Git and is recreated by the docs build.
+
+Run the generator directly when you need to inspect the generated snippet:
+
+```bash
+npm run docs:sync-starter-prompt
+```
+
+Run the read-only comparison after generation when you need to verify that the snippet matches the Markdown source:
+
+```bash
+npm run docs:check-starter-prompt
+```
+
+The shared `npm run docs:prepare` step generates the Starter Prompt and agent variants.
+The normal `npm run docs`, `npm run docs:live`, agent-variant sync, preview-watcher, and docs publish workflows run that step before Fern validates, serves, previews, or publishes the pages that include the prompt.
 
 ## Agent Variant Generation
 
-Some Fern pages appear in both the OpenClaw and Hermes guide variants.
-The `scripts/sync-agent-variant-docs.ts` script reads `docs/index.yml` and renders variant-specific copies for every page that appears in both guide variants before Fern validates or publishes the site.
+Some Fern pages appear in the OpenClaw, Hermes, Deep Agents, and Pi guide variants.
+The `scripts/sync-agent-variant-docs.mts` script reads `docs/index.yml` and renders variant-specific copies for every page that appears in multiple guide variants before Fern validates or publishes the site.
 The source pages stay in their normal `docs/` locations, and generated pages are written under `docs/_build/agent-variants/`, which is ignored by Git.
 Navigation in `docs/index.yml` points Fern at generated pages for shared entries so Fern still renders normal fenced code blocks with copy buttons and syntax highlighting.
-OpenClaw-only or Hermes-only pages stay as source pages in navigation.
+OpenClaw-only, Hermes-only, Deep Agents-only, or Pi-only pages stay as source pages in navigation.
+
+Determine page applicability from the implementation, tests, or accepted product scope before adding or moving navigation entries.
+Do not use the current navigation tree as evidence that a page is agent-specific.
+Publish a shared source page through generated navigation targets in every applicable variant.
+The established shared scope is OpenClaw, Hermes, and Deep Agents. A page in that complete scope can omit `agent-variants`. When a page has a narrower scope or appears in the Pi guide, declare the exact subset in frontmatter, for example `agent-variants: ["openclaw", "hermes"]` or `agent-variants: ["pi"]`.
+The sync command fails when a subset declaration is missing or differs from navigation membership.
 
 When shared page content is the same except for the host CLI binary, write one source page and use `$$nemoclaw` as a build-time placeholder.
-Do not duplicate fenced code blocks or inline command examples only to switch between `nemoclaw` and `nemohermes`.
+Do not duplicate fenced code blocks or inline command examples only to switch among `nemoclaw`,
+`nemohermes`, and `nemo-deepagents`.
 Use literal command names on those single-variant pages rather than `$$nemoclaw`, because no generated page will rewrite the placeholder.
 
 Run `npm run docs:sync-agent-variants` after editing shared variant source pages or navigation.
 Run `npm run docs` before opening a PR to verify the generated pages, rewritten relative links, and Fern navigation.
+Update `docs/index.yml` when navigation, slugs, or page placement changes.
 If content differs by behavior, setup flow, state layout, or agent-specific wording, keep using `<AgentOnly>` blocks for that content.
+Treat `<AgentOnly>` as a build-time directive rather than a React component, and do not import it from `AgentGuide.tsx`.
+Put each opening and closing tag at the first column on its own line, and do not nest the blocks.
+Keep a section heading inside the `<AgentOnly>` block that holds its body, or the heading renders in every variant with nothing beneath it.
+The sync command fails when a generated variant leaves a heading without content.
+The generated pages must contain only statically resolved content, with no `AgentGuide` imports or runtime agent components.
+
+Before review, render every guide variant that uses a changed shared page.
+Confirm that commands, paths, state locations, and capabilities are correct in each variant.
+State when a variant has no equivalent operation.
 
 ## Route-Style Links
 
@@ -114,9 +214,12 @@ Commit and push normally so the Git hooks run, then run:
 npm run docs
 ```
 
-Leave `npm test` unchecked in the PR verification checklist unless you actually ran it.
-If hooks were skipped or unavailable, run `npx prek run --from-ref main --to-ref HEAD` before opening the PR.
-Run targeted tests only when the change also touches code, generated behavior, or runtime behavior.
+Leave the broad-gate verification item unchecked unless you actually ran the applicable command.
+If normal `pre-commit`, `commit-msg`, or `pre-push` hooks were skipped or unavailable, run `npm run validate:pr` once to reproduce those checks before opening the PR.
+The command uses `origin/main`, so refresh it with `git fetch origin main` first.
+Run targeted tests once per relevant change set only when the change also touches code, generated behavior, or runtime behavior; rerun after later edits or hook autofixes that can affect it.
+Reserve `npm test` for broad runtime or test-harness changes.
+Reserve `npm run check` for repo-wide validation or coverage-baseline changes.
 
 ## Writing Conventions
 
@@ -152,6 +255,12 @@ position: 1
 ---
 ```
 
+When the page intentionally applies to fewer than OpenClaw, Hermes, and Deep Agents, or when it appears in the Pi guide, add the exact subset to frontmatter:
+
+```yaml
+agent-variants: ["openclaw", "hermes"]
+```
+
 ### Page Structure
 
 1. Start MDX pages with a one- or two-sentence introduction stating what the page covers.
@@ -159,9 +268,25 @@ position: 1
 3. Use Fern components like `<Note>`, `<Tip>`, `<Warning>`, `<Cards>`, and `<Card>` for callouts and landing-page navigation.
 4. Add a "Next Steps" or "Related Topics" section at the bottom when it helps users continue.
 
+### Procedure Structure
+
+Present an operational procedure in this order:
+
+1. State the prerequisites and risks.
+2. Show the command or action.
+3. State the resulting state changes, external traffic, credential changes, and other effects.
+4. Give the verification command or observation and its acceptance criterion.
+5. Give recovery or rollback instructions when failure can leave state behind or create risk.
+
+Put warnings about destructive or replacement behavior, security relaxation, data loss, credential
+exposure, external traffic, and public ingress before the action that creates the risk.
+
 ## Style Guide
 
 Write like you are explaining something to a colleague. Be direct, specific, and concise.
+Follow the [NemoClaw Writing Guide](../WRITING.md) for changed prose.
+The writing guide defines sentence rules, rewrite examples, and review policy.
+The rules below add documentation-specific voice, formatting, and product-name conventions.
 
 ### Voice and Tone
 
@@ -169,6 +294,22 @@ Write like you are explaining something to a colleague. Be direct, specific, and
 - Use second person ("you") when addressing the reader.
 - Use present tense. "The command returns an error" not "The command will return an error."
 - State facts. Do not hedge with "simply," "just," "easily," or "of course."
+- Avoid contractions. Write "do not," "cannot," and "it is."
+- Spell out an uncommon abbreviation at first use.
+  Spell out LLM, RAG, SLM, VLM, and MoE at first use.
+- Replace Latinisms with plain English.
+  Use "for example," "that is," "and so on," "through," and "compared to."
+- Use "refer to" instead of "see," "can" instead of "may" for capability, and "after" instead of
+  "once" for time.
+- Do not use "please" in technical instructions.
+
+### Product Names and Usage
+
+- Write "NVIDIA" in all caps and use "an NVIDIA," not "a NVIDIA."
+- Use NVIDIA spellings such as data center, dataset, open source, pretrained, startup, webpage,
+  website, and Wi-Fi.
+- Preserve quoted UI labels, API field names, and audience role labels instead of rewriting them to
+  enforce second person.
 
 ### Things to Avoid
 
@@ -186,21 +327,40 @@ Remove them during review.
 
 ### Formatting Rules
 
-- End every sentence with a period.
-- One sentence per line in the source file (makes diffs readable).
-- Use `code` formatting for CLI commands, file paths, flags, parameter names, and values.
+- End prose sentences with a period.
+- Put one prose sentence per source line.
+- Exempt frontmatter, headings, navigation labels, diagrams, code, output, UI labels, and compact
+  table fragments from the prose sentence rules.
+- Use `code` formatting for commands, code, filenames, paths, flags, environment variables, API
+  identifiers, and literal values.
+- Use numerals for specific values, parameters, measurements, and values of 10 or more.
+  Spell out zero through nine in general prose.
+- Include a space between a number and its unit.
+  Use a comma in numbers with four or more digits.
+- Use title case for headings.
+  Do not style headings with code, bold, italics, quotation marks, ampersands, or exclamation marks.
+- Use the Oxford comma.
+  Put periods inside quotation marks in U.S. style.
+- Use hyphens only for compound modifiers before nouns.
+  Do not hyphenate an adverb that ends in "ly."
+- Use bold for UI elements and the greater-than sign for UI navigation.
+- Introduce lists, tables, code examples, and images with a complete sentence.
+  Use parallel construction in lists.
+- Use descriptive link text.
+  Do not use raw URLs in running text or generic link text such as "click here" or "read more."
+- Write dates as Month DD, YYYY.
+  Omit the year when it matches the publication year.
+  Write time with a 12-hour clock and include minutes only when needed.
+- Provide useful alt text and preserve a logical heading hierarchy.
 - Use language-specific code blocks for commands that readers should copy.
   Put only the command text in copyable blocks:
 
   ```bash
-  $$nemoclaw onboard
+  npm run docs
   ```
 
-- Use `$$nemoclaw` as a build-time placeholder for NemoClaw host CLI command examples in shared variant pages.
-  The docs build resolves it to `nemoclaw` for OpenClaw pages and `nemohermes` for Hermes pages before Fern renders code blocks.
-  This preserves Fern's native fenced-code UI while keeping one source sample.
-- Do not write duplicate `<AgentOnly>` fenced code blocks when the only difference is `nemoclaw` versus `nemohermes`.
-  Use `<AgentOnly>` blocks only when the surrounding content differs between the OpenClaw and Hermes variants.
+- Apply the [agent variant generation rules](#agent-variant-generation) to code samples that differ
+  between guide variants.
 
 - Use `powershell` for Windows PowerShell commands.
   Use `bash` or `sh` for Linux, macOS, and WSL shell commands.
@@ -213,50 +373,33 @@ Remove them during review.
 
 - Use tables for structured comparisons. Keep tables simple (no nested formatting).
 - Use Fern callout components (`<Note>`, `<Tip>`, `<Warning>`) for callouts in MDX pages, not bold text.
-- Use MyST admonitions (`:::{tip}`, `:::{note}`, `:::{warning}`) only in legacy `.md` pages that have not migrated yet.
 - Avoid nested admonitions.
 - Do not number section titles. Write "Deploy a Gateway" not "Section 1: Deploy a Gateway" or "Step 3: Verify."
 - Do not use colons in titles. Write "Deploy and Manage Gateways" not "Gateways: Deploy and Manage."
-- Use colons only to introduce a list. Do not use colons as general-purpose punctuation between clauses.
-
-### Word List
-
-Use these consistently:
-
-| Use | Do not use |
-|---|---|
-| gateway | Gateway (unless starting a sentence) |
-| sandbox | Sandbox (unless starting a sentence) |
-| CLI | cli, Cli |
-| API key | api key, API Key |
-| NVIDIA | Nvidia, nvidia |
-| NemoClaw | nemoclaw (in prose), Nemoclaw |
-| OpenClaw | openclaw (in prose), Openclaw |
-| OpenShell | Open Shell, openShell, Openshell, openshell |
-| mTLS | MTLS, mtls |
-| YAML | yaml, Yaml |
+- Use colons to introduce a list or define a term or value.
+  Do not use a colon to join independent clauses.
 
 ## Submitting Doc Changes
 
 1. Create a branch following the project convention.
 2. Make your changes.
 3. Build locally with `npm run docs` and verify the output.
-4. Open a PR with `docs:` as the conventional commit type.
+4. Have a separate documentation writer review the completed diff against this guide and `WRITING.md`.
+5. Open a PR with `docs:` as the conventional commit type.
 
 ```text
 docs: update quickstart for new onboard wizard
-```
-
-If your doc change accompanies a code change, include both in the same PR and use the code change's commit type:
-
-```text
-feat(cli): add policy-add command
 ```
 
 ## Reviewing Doc PRs
 
 When reviewing documentation:
 
+- Review changed text against the [Style Guide](#style-guide) and its linked writing and
+  terminology authorities.
+- Confirm that the page documents an approved and maintained NemoClaw product surface.
+- Do not approve a new integration or solution solely because its instructions work or its checks pass.
+- Route independent third-party solutions to [Community Solutions](resources/community-contributions.mdx) when no product decision establishes core ownership.
 - Check that the style guide rules above are followed.
 - Watch for LLM-generated patterns (excessive bold, em dashes, filler).
 - Verify code examples are accurate and runnable.

@@ -1,16 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from "vitest";
-// Import through the compiled dist/ output so coverage is attributed to the
-// CLI build output that the ratchet measures.
-import {
-  assessHost,
-  planHostRemediation,
-  shouldEnforceCdiNvidiaGpuSpec,
-} from "../../../dist/lib/onboard/preflight";
+import { describe, expect, it, vi } from "vitest";
+// Import source directly so tests cannot pass against a stale build.
+import { assessHost, planHostAdvisories } from "./preflight";
 
-type HostAssessment = Parameters<typeof planHostRemediation>[0];
+type HostAssessment = Parameters<typeof planHostAdvisories>[0];
+
+function advisoryCommands(advisory: { commands?: readonly string[] } | undefined) {
+  return advisory?.commands ?? [];
+}
 
 function baseAssessment(overrides: Partial<HostAssessment> = {}): HostAssessment {
   return {
@@ -54,6 +53,8 @@ function runCaptureWithLspci(lspciOutput: string): (command: readonly string[]) 
   };
 }
 
+const noHostCommandOutput = () => "";
+
 function healthySystemctlAndStat(command: readonly string[]) {
   if (command[0] === "systemctl" && command[1] === "is-enabled") return "enabled";
   if (command[0] === "systemctl" && command[1] === "is-active") return "active";
@@ -70,6 +71,7 @@ describe("assessHost — CDI", () => {
       release: "6.8.0-58-generic",
       readFileImpl: () => "Linux version 6.8.0-58-generic",
       readdirImpl: () => [],
+      runCaptureImpl: noHostCommandOutput,
       dockerInfoOutput: JSON.stringify({
         ServerVersion: "27.0",
         OperatingSystem: "Ubuntu 24.04",
@@ -93,6 +95,7 @@ describe("assessHost — CDI", () => {
           ? "cdiVersion: 0.5.0\nkind: nvidia.com/gpu\ndevices: []\n"
           : "Linux version 6.8.0-58-generic",
       readdirImpl: (dir: string) => (dir === "/etc/cdi" ? ["nvidia.yaml"] : []),
+      runCaptureImpl: noHostCommandOutput,
       dockerInfoOutput: JSON.stringify({
         ServerVersion: "27.0",
         CDISpecDirs: ["/etc/cdi", "/var/run/cdi"],
@@ -234,13 +237,14 @@ describe("assessHost — CDI", () => {
     expect(result.nvidiaCdiRefreshServiceEnabled).toBe(false);
   });
 
-  it("does not apply CDI checks without an NVIDIA Linux CDI context", () => {
+  it("uses default CDI directories only when the NVIDIA Linux check applies (#7411)", () => {
     const linuxWithoutGpu = assessHost({
       platform: "linux",
       env: {},
       release: "6.8.0-58-generic",
       readFileImpl: () => "Linux version 6.8.0-58-generic",
       readdirImpl: () => [],
+      runCaptureImpl: noHostCommandOutput,
       dockerInfoOutput: JSON.stringify({ ServerVersion: "27.0", CDISpecDirs: ["/etc/cdi"] }),
       commandExistsImpl: (name: string) => name === "docker",
       gpuProbeImpl: () => false,
@@ -251,31 +255,36 @@ describe("assessHost — CDI", () => {
       release: "6.8.0-58-generic",
       readFileImpl: () => "Linux version 6.8.0-58-generic",
       readdirImpl: () => [],
+      runCaptureImpl: noHostCommandOutput,
       dockerInfoOutput: JSON.stringify({ ServerVersion: "24.0" }),
       commandExistsImpl: (name: string) => name === "docker",
       gpuProbeImpl: () => true,
     });
 
     expect(linuxWithoutGpu.cdiNvidiaGpuSpecMissing).toBe(false);
-    expect(noCdiDirs.dockerCdiSpecDirs).toEqual([]);
-    expect(noCdiDirs.cdiNvidiaGpuSpecMissing).toBe(false);
+    expect(noCdiDirs.dockerCdiSpecDirs).toEqual(["/etc/cdi", "/var/run/cdi"]);
+    expect(noCdiDirs.cdiNvidiaGpuSpecMissing).toBe(true);
   });
 });
 
-describe("planHostRemediation — CDI", () => {
+describe("planHostAdvisories — CDI", () => {
   it("emits a blocking generate action for missing nvidia.com/gpu specs", () => {
-    const actions = planHostRemediation(baseAssessment({ cdiNvidiaGpuSpecMissing: true }));
+    const actions = planHostAdvisories(baseAssessment({ cdiNvidiaGpuSpecMissing: true }));
     const action = actions.find((entry: { id: string }) => entry.id === "generate_nvidia_cdi_spec");
 
     expect(action).toBeTruthy();
     expect(action?.kind).toBe("sudo");
-    expect(action?.blocking).toBe(true);
-    expect(action?.commands.some((command) => command.includes("--output='/etc/cdi"))).toBe(true);
-    expect(action?.commands.some((command) => command.includes("nvidia-ctk cdi list"))).toBe(true);
+    expect(action?.severity).toBe("blocking");
+    expect(advisoryCommands(action).some((command) => command.includes("--output='/etc/cdi"))).toBe(
+      true,
+    );
+    expect(
+      advisoryCommands(action).some((command) => command.includes("nvidia-ctk cdi list")),
+    ).toBe(true);
   });
 
   it("emits service-refresh commands for stale nvidia.com/gpu specs", () => {
-    const actions = planHostRemediation(
+    const actions = planHostAdvisories(
       baseAssessment({
         cdiNvidiaGpuSpecStale: true,
         cdiNvidiaGpuSpecNeedsRepair: true,
@@ -285,20 +294,26 @@ describe("planHostRemediation — CDI", () => {
     const action = actions.find((entry: { id: string }) => entry.id === "refresh_nvidia_cdi_spec");
 
     expect(action).toBeTruthy();
-    expect(action?.blocking).toBe(true);
-    expect(action?.commands[0]).toBe(
+    expect(action?.severity).toBe("blocking");
+    expect(advisoryCommands(action)[0]).toBe(
       "sudo systemctl enable --now nvidia-cdi-refresh.path nvidia-cdi-refresh.service",
     );
-    expect(action?.commands[1]).toBe("sudo systemctl start nvidia-cdi-refresh.service");
+    expect(advisoryCommands(action)[1]).toBe("sudo systemctl start nvidia-cdi-refresh.service");
     expect(
-      action?.commands.some((command) => command.includes("sudo rm -f '/etc/cdi/nvidia.yaml'")),
+      advisoryCommands(action).some((command) =>
+        command.includes("sudo rm -f '/etc/cdi/nvidia.yaml'"),
+      ),
     ).toBe(true);
-    expect(action?.commands.some((command) => command.includes("--output=/etc/cdi"))).toBe(false);
-    expect(action?.commands.some((command) => command.includes("nvidia-ctk cdi list"))).toBe(false);
+    expect(advisoryCommands(action).some((command) => command.includes("--output=/etc/cdi"))).toBe(
+      false,
+    );
+    expect(
+      advisoryCommands(action).some((command) => command.includes("nvidia-ctk cdi list")),
+    ).toBe(false);
   });
 
   it("emits manual stale-spec guidance without systemctl on non-systemd hosts", () => {
-    const actions = planHostRemediation(
+    const actions = planHostAdvisories(
       baseAssessment({
         systemctlAvailable: false,
         cdiNvidiaGpuSpecStale: true,
@@ -309,14 +324,14 @@ describe("planHostRemediation — CDI", () => {
     const action = actions.find((entry: { id: string }) => entry.id === "refresh_nvidia_cdi_spec");
 
     expect(action).toBeTruthy();
-    expect(action?.blocking).toBe(true);
+    expect(action?.severity).toBe("blocking");
     expect(action?.kind).toBe("manual");
-    expect(action?.commands.join("\n")).toContain("/var/run/cdi/nvidia.yaml");
-    expect(action?.commands.join("\n")).not.toContain("systemctl");
+    expect(advisoryCommands(action).join("\n")).toContain("/var/run/cdi/nvidia.yaml");
+    expect(advisoryCommands(action).join("\n")).not.toContain("systemctl");
   });
 
   it("emits a non-blocking refresh-service warning when refresh units are unhealthy", () => {
-    const actions = planHostRemediation(
+    const actions = planHostAdvisories(
       baseAssessment({
         dockerCdiSpecDirs: ["/etc/cdi"],
         cdiNvidiaGpuRefreshUnhealthy: true,
@@ -330,7 +345,7 @@ describe("planHostRemediation — CDI", () => {
     );
 
     expect(action).toBeTruthy();
-    expect(action?.blocking).toBe(false);
+    expect(action?.severity).toBe("warning");
     expect(action?.title).toBe("Enable NVIDIA CDI refresh service");
     expect(action?.reason).toContain("path disabled");
   });
@@ -362,17 +377,17 @@ describe("planHostRemediation — CDI", () => {
     expect(result.hasNvidiaGpu).toBe(true);
     expect(result.cdiNvidiaGpuSpecMissing).toBe(true);
 
-    const actions = planHostRemediation(result);
+    const actions = planHostAdvisories(result);
     const action = actions.find((entry) => entry.id === "install_nvidia_container_toolkit");
     expect(action).toBeTruthy();
-    expect(action?.blocking).toBe(true);
+    expect(action?.severity).toBe("blocking");
     expect(
-      action?.commands.some(
+      advisoryCommands(action).some(
         (command) => command === "sudo apt-get install -y nvidia-container-toolkit",
       ),
     ).toBe(true);
     expect(
-      action?.commands.some((command) =>
+      advisoryCommands(action).some((command) =>
         command.startsWith("sudo nvidia-ctk cdi generate --output="),
       ),
     ).toBe(true);
@@ -405,14 +420,14 @@ describe("planHostRemediation — CDI", () => {
 
     expect(result.hasNvidiaGpu).toBe(false);
 
-    const action = planHostRemediation(result).find(
+    const action = planHostAdvisories(result).find(
       (entry) => entry.id === "install_nvidia_container_toolkit",
     );
     expect(action).toBeFalsy();
   });
 
   it("bootstraps nvidia-container-toolkit before missing-spec generation", () => {
-    const actions = planHostRemediation(
+    const actions = planHostAdvisories(
       baseAssessment({
         cdiNvidiaGpuSpecMissing: true,
         nvidiaContainerToolkitInstalled: false,
@@ -422,60 +437,14 @@ describe("planHostRemediation — CDI", () => {
 
     expect(action).toBeTruthy();
     expect(
-      action?.commands.some(
+      advisoryCommands(action).some(
         (command) => command === "sudo apt-get install -y nvidia-container-toolkit",
       ),
     ).toBe(true);
     expect(
-      action?.commands.some((command) =>
+      advisoryCommands(action).some((command) =>
         command.startsWith("sudo nvidia-ctk cdi generate --output="),
       ),
     ).toBe(true);
-  });
-});
-
-describe("shouldEnforceCdiNvidiaGpuSpec (#5489 enforcement gate)", () => {
-  it("enforces when the spec is missing and the operator did not explicitly opt out", () => {
-    // The #5489 scenario: GPU hardware present (so cdiNvidiaGpuSpecMissing is
-    // true) with sandbox GPU AUTO-disabled (nvidia-smi unavailable). Auto-disable
-    // must NOT be treated as an opt-out, so the gate enforces.
-    expect(
-      shouldEnforceCdiNvidiaGpuSpec({
-        cdiNvidiaGpuSpecMissing: true,
-        cdiNvidiaGpuSpecNeedsRepair: false,
-        explicitlyOptedOutGpuPassthrough: false,
-      }),
-    ).toBe(true);
-  });
-
-  it("enforces when the spec needs repair (stale) and not explicitly opted out", () => {
-    expect(
-      shouldEnforceCdiNvidiaGpuSpec({
-        cdiNvidiaGpuSpecMissing: false,
-        cdiNvidiaGpuSpecNeedsRepair: true,
-        explicitlyOptedOutGpuPassthrough: false,
-      }),
-    ).toBe(true);
-  });
-
-  it("does NOT enforce when the operator explicitly opted out of GPU passthrough (--no-gpu)", () => {
-    // Escape hatch: a host with an unusable GPU can still onboard CPU-only.
-    expect(
-      shouldEnforceCdiNvidiaGpuSpec({
-        cdiNvidiaGpuSpecMissing: true,
-        cdiNvidiaGpuSpecNeedsRepair: true,
-        explicitlyOptedOutGpuPassthrough: true,
-      }),
-    ).toBe(false);
-  });
-
-  it("does NOT enforce when the CDI spec is present and healthy", () => {
-    expect(
-      shouldEnforceCdiNvidiaGpuSpec({
-        cdiNvidiaGpuSpecMissing: false,
-        cdiNvidiaGpuSpecNeedsRepair: false,
-        explicitlyOptedOutGpuPassthrough: false,
-      }),
-    ).toBe(false);
   });
 });

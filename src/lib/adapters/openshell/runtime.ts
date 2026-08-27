@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { StdioOptions } from "node:child_process";
+import path from "node:path";
 
 import { ROOT } from "../../runner";
 import {
@@ -11,19 +12,28 @@ import {
   getInstalledOpenshellVersion,
   runOpenshellCommand,
 } from "./client";
-import { resolveOpenshell } from "./resolve";
-import { OPENSHELL_PROBE_TIMEOUT_MS } from "./timeouts";
+import { buildOpenShellSubprocessEnv, resolveOpenshellBinaryOrNull } from "./resolve-shared";
+import { OPENSHELL_OPERATION_TIMEOUT_MS, OPENSHELL_PROBE_TIMEOUT_MS } from "./timeouts";
 
 type CommandArgs = string[];
 
+export { buildOpenShellSubprocessEnv, OPENSHELL_OPERATION_TIMEOUT_MS };
+export { classifyManagedGatewayEndpointBinding } from "./client";
+export { runCaptureEx } from "../../runner";
+
 type RunnerOptions = {
+  /** Exact canonical executable selected by the caller. */
+  openshellBinary?: string;
   env?: NodeJS.ProcessEnv;
+  replaceEnv?: boolean;
   stdio?: StdioOptions;
   input?: string;
   ignoreError?: boolean;
   includeStderr?: boolean;
   includeStreams?: boolean;
   timeout?: number;
+  killSignal?: NodeJS.Signals;
+  killProcessTreeOnTimeout?: boolean;
   maxBuffer?: number;
 };
 
@@ -32,7 +42,7 @@ let openshellBin: string | null = null;
 /** Resolve and cache the OpenShell binary path, exiting if it is not installed. */
 export function getOpenshellBinary(): string {
   if (!openshellBin) {
-    openshellBin = resolveOpenshell();
+    openshellBin = resolveOpenshellBinaryOrNull();
   }
   if (!openshellBin) {
     console.error("openshell CLI not found. Install OpenShell before using sandbox commands.");
@@ -43,13 +53,17 @@ export function getOpenshellBinary(): string {
 
 /** Run an OpenShell command, inheriting stdio (no output capture). */
 export function runOpenshell(args: CommandArgs, opts: RunnerOptions = {}) {
-  return runOpenshellCommand(getOpenshellBinary(), args, {
+  return runOpenshellCommand(opts.openshellBinary ?? getOpenshellBinary(), args, {
     cwd: ROOT,
     env: opts.env,
+    replaceEnv: opts.replaceEnv,
     stdio: opts.stdio,
     input: opts.input,
     ignoreError: opts.ignoreError,
     timeout: opts.timeout,
+    killSignal: opts.killSignal,
+    killProcessTreeOnTimeout: opts.killProcessTreeOnTimeout,
+    maxBuffer: opts.maxBuffer,
     errorLine: console.error,
     exit: (code: number) => process.exit(code),
   });
@@ -61,13 +75,37 @@ export function runOpenshell(args: CommandArgs, opts: RunnerOptions = {}) {
  * must stay non-fatal yet still read status text OpenShell writes to stderr).
  */
 export function captureOpenshell(args: CommandArgs, opts: RunnerOptions = {}) {
-  return captureOpenshellCommand(getOpenshellBinary(), args, {
+  return captureOpenshellCommand(opts.openshellBinary ?? getOpenshellBinary(), args, {
     cwd: ROOT,
     env: opts.env,
+    replaceEnv: opts.replaceEnv,
     ignoreError: opts.ignoreError,
     includeStderr: opts.includeStderr,
     includeStreams: opts.includeStreams,
     timeout: opts.timeout,
+    killSignal: opts.killSignal,
+    killProcessTreeOnTimeout: opts.killProcessTreeOnTimeout,
+    maxBuffer: opts.maxBuffer,
+    errorLine: console.error,
+    exit: (code: number) => process.exit(code),
+  });
+}
+
+/** Capture an OpenShell command while treating an unavailable binary as a recoverable error. */
+export function captureResolvedOpenshell(args: CommandArgs, opts: RunnerOptions = {}) {
+  const openshell = opts.openshellBinary ?? resolveOpenshellBinaryOrNull();
+  if (!openshell) throw new Error("OpenShell is unavailable");
+  if (!path.isAbsolute(openshell)) throw new Error("OpenShell executable must be absolute");
+  return captureOpenshellCommand(openshell, args, {
+    cwd: ROOT,
+    env: opts.env,
+    replaceEnv: opts.replaceEnv,
+    ignoreError: opts.ignoreError,
+    includeStderr: opts.includeStderr,
+    includeStreams: opts.includeStreams,
+    timeout: opts.timeout,
+    killSignal: opts.killSignal,
+    killProcessTreeOnTimeout: opts.killProcessTreeOnTimeout,
     maxBuffer: opts.maxBuffer,
     errorLine: console.error,
     exit: (code: number) => process.exit(code),
@@ -79,6 +117,7 @@ export function captureSandboxSshConfig(sandboxName: string, opts: RunnerOptions
   return captureSandboxSshConfigCommand(getOpenshellBinary(), sandboxName, {
     cwd: ROOT,
     env: opts.env,
+    replaceEnv: opts.replaceEnv,
     ignoreError: opts.ignoreError,
     includeStreams: opts.includeStreams,
     timeout: opts.timeout,
@@ -99,6 +138,7 @@ export function captureOpenshellForStatus(args: CommandArgs, opts: RunnerOptions
   return captureOpenshellCommandAsync(getOpenshellBinary(), args, {
     cwd: ROOT,
     env: opts.env,
+    replaceEnv: opts.replaceEnv,
     ignoreError: opts.ignoreError,
     includeStreams: opts.includeStreams,
     timeout: opts.timeout ?? getStatusProbeTimeoutMs(),

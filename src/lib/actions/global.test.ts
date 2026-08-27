@@ -10,9 +10,6 @@ const mocks = vi.hoisted(() => ({
   recoverNamedGatewayRuntime: vi.fn().mockResolvedValue({ recovered: true }),
   runDeployAction: vi.fn().mockResolvedValue(undefined),
   runOnboardAction: vi.fn().mockResolvedValue(undefined),
-  runOpenshell: vi.fn(() => ({ status: 0 })),
-  runSetupAction: vi.fn().mockResolvedValue(undefined),
-  runSetupSparkAction: vi.fn().mockResolvedValue(undefined),
   version: vi.fn(),
 }));
 
@@ -26,21 +23,16 @@ vi.mock("./maintenance", () => ({
 }));
 vi.mock("./onboard", () => ({
   runOnboardAction: mocks.runOnboardAction,
-  runSetupAction: mocks.runSetupAction,
-  runSetupSparkAction: mocks.runSetupSparkAction,
 }));
-vi.mock("../adapters/openshell/runtime", () => ({ runOpenshell: mocks.runOpenshell }));
 vi.mock("./root-help", () => ({ help: mocks.help, version: mocks.version }));
 
 import {
+  listManagedMcpCredentialReservations,
   recoverNamedGatewayRuntime,
   runBackupAllAction,
   runDeployAction,
   runGarbageCollectImagesAction,
   runOnboardAction,
-  runOpenshellProviderCommand,
-  runSetupAction,
-  runSetupSparkAction,
   runUpgradeSandboxesAction,
   setGlobalCliActionRuntimeHooksForTest,
   showRootHelp,
@@ -54,18 +46,15 @@ describe("global cli action facade", () => {
   });
 
   it("forwards onboarding, deploy, maintenance, and help actions", async () => {
-    await runOnboardAction(["--resume"]);
-    await runSetupAction(["--fresh"]);
-    await runSetupSparkAction(["--name", "alpha"]);
+    const onboardRuntimeDeps = { googlechatTunnelRuntime: {} };
+    await runOnboardAction({ resume: true }, onboardRuntimeDeps);
     await runDeployAction("gpu-alpha");
     await runBackupAllAction();
     await runGarbageCollectImagesAction({ dryRun: true });
     showRootHelp();
     showVersion();
 
-    expect(mocks.runOnboardAction).toHaveBeenCalledWith(["--resume"]);
-    expect(mocks.runSetupAction).toHaveBeenCalledWith(["--fresh"]);
-    expect(mocks.runSetupSparkAction).toHaveBeenCalledWith(["--name", "alpha"]);
+    expect(mocks.runOnboardAction).toHaveBeenCalledWith({ resume: true }, onboardRuntimeDeps);
     expect(mocks.runDeployAction).toHaveBeenCalledWith("gpu-alpha");
     expect(mocks.backupAll).toHaveBeenCalledWith();
     expect(mocks.garbageCollectImages).toHaveBeenCalledWith({ dryRun: true });
@@ -73,30 +62,46 @@ describe("global cli action facade", () => {
     expect(mocks.version).toHaveBeenCalledWith();
   });
 
-  it("uses injected runtime hooks for gateway recovery, OpenShell, and upgrades", async () => {
+  it("uses injected runtime hooks for gateway recovery and upgrades", async () => {
     const recoverHook = vi.fn().mockResolvedValue({ recovered: false });
-    const runOpenshellHook = vi.fn(() => ({ status: 0 }));
     const upgradeHook = vi.fn().mockResolvedValue(undefined);
     setGlobalCliActionRuntimeHooksForTest({
       recoverNamedGatewayRuntime: recoverHook,
-      runOpenshell: runOpenshellHook as never,
       upgradeSandboxes: upgradeHook,
     });
 
     await expect(recoverNamedGatewayRuntime()).resolves.toEqual({ recovered: false });
-    runOpenshellProviderCommand(["provider", "list"], { timeout: 100 });
     await runUpgradeSandboxesAction({ check: true });
 
     expect(recoverHook).toHaveBeenCalledWith();
-    expect(runOpenshellHook).toHaveBeenCalledWith(["provider", "list"], { timeout: 100 });
     expect(upgradeHook).toHaveBeenCalledWith({ check: true });
   });
 
-  it("falls back to default runtime hooks", async () => {
+  it("uses default gateway recovery without an injected hook", async () => {
     await expect(recoverNamedGatewayRuntime()).resolves.toEqual({ recovered: true });
-    runOpenshellProviderCommand(["provider", "list"]);
 
     expect(mocks.recoverNamedGatewayRuntime).toHaveBeenCalledWith();
-    expect(mocks.runOpenshell).toHaveBeenCalledWith(["provider", "list"], undefined);
+  });
+
+  it("uses an injected managed MCP credential reservation query (#9388)", () => {
+    const listReservations = vi.fn(() => [
+      {
+        sandboxName: "hermes",
+        server: "maas-glean",
+        credentialKeys: ["MAAS_GLEAN_TOKEN"],
+      },
+    ]);
+    setGlobalCliActionRuntimeHooksForTest({
+      listManagedMcpCredentialReservations: listReservations,
+    });
+
+    expect(listManagedMcpCredentialReservations()).toEqual([
+      {
+        sandboxName: "hermes",
+        server: "maas-glean",
+        credentialKeys: ["MAAS_GLEAN_TOKEN"],
+      },
+    ]);
+    expect(listReservations).toHaveBeenCalledWith();
   });
 });

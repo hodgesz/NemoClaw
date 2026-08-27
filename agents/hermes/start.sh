@@ -19,6 +19,129 @@ set -euo pipefail
 
 # SECURITY: Lock down PATH before resolving or sourcing root startup helpers.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+NEMOCLAW_RUNTIME_STATE_MUTATION_RETRY_ARGV=("$@")
+
+# The provider gate is a fixed root-owned file beneath a search-only directory
+# outside /sandbox, so the sandbox identity cannot rename either the gate or
+# its parent.  Run the immutable validator as this shell's direct child before
+# sourcing helpers or reading mutable state; its permit is bound to this exact
+# process identity.  Invalid or uninspectable gate state is a hold, never an
+# availability-to-integrity downgrade.
+readonly NEMOCLAW_RUNTIME_STATE_MUTATION_GATE_PYTHON="/opt/hermes/.venv/bin/python3"
+readonly NEMOCLAW_RUNTIME_STATE_MUTATION_GATE_HELPER="/usr/local/lib/nemoclaw/runtime-state-mutation-startup-gate.py"
+readonly NEMOCLAW_RUNTIME_STATE_MUTATION_GATE_SETPRIV="/usr/bin/setpriv"
+
+if [ ! -x "$NEMOCLAW_RUNTIME_STATE_MUTATION_GATE_PYTHON" ] \
+  || [ ! -f "$NEMOCLAW_RUNTIME_STATE_MUTATION_GATE_HELPER" ] \
+  || [ -L "$NEMOCLAW_RUNTIME_STATE_MUTATION_GATE_HELPER" ] \
+  || { [ "$EUID" -eq 0 ] && [ ! -x "$NEMOCLAW_RUNTIME_STATE_MUTATION_GATE_SETPRIV" ]; }; then
+  printf '%s\n' '[SECURITY] Required runtime state mutation startup gate is unavailable.' >&2
+  exit 1
+fi
+
+nemoclaw_runtime_state_mutation_gate() {
+  local action="$1"
+  if [ "$EUID" -eq 0 ]; then
+    "$NEMOCLAW_RUNTIME_STATE_MUTATION_GATE_SETPRIV" \
+      --reuid=sandbox --regid=sandbox --init-groups -- \
+      "$NEMOCLAW_RUNTIME_STATE_MUTATION_GATE_PYTHON" -I \
+      "$NEMOCLAW_RUNTIME_STATE_MUTATION_GATE_HELPER" "$action" >/dev/null
+    return
+  fi
+  "$NEMOCLAW_RUNTIME_STATE_MUTATION_GATE_PYTHON" -I \
+    "$NEMOCLAW_RUNTIME_STATE_MUTATION_GATE_HELPER" "$action" >/dev/null
+}
+
+nemoclaw_runtime_state_mutation_retry_exec() {
+  local status
+  if nemoclaw_runtime_state_mutation_gate restart; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$status" -eq 12 ]; then
+    exec /usr/local/bin/nemoclaw-start \
+      "${NEMOCLAW_RUNTIME_STATE_MUTATION_RETRY_ARGV[@]}"
+  fi
+  printf '%s\n' '[SECURITY] Runtime state mutation retry was not authenticated; holding startup.' >&2
+  kill -STOP "$$"
+}
+trap nemoclaw_runtime_state_mutation_retry_exec USR2
+
+while :; do
+  if nemoclaw_runtime_state_mutation_gate admit; then
+    break
+  else
+    _nemoclaw_runtime_state_mutation_gate_status=$?
+  fi
+  case "$_nemoclaw_runtime_state_mutation_gate_status" in
+    10) break ;;
+    75)
+      printf '%s\n' '[SECURITY] Hermes startup held by an active runtime state mutation.' >&2
+      /bin/sleep 1 || true
+      ;;
+    *)
+      printf '%s\n' '[SECURITY] Runtime state mutation startup gate failed.' >&2
+      exit 1
+      ;;
+  esac
+done
+unset _nemoclaw_runtime_state_mutation_gate_status
+
+# Publish a candidate only after the complete gateway topology is healthy.
+# The shell then stops itself until the root controller has independently
+# authenticated the candidate, frozen the exact process tree, and published a
+# release receipt.  Calling this with no active mutation is a cheap no-op.
+nemoclaw_runtime_state_mutation_checkpoint() {
+  local status
+  if nemoclaw_runtime_state_mutation_gate checkpoint; then
+    return 0
+  else
+    status=$?
+  fi
+  if [ "$status" -ne 11 ]; then
+    printf '%s\n' '[SECURITY] Runtime state mutation startup checkpoint was refused; holding startup.' >&2
+    kill -STOP "$$"
+    return 1
+  fi
+  kill -STOP "$$"
+  if nemoclaw_runtime_state_mutation_gate resume; then
+    return 0
+  else
+    status=$?
+  fi
+  if [ "$status" -eq 12 ]; then
+    exec /usr/local/bin/nemoclaw-start \
+      "${NEMOCLAW_RUNTIME_STATE_MUTATION_RETRY_ARGV[@]}"
+  fi
+  printf '%s\n' '[SECURITY] Runtime state mutation release receipt was not authenticated; holding startup.' >&2
+  kill -STOP "$$"
+  return 1
+}
+
+# managed-entrypoint-env-wrapper begin
+_NEMOCLAW_ENTRYPOINT_ENV_WRAPPER="/usr/local/lib/nemoclaw/entrypoint-env-wrapper.sh"
+if [ ! -f "$_NEMOCLAW_ENTRYPOINT_ENV_WRAPPER" ]; then
+  _HERMES_ENTRYPOINT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  _NEMOCLAW_ENTRYPOINT_ENV_WRAPPER="${_HERMES_ENTRYPOINT_SOURCE_DIR}/../../scripts/lib/entrypoint-env-wrapper.sh"
+  unset _HERMES_ENTRYPOINT_SOURCE_DIR
+fi
+if [ ! -f "$_NEMOCLAW_ENTRYPOINT_ENV_WRAPPER" ]; then
+  printf '%s\n' '[SECURITY] Required entrypoint env-wrapper normalizer is missing.' >&2
+  exit 1
+fi
+# shellcheck source=scripts/lib/entrypoint-env-wrapper.sh
+source "$_NEMOCLAW_ENTRYPOINT_ENV_WRAPPER"
+nemoclaw_normalize_entrypoint_env_wrapper "$@"
+if [ "$NEMOCLAW_ENTRYPOINT_NORMALIZED_ARGC" -eq 0 ]; then
+  set --
+else
+  set -- "${NEMOCLAW_ENTRYPOINT_NORMALIZED_ARGV[@]}"
+fi
+unset NEMOCLAW_ENTRYPOINT_NORMALIZED_ARGC NEMOCLAW_ENTRYPOINT_NORMALIZED_ARGV \
+  _NEMOCLAW_ENTRYPOINT_ENV_WRAPPER
+unset -f nemoclaw_normalize_entrypoint_env_wrapper
+# managed-entrypoint-env-wrapper end
 
 # ── Source shared sandbox initialisation library ─────────────────
 # Single source of truth for security-sensitive primitives shared with
@@ -37,6 +160,13 @@ if [ ! -f "$_SANDBOX_INIT" ]; then
 fi
 # shellcheck source=scripts/lib/sandbox-init.sh
 source "$_SANDBOX_INIT"
+
+_GATEWAY_SUPERVISOR="/usr/local/lib/nemoclaw/gateway-supervisor.sh"
+if [ ! -f "$_GATEWAY_SUPERVISOR" ]; then
+  _GATEWAY_SUPERVISOR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../scripts/lib/gateway-supervisor.sh"
+fi
+# shellcheck source=scripts/lib/gateway-supervisor.sh
+source "$_GATEWAY_SUPERVISOR"
 
 # Harden RLIMITs (nproc #809 + nofile #4527) as root PID 1, before any step-down.
 harden_resource_limits
@@ -95,34 +225,8 @@ exec > >(tee -a "$_START_LOG") 2> >(tee -a "$_START_LOG" >&2)
 # ── Drop unnecessary Linux capabilities (shared) ────────────────
 drop_capabilities /usr/local/bin/nemoclaw-start "$@"
 
-# Normalize the self-wrapper bootstrap (same as OpenClaw entrypoint).
-if [ "${1:-}" = "env" ]; then
-  _raw_args=("$@")
-  _self_wrapper_index=""
-  for ((i = 1; i < ${#_raw_args[@]}; i += 1)); do
-    case "${_raw_args[$i]}" in
-      *=*) ;;
-      nemoclaw-start | /usr/local/bin/nemoclaw-start)
-        _self_wrapper_index="$i"
-        break
-        ;;
-      *)
-        break
-        ;;
-    esac
-  done
-  if [ -n "$_self_wrapper_index" ]; then
-    for ((i = 1; i < _self_wrapper_index; i += 1)); do
-      export "${_raw_args[$i]}"
-    done
-    set -- "${_raw_args[@]:$((_self_wrapper_index + 1))}"
-  fi
-fi
-
-case "${1:-}" in
-  nemoclaw-start | /usr/local/bin/nemoclaw-start) shift ;;
-esac
 NEMOCLAW_CMD=("$@")
+NEMOCLAW_RUNTIME_STATE_MUTATION_RETRY_ARGV=("${NEMOCLAW_CMD[@]}")
 
 _chat_ui_url_port() {
   [ -n "${CHAT_UI_URL:-}" ] || return 1
@@ -166,8 +270,33 @@ else
   fi
 fi
 
-if [ "$_dashboard_port" -eq 8642 ]; then
-  echo "[SECURITY] Invalid Hermes dashboard port 8642 - reserved for the Hermes OpenAI-compatible API" >&2
+# The API port is a per-sandbox host resource: the host forwards the same
+# number it is exposed on here, so two sandboxes on one host need two values.
+# NemoClaw allocates the port and passes it in; the default keeps a sandbox
+# whose create environment carries no value on the original port.
+HERMES_DEFAULT_API_PORT=8642
+HERMES_API_PORT_RANGE_END=8652
+HERMES_RUNTIME_DIR=/run/nemoclaw
+_api_port_raw="${NEMOCLAW_HERMES_API_PORT:-}"
+if [ -z "$_api_port_raw" ]; then
+  PUBLIC_PORT="$HERMES_DEFAULT_API_PORT"
+else
+  PUBLIC_PORT="$(printf '%s' "$_api_port_raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  _api_port_valid=1
+  case "$PUBLIC_PORT" in
+    *[!0-9]* | '') _api_port_valid=0 ;;
+  esac
+  if [ "$_api_port_valid" -eq 1 ] && { [ "$PUBLIC_PORT" -lt "$HERMES_DEFAULT_API_PORT" ] || [ "$PUBLIC_PORT" -gt "$HERMES_API_PORT_RANGE_END" ]; }; then
+    _api_port_valid=0
+  fi
+  if [ "$_api_port_valid" -ne 1 ]; then
+    echo "[SECURITY] Invalid NEMOCLAW_HERMES_API_PORT='${NEMOCLAW_HERMES_API_PORT}' - must be an integer from ${HERMES_DEFAULT_API_PORT} through ${HERMES_API_PORT_RANGE_END}" >&2
+    exit 1
+  fi
+fi
+
+if [ "$_dashboard_port" -eq "$PUBLIC_PORT" ]; then
+  echo "[SECURITY] Invalid Hermes dashboard port ${_dashboard_port} - reserved for the Hermes OpenAI-compatible API" >&2
   exit 1
 fi
 
@@ -177,7 +306,6 @@ else
   CHAT_UI_URL="${CHAT_UI_URL:-http://127.0.0.1:${_dashboard_port}}"
 fi
 
-PUBLIC_PORT=8642
 # Hermes binds the API server to 127.0.0.1. Run it on an internal port and
 # use socat to expose the OpenAI-compatible API on PUBLIC_PORT.
 INTERNAL_PORT=18642
@@ -187,7 +315,7 @@ if [ "$DASHBOARD_PUBLIC_PORT" -eq "$DASHBOARD_INTERNAL_PORT" ]; then
   DASHBOARD_INTERNAL_PORT=19120
 fi
 HERMES_DASHBOARD_TUI="${NEMOCLAW_HERMES_DASHBOARD_TUI:-${HERMES_DASHBOARD_TUI:-0}}"
-HERMES_DASHBOARD_HOME="${HERMES_DASHBOARD_HOME:-/sandbox/.hermes/dashboard-home}"
+HERMES_DASHBOARD_HOME="${HERMES_DASHBOARD_HOME:-/sandbox/.hermes/profiles/dashboard-home}"
 HERMES="$(command -v hermes)" # Resolve once, use absolute path everywhere
 
 # Hermes resolves config and runtime state relative to HERMES_HOME. The config
@@ -196,6 +324,9 @@ HERMES="$(command -v hermes)" # Resolve once, use absolute path everywhere
 # create new top-level state while the gateway user cannot remove config files.
 # Immutability is opt-in via `shields up`.
 HERMES_DIR="/sandbox/.hermes"
+if [ -z "${HERMES_LAZY_INSTALL_TARGET+x}" ]; then
+  export HERMES_LAZY_INSTALL_TARGET="/sandbox/.hermes/lazy-packages"
+fi
 HERMES_HASH_FILE="/etc/nemoclaw/hermes.config-hash"
 
 # Resolve the standalone secret-boundary validator. The container ships it at
@@ -219,25 +350,65 @@ _HERMES_DASHBOARD_CONFIG_SEEDER="/usr/local/lib/nemoclaw/seed-hermes-dashboard-c
 if [ ! -f "$_HERMES_DASHBOARD_CONFIG_SEEDER" ]; then
   _HERMES_DASHBOARD_CONFIG_SEEDER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/seed-dashboard-config.py"
 fi
+_HERMES_MANAGED_POLICY="/usr/local/share/nemoclaw/hermes-managed-policy.json"
 
 # Descriptor-safe updater for runtime-mutable Hermes config/env/hash files.
 _HERMES_RUNTIME_CONFIG_GUARD="/usr/local/lib/nemoclaw/hermes-runtime-config-guard.py"
 if [ ! -f "$_HERMES_RUNTIME_CONFIG_GUARD" ]; then
   _HERMES_RUNTIME_CONFIG_GUARD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runtime-config-guard.py"
 fi
+_HERMES_TIRITH_MARKER_FINALIZER="/usr/local/lib/nemoclaw/finalize-tirith-marker.py"
+if [ ! -f "$_HERMES_TIRITH_MARKER_FINALIZER" ]; then
+  _HERMES_TIRITH_MARKER_FINALIZER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/finalize-tirith-marker.py"
+fi
+_HERMES_GUARD_TIMEOUT=(timeout --signal=TERM --kill-after=5s 12m)
+_HERMES_BOUNDARY_TIMEOUT=(timeout --signal=TERM --kill-after=2s 15s)
+HERMES_RESTART_SEAL_STATE="/run/nemoclaw/hermes-restart-seal.json"
+HERMES_CONFIG_MUTATION_LOCK="/run/nemoclaw/hermes-config-mutation.lock"
+HERMES_RESTART_ORPHAN_MARKER="/sandbox/.hermes/.nemoclaw-hermes-restart-seal"
+HERMES_STARTUP_READY_FILE="/run/nemoclaw/hermes-startup-ready"
+HERMES_RESTART_SEALED=0
+HERMES_RESTART_ORIGINAL_LOCKED=0
+HERMES_RESTART_UNSEALING=0
+HERMES_RESTART_SIGNAL_PENDING=0
+HERMES_MCP_RECONCILE_PENDING=0
+HERMES_MCP_INTEGRITY_FAILED=0
+
+# A same-container PID 1 restart can retain /run. Revoke the prior readiness
+# lease before any startup migration or mutable config read; host mutations are
+# admitted again only after the root supervisor is fully initialized.
+if [ -e "$HERMES_STARTUP_READY_FILE" ] && ! rm -f "$HERMES_STARTUP_READY_FILE"; then
+  echo "[SECURITY] Refusing Hermes startup because the stale readiness marker could not be removed" >&2
+  exit 1
+fi
 
 # The seeder imports PyYAML, which ships ONLY in the Hermes venv — not in the
-# base-image python3 that is first on PATH at container boot. (An interactive
-# login shell activates the venv, masking this: `python3` there resolves to
-# /opt/hermes/.venv/bin/python3 and has yaml, but the entrypoint that runs this
-# script does not.) Invoked with bare python3, the seeder hits its "PyYAML
-# unavailable; skipping model seed" branch and returns 0, so the model routing
-# is silently never mirrored into the dashboard home and the Models page shows
-# no models. Resolve the venv interpreter explicitly, falling back to python3.
-_HERMES_PYTHON="/opt/hermes/.venv/bin/python"
-if [ ! -x "$_HERMES_PYTHON" ]; then
-  _HERMES_PYTHON="$(command -v python3 || echo python3)"
-fi
+# base-image python3 that is first on PATH at container boot. Invoked with
+# the base python3, the seeder hits its "PyYAML unavailable; skipping model
+# seed" branch and returns 0, so the model routing is silently never mirrored
+# into the dashboard home and the Models page shows no models.
+#
+# Pick the venv interpreter from a fixed trusted absolute-path list so a
+# PATH-shadowed python3 (via SSH env, compromised sandbox, or malicious
+# entrypoint wrapper) cannot bypass the runtime-config-guard security checks.
+# The list scans first-wins ordered most-preferred first (venv > local >
+# system) so the venv python3 is selected when present and falls back to
+# system python3 when the sandbox image has no venv yet. The same priority
+# is mirrored in `agents/hermes/hermes-wrapper.py:_TRUSTED_PYTHON3` and
+# `src/lib/agent/hermes-recovery-boundary.ts:buildTrustedPython3Picker` so
+# all three entry points pick the same interpreter when several are present.
+# The deprecated `/opt/hermes/.venv/bin/python` symlink path is intentionally
+# not consulted: it is a symlink an attacker with write access to
+# /opt/hermes/.venv could repoint, while the regular files in the trusted
+# list cannot be substituted without breaking the image.
+_HERMES_PYTHON=""
+for _candidate in /opt/hermes/.venv/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  if [ -x "$_candidate" ]; then
+    _HERMES_PYTHON="$_candidate"
+    break
+  fi
+done
+unset _candidate
 
 truthy_env() {
   case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
@@ -300,10 +471,66 @@ verify_hermes_config_integrity() {
     # that owns the mutable Hermes home.
     export -f verify_config_integrity
     "${STEP_DOWN_PREFIX_SANDBOX[@]}" bash -c "verify_config_integrity \"\$1\" \"\$2\"" bash \
-      "${HERMES_DIR}" "${HERMES_HASH_FILE}"
-    return $?
+      "${HERMES_DIR}" "${HERMES_HASH_FILE}" || return 1
+    if ! inspect_hermes_mcp_integrity "${HERMES_HASH_FILE}"; then
+      HERMES_RESTART_FAILURE_CODE=mcp-integrity
+      return 1
+    fi
+    return 0
   fi
-  verify_config_integrity "${HERMES_DIR}" "${HERMES_HASH_FILE}"
+  verify_config_integrity "${HERMES_DIR}" "${HERMES_HASH_FILE}" || return 1
+  if ! inspect_hermes_mcp_integrity "${HERMES_HASH_FILE}"; then
+    HERMES_RESTART_FAILURE_CODE=mcp-integrity
+    return 1
+  fi
+}
+
+prepare_hermes_lazy_dependencies() {
+  local -a installer=(
+    env
+    HOME=/sandbox
+    UV_CACHE_DIR=/sandbox/.hermes/cache/uv
+    UV_NO_CACHE=1
+    HERMES_HOME="$HERMES_DIR"
+    HERMES_LAZY_INSTALL_TARGET=/sandbox/.hermes/lazy-packages
+  )
+
+  # The separated gateway identity deliberately has no write access to the
+  # durable dependency tree. Route the allowlisted installer through sandbox;
+  # same-UID OpenShell startup is already running under that identity.
+  if [ "$(id -u)" -eq 0 ]; then
+    installer+=("${STEP_DOWN_PREFIX_SANDBOX[@]}")
+  fi
+  installer+=("$_HERMES_PYTHON" -I -c)
+
+  "${installer[@]}" '
+import os
+from pathlib import Path
+
+import yaml
+
+config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+try:
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+except Exception as exc:
+    raise SystemExit(f"[SECURITY] Unable to inspect Hermes memory configuration: {exc}") from exc
+
+memory = config.get("memory") if isinstance(config, dict) else None
+provider = memory.get("provider") if isinstance(memory, dict) else None
+if provider != "hindsight":
+    raise SystemExit(0)
+
+from tools.lazy_deps import activate_durable_lazy_target, ensure
+
+activate_durable_lazy_target()
+try:
+    ensure("memory.hindsight", prompt=False)
+except Exception as exc:
+    raise SystemExit(
+        "[SECURITY] Unable to prepare the approved Hindsight dependency "
+        f"under the sandbox-owned lazy-install target: {exc}"
+    ) from exc
+'
 }
 
 # configure_messaging_channels is provided by sandbox-init.sh (shared).
@@ -318,36 +545,110 @@ print_dashboard_urls() {
   echo "[gateway] Connect any OpenAI-compatible frontend to this endpoint." >&2
 }
 
+hermes_fatal_unproven_child() {
+  local role="$1"
+  local pid="$2"
+  if [ "${HERMES_STARTUP_SUPERVISOR_PID:-$$}" -eq 1 ]; then
+    echo "[CRITICAL] Newly launched Hermes ${role} pid ${pid} failed exact role identity capture; exiting PID 1 for whole-container cleanup without signaling or waiting on the unproven PID" >&2
+    exit 1
+  fi
+
+  # In managed OpenShell, exiting this non-root supervisor would leave PID 1
+  # and the unproven child alive. Bash's job table can still wait for the exact
+  # `$!` child without treating a reused numeric PID as authority to signal it.
+  # Quarantine the supervisor after that child exits; only sandbox destruction
+  # may tear down a process tree whose identities could not be established.
+  echo "[CRITICAL] Newly launched Hermes ${role} pid ${pid} failed exact role identity capture; quarantining the managed startup supervisor without signaling the unproven child" >&2
+  trap ':' TERM INT
+  wait "$pid" 2>/dev/null || true
+  echo "[CRITICAL] Unproven Hermes ${role} child exited; managed supervisor remains quarantined until sandbox recreation" >&2
+  while :; do
+    sleep 60 || true
+  done
+}
+
 start_gateway_log_stream() {
-  { tail -n +1 -F /tmp/gateway.log 2>/dev/null | sed -u 's/^/[gateway-log:] /' >&2; } &
+  tail -n +1 -F /tmp/gateway.log 2>/dev/null | sed -u 's/^/[gateway-log:] /' >&2 &
   GATEWAY_LOG_TAIL_PID=$!
+  if ! hermes_capture_tracked_role gateway-log "$GATEWAY_LOG_TAIL_PID" current; then
+    hermes_fatal_unproven_child gateway-log "$GATEWAY_LOG_TAIL_PID"
+  fi
 }
 
 start_dashboard_log_stream() {
-  { tail -n +1 -F /tmp/dashboard.log 2>/dev/null | sed -u 's/^/[dashboard-log:] /' >&2; } &
+  tail -n +1 -F /tmp/dashboard.log 2>/dev/null | sed -u 's/^/[dashboard-log:] /' >&2 &
   DASHBOARD_LOG_TAIL_PID=$!
+  if ! hermes_capture_tracked_role dashboard-log "$DASHBOARD_LOG_TAIL_PID" current; then
+    hermes_fatal_unproven_child dashboard-log "$DASHBOARD_LOG_TAIL_PID"
+  fi
 }
+
+ensure_dashboard_log_stream() {
+  if ! hermes_tracked_role_is_current dashboard-log "${DASHBOARD_LOG_TAIL_PID:-}" current; then
+    start_dashboard_log_stream
+  fi
+}
+
+ensure_gateway_log_stream() {
+  if ! hermes_tracked_role_is_current gateway-log "${GATEWAY_LOG_TAIL_PID:-}" current; then
+    start_gateway_log_stream
+  fi
+}
+
+TIRITH_RETRY_MARKER_CLEARED=0
 
 retry_tirith_marker_if_needed() {
   local marker="${HERMES_DIR}/.tirith-install-failed"
-  local reason
+  local rc
 
-  [ -e "$marker" ] || return 0
-  if [ -L "$marker" ] || [ ! -f "$marker" ]; then
+  if "$_HERMES_PYTHON" -I "$_HERMES_TIRITH_MARKER_FINALIZER" "$marker"; then
+    echo "[tirith-bootstrap] download_failed marker present; letting Hermes runtime fallback retry Tirith" >&2
+    TIRITH_RETRY_MARKER_CLEARED=1
+    return 0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 10 ]; then
+    if [ -e "$marker" ]; then
+      echo "[tirith-bootstrap] WARNING: Tirith install marker reason is not retryable; Hermes gateway startup will continue" >&2
+    fi
+    return 0
+  fi
+  if [ "$rc" -eq 11 ]; then
     echo "[tirith-bootstrap] WARNING: unsafe Tirith install marker at ${marker}; not reading it" >&2
     return 0
   fi
+  echo "[tirith-bootstrap] WARNING: could not safely inspect or remove retryable Tirith marker; Hermes gateway startup will continue" >&2
+}
 
-  reason="$(head -n 1 "$marker" 2>/dev/null | tr -d '\r\n' || true)"
-  if [ "$reason" != "download_failed" ]; then
-    echo "[tirith-bootstrap] WARNING: Tirith install marker reason '${reason:-unknown}' is not retryable; Hermes gateway startup will continue" >&2
+prepare_tirith_marker_retry() {
+  TIRITH_RETRY_MARKER_CLEARED=0
+  retry_tirith_marker_if_needed
+}
+
+# sourceBoundary: Hermes runtime fallback recreates download_failed when its background Tirith fetch fails.
+# whyNotSourceFix: Hermes is an upstream image dependency; this entrypoint owns restart recovery only.
+# regressionTest: test/agents/hermes/hermes-tirith-retry-finalization.test.ts covers cleanup and unsafe-marker preservation.
+# removalCondition: Remove when Hermes no longer recreates the marker after a handled startup retry.
+finalize_tirith_marker_retry() {
+  local marker="${HERMES_DIR}/.tirith-install-failed"
+  local rc
+
+  [ "$TIRITH_RETRY_MARKER_CLEARED" -eq 1 ] || return 0
+  if "$_HERMES_PYTHON" -I "$_HERMES_TIRITH_MARKER_FINALIZER" "$marker"; then
+    echo "[tirith-bootstrap] Tirith retry completed with download_failed; clearing the handled retry marker" >&2
+    return 0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 10 ]; then
     return 0
   fi
-
-  echo "[tirith-bootstrap] download_failed marker present; letting Hermes runtime fallback retry Tirith" >&2
-  if ! rm -f "$marker" 2>/dev/null; then
-    echo "[tirith-bootstrap] WARNING: could not remove retryable Tirith marker; Hermes gateway startup will continue" >&2
+  if [ "$rc" -eq 11 ]; then
+    echo "[tirith-bootstrap] WARNING: unsafe Tirith install marker recreated during retry; not reading it" >&2
+    return 0
   fi
+  echo "[tirith-bootstrap] WARNING: could not safely inspect or clear handled Tirith retry marker; Hermes gateway startup will continue" >&2
 }
 
 cmdline_is_hermes_gateway() {
@@ -361,10 +662,21 @@ cmdline_is_hermes_gateway() {
 
 has_live_hermes_gateway() {
   local proc_root="${NEMOCLAW_PROC_ROOT:-/proc}"
-  local cmdline_file cmdline
+  local expected_uid cmdline_file pid process_uid cmdline
+
+  expected_uid="$(id -u)"
+  if [ "$expected_uid" -eq 0 ]; then
+    expected_uid="$(id -u gateway 2>/dev/null || true)"
+  fi
+  case "$expected_uid" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
 
   for cmdline_file in "${proc_root}"/[0-9]*/cmdline; do
     [ -r "$cmdline_file" ] || continue
+    pid="${cmdline_file%/cmdline}"
+    process_uid="$(awk '$1 == "Uid:" { print $2; exit }' "${pid}/status" 2>/dev/null || true)"
+    [ "$process_uid" = "$expected_uid" ] || continue
     cmdline="$(tr '\0' ' ' <"$cmdline_file" 2>/dev/null || true)"
     if cmdline_is_hermes_gateway "$cmdline"; then
       return 0
@@ -385,11 +697,26 @@ cleanup_orphan_socat_forwarders() {
     cmdline="$(tr '\0' ' ' <"$cmdline_file" 2>/dev/null || true)"
     case "$cmdline" in
       *socat*"TCP-LISTEN:${PUBLIC_PORT}"*"TCP:127.0.0.1:${INTERNAL_PORT}"*)
+        if [ "$pid" = "${SOCAT_PID:-}" ] \
+          && hermes_tracked_role_is_current \
+            api-socat "$pid" current "$PUBLIC_PORT"; then
+          # A managed gateway reload temporarily leaves no gateway process,
+          # but its exact tracked relay may still be safe to reuse. Preserve
+          # only the fully identity-proven parent; listener ownership and
+          # public readiness are re-proven before convergence, while every
+          # other matching socat is still removed below.
+          continue
+        fi
         echo "[gateway] Removing orphaned socat forwarder for ${PUBLIC_PORT}->${INTERNAL_PORT} (pid ${pid})" >&2
         kill "$pid" 2>/dev/null || true
         ;;
       *socat*"TCP-LISTEN:${dashboard_public_port}"*"TCP:127.0.0.1:${dashboard_internal_port}"*)
         if [ -z "$dashboard_public_port" ] || [ -z "$dashboard_internal_port" ]; then
+          continue
+        fi
+        if [ "$pid" = "${DASHBOARD_SOCAT_PID:-}" ] \
+          && hermes_tracked_role_is_current \
+            dashboard-socat "$pid" current "$dashboard_public_port"; then
           continue
         fi
         echo "[gateway] Removing orphaned dashboard socat forwarder for ${dashboard_public_port}->${dashboard_internal_port} (pid ${pid})" >&2
@@ -436,7 +763,14 @@ hermes_config_root_is_locked() {
   owner="$(stat -c '%U:%G' "$HERMES_DIR" 2>/dev/null || stat -f '%Su:%Sg' "$HERMES_DIR" 2>/dev/null || true)"
   mode="$(stat -c '%a' "$HERMES_DIR" 2>/dev/null || stat -f '%Lp' "$HERMES_DIR" 2>/dev/null || true)"
 
+  # The locked root is root-owned in the sandbox group and keeps the set-id and
+  # sticky bits so the gateway can still write its top-level runtime state while
+  # the sticky bit protects the sealed entries (#7865) — the same shape
+  # hermes_locked_parent_is_protected expects one level up. `root:root 755` is
+  # the pre-#7865 posture; keep detecting it so an existing shields-up sandbox
+  # still takes the locked branches until `shields up` repairs the root.
   case "${owner} ${mode}" in
+    "root:sandbox 3770" | "root:sandbox 03770") ;;
     "root:root 755" | "root:root 0755") ;;
     *) return 1 ;;
   esac
@@ -445,11 +779,36 @@ hermes_config_root_is_locked() {
     && hermes_config_path_is_locked "${HERMES_DIR}/.env"
 }
 
+hermes_locked_parent_is_protected() {
+  local owner mode
+  owner="$(stat -c '%U:%G' /sandbox 2>/dev/null || stat -f '%Su:%Sg' /sandbox 2>/dev/null || true)"
+  mode="$(stat -c '%a' /sandbox 2>/dev/null || stat -f '%Lp' /sandbox 2>/dev/null || true)"
+  case "${owner} ${mode}" in
+    "root:sandbox 1775" | "root:sandbox 01775") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 apply_shields_up_runtime_env() {
-  hermes_config_root_is_locked || return 0
-  if [ -z "${HERMES_KANBAN_DISPATCH_IN_GATEWAY:-}" ]; then
-    export HERMES_KANBAN_DISPATCH_IN_GATEWAY=0
-    echo "[gateway] Shields-up: HERMES_KANBAN_DISPATCH_IN_GATEWAY=0 (embedded kanban dispatcher suspended; kanban.db on locked config root is read-only)" >&2
+  local config_locked=0
+  if [ "${HERMES_RESTART_SEALED:-0}" -eq 1 ]; then
+    config_locked="${HERMES_RESTART_ORIGINAL_LOCKED:-0}"
+  elif hermes_config_root_is_locked; then
+    config_locked=1
+  fi
+
+  if [ "$config_locked" -eq 1 ]; then
+    if [ -z "${HERMES_KANBAN_DISPATCH_IN_GATEWAY:-}" ]; then
+      export HERMES_KANBAN_DISPATCH_IN_GATEWAY=0
+      _NEMOCLAW_SET_KANBAN_DISPATCH=1
+      echo "[gateway] Shields-up: HERMES_KANBAN_DISPATCH_IN_GATEWAY=0 (embedded kanban dispatcher suspended; kanban.db on locked config root is read-only)" >&2
+    fi
+    return 0
+  fi
+
+  if [ "${_NEMOCLAW_SET_KANBAN_DISPATCH:-0}" -eq 1 ]; then
+    unset HERMES_KANBAN_DISPATCH_IN_GATEWAY
+    _NEMOCLAW_SET_KANBAN_DISPATCH=0
   fi
 }
 
@@ -465,7 +824,7 @@ ensure_hermes_config_root_mode() {
   fi
 
   if [ "$(id -u)" -eq 0 ]; then
-    chown sandbox:sandbox "$HERMES_DIR"
+    chown sandbox:sandbox "$HERMES_DIR" || return 1
   fi
   chmod 3770 "$HERMES_DIR"
 }
@@ -483,7 +842,7 @@ ensure_hermes_state_dir() {
     return 1
   fi
 
-  mkdir -p "$dir"
+  mkdir -p "$dir" || return 1
 
   if [ -L "$dir" ] || [ ! -d "$dir" ]; then
     echo "[SECURITY] Refusing Hermes layout repair because ${dir} did not resolve to a safe directory" >&2
@@ -491,14 +850,163 @@ ensure_hermes_state_dir() {
   fi
 
   if [ "$(id -u)" -eq 0 ]; then
-    chown sandbox:sandbox "$dir"
+    chown sandbox:sandbox "$dir" || return 1
   fi
   chmod "$mode" "$dir"
 }
 
+ensure_hermes_cross_uid_state_dir() {
+  local state_name="${1:?Hermes state directory name required}"
+  NEMOCLAW_HERMES_CONFIG_ROOT="$HERMES_DIR" \
+    NEMOCLAW_HERMES_STATE_DIR_NAME="$state_name" \
+    python3 -I - <<'PYCROSSUIDDIR'
+import errno
+import grp
+import os
+import pwd
+import stat
+import sys
+
+root = os.environ["NEMOCLAW_HERMES_CONFIG_ROOT"]
+name = os.environ["NEMOCLAW_HERMES_STATE_DIR_NAME"]
+desired_mode = 0o2770
+
+
+def fail(message: str) -> None:
+    print(
+        f"[SECURITY] Refusing Hermes cross-UID state repair because {message}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+    fail("descriptor-safe directory flags are unavailable")
+
+try:
+    root_before = os.lstat(root)
+except OSError as exc:
+    fail(f"{root} could not be inspected: {exc.strerror}")
+if stat.S_ISLNK(root_before.st_mode) or not stat.S_ISDIR(root_before.st_mode):
+    fail(f"{root} is not a safe directory")
+
+open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+open_flags |= getattr(os, "O_CLOEXEC", 0)
+root_fd = -1
+gateway_fd = -1
+try:
+    try:
+        root_fd = os.open(root, open_flags)
+    except OSError as exc:
+        fail(f"{root} could not be opened safely: {exc.strerror}")
+    root_open = os.fstat(root_fd)
+    if (root_open.st_dev, root_open.st_ino) != (
+        root_before.st_dev,
+        root_before.st_ino,
+    ):
+        fail(f"{root} changed while it was opened")
+
+    try:
+        gateway_fd = os.open(name, open_flags, dir_fd=root_fd)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, desired_mode, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            fail(f"{root}/{name} could not be created: {exc.strerror}")
+        try:
+            gateway_fd = os.open(name, open_flags, dir_fd=root_fd)
+        except OSError as exc:
+            fail(f"{root}/{name} could not be opened after creation: {exc.strerror}")
+    except OSError as exc:
+        try:
+            unsafe = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        except OSError:
+            unsafe = None
+        if unsafe is not None and stat.S_ISLNK(unsafe.st_mode):
+            fail(f"{root}/{name} is a symlink")
+        if unsafe is not None and not stat.S_ISDIR(unsafe.st_mode):
+            fail(f"{root}/{name} is not a directory")
+        detail = exc.strerror or errno.errorcode.get(exc.errno, str(exc.errno))
+        fail(f"{root}/{name} could not be opened safely: {detail}")
+
+    if os.geteuid() == 0:
+        try:
+            gateway_uid = pwd.getpwnam("gateway").pw_uid
+            sandbox_gid = grp.getgrnam("sandbox").gr_gid
+        except KeyError as exc:
+            fail(f"gateway/sandbox account lookup failed: {exc}")
+        os.fchown(gateway_fd, gateway_uid, sandbox_gid)
+        os.fchmod(gateway_fd, desired_mode)
+    else:
+        # OpenShell's non-root topology runs the gateway as the current user.
+        # Repair the mode when this user owns the directory. If an ordinary
+        # Linux image still has the root-prepared gateway owner, fchmod is
+        # expected to fail and the exact existing mode is verified below.
+        try:
+            os.fchmod(gateway_fd, desired_mode)
+        except PermissionError:
+            pass
+
+    current = os.fstat(gateway_fd)
+    if not stat.S_ISDIR(current.st_mode):
+        fail(f"{root}/{name} is not a directory")
+    if stat.S_IMODE(current.st_mode) != desired_mode:
+        fail(
+            f"{root}/{name} mode is {stat.S_IMODE(current.st_mode):04o}, "
+            f"expected {desired_mode:04o}"
+        )
+
+    if os.geteuid() == 0:
+        allowed_uids = {gateway_uid}
+        expected_gid = sandbox_gid
+    else:
+        allowed_uids = {os.geteuid()}
+        try:
+            allowed_uids.add(pwd.getpwnam("gateway").pw_uid)
+            expected_gid = grp.getgrnam("sandbox").gr_gid
+        except KeyError:
+            # Host-side unit fixtures need not have the image's account pair.
+            # A deployed image always has both accounts; when the gateway
+            # account is absent, current-user ownership and exact mode remain
+            # the complete non-root topology contract.
+            expected_gid = None
+    if current.st_uid not in allowed_uids:
+        fail(f"{root}/{name} has an unexpected owner uid {current.st_uid}")
+    if expected_gid is not None and current.st_gid != expected_gid:
+        fail(
+            f"{root}/{name} has group gid {current.st_gid}, "
+            f"expected sandbox gid {expected_gid}"
+        )
+
+    try:
+        named = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+    except OSError as exc:
+        fail(f"{root}/{name} no longer names the opened directory: {exc.strerror}")
+    if (named.st_dev, named.st_ino) != (current.st_dev, current.st_ino):
+        fail(f"{root}/{name} changed during repair")
+
+    try:
+        root_after = os.lstat(root)
+    except OSError as exc:
+        fail(f"{root} disappeared during repair: {exc.strerror}")
+    if (root_after.st_dev, root_after.st_ino) != (
+        root_open.st_dev,
+        root_open.st_ino,
+    ):
+        fail(f"{root} changed during repair")
+finally:
+    if gateway_fd >= 0:
+        os.close(gateway_fd)
+    if root_fd >= 0:
+        os.close(root_fd)
+PYCROSSUIDDIR
+}
+
 repair_hermes_log_permissions() {
-  ensure_hermes_state_dir "${HERMES_DIR}/logs" 2770
-  ensure_hermes_state_dir "${HERMES_DIR}/logs/curator" 2770
+  ensure_hermes_state_dir "${HERMES_DIR}/logs" 2770 || return 1
+  ensure_hermes_state_dir "${HERMES_DIR}/logs/curator" 2770 || return 1
 
   NEMOCLAW_HERMES_LOG_DIR="${HERMES_DIR}/logs" \
     python3 - <<'PYLOGS'
@@ -699,26 +1207,44 @@ PYHISTORY
 }
 
 repair_hermes_startup_layout() {
+  # The cron execution and Discord recovery ledgers are created by gateway and
+  # backed up/restored by sandbox. Maintain their descriptor-verified,
+  # group-writable runtime and gateway parents even when the rest of the config
+  # root is locked while Shields up is active or was wiped. The cron directory
+  # contains cron job definitions and must remain sealed.
+  if ! ensure_hermes_cross_uid_state_dir gateway; then
+    echo "[gateway] Hermes pre-launch layout repair failed at gateway state directory" >&2
+    return 1
+  fi
+  if ! ensure_hermes_cross_uid_state_dir runtime; then
+    echo "[gateway] Hermes pre-launch layout repair failed at runtime state directory" >&2
+    return 1
+  fi
+
   if hermes_config_root_is_locked; then
-    # The locked-root posture seals config.yaml/.env, not the dir, so we can
-    # still bring a missing prompt_toolkit history file into existence as a
-    # sandbox-owned regular file. Sandboxes built before the precreate landed
-    # would otherwise stay broken until the next `shields down` cycle.
+    # The locked-root posture seals config.yaml/.env, not the dir. The gateway
+    # and runtime state parents were maintained above; also bring a missing
+    # prompt_toolkit history file into existence as a sandbox-owned regular
+    # file. Sandboxes built before the precreate landed would otherwise stay
+    # broken until the next `shields down` cycle.
     # Refusal (symlink, non-regular, create failure) is a hard stop: starting
     # the gateway with an unsafe .hermes_history under a locked root would
     # either let the TUI clobber an attacker-pointed path or repeat the
     # original keypress traceback.
     echo "[gateway] Hermes layout repair limited to history file because config root is locked" >&2
-    ensure_hermes_history_file "${HERMES_DIR}/.hermes_history" 660
+    if ! ensure_hermes_history_file "${HERMES_DIR}/.hermes_history" 660; then
+      echo "[gateway] Hermes pre-launch layout repair failed at history file" >&2
+      return 1
+    fi
     return 0
   fi
 
-  ensure_hermes_config_root_mode
-  repair_hermes_log_permissions
-  ensure_hermes_state_dir "${HERMES_DIR}/hooks" 770
-  ensure_hermes_state_dir "${HERMES_DIR}/image_cache" 770
-  ensure_hermes_state_dir "${HERMES_DIR}/audio_cache" 770
-  ensure_hermes_history_file "${HERMES_DIR}/.hermes_history" 660
+  ensure_hermes_config_root_mode || return 1
+  repair_hermes_log_permissions || return 1
+  ensure_hermes_state_dir "${HERMES_DIR}/hooks" 770 || return 1
+  ensure_hermes_state_dir "${HERMES_DIR}/image_cache" 770 || return 1
+  ensure_hermes_state_dir "${HERMES_DIR}/audio_cache" 770 || return 1
+  ensure_hermes_history_file "${HERMES_DIR}/.hermes_history" 660 || return 1
 }
 
 cleanup_stale_hermes_gateway_runtime() {
@@ -729,7 +1255,7 @@ cleanup_stale_hermes_gateway_runtime() {
     return 0
   fi
 
-  repair_hermes_startup_layout
+  repair_hermes_startup_layout || return 1
 
   # Hermes can leave gateway.lock behind after Docker GPU recreation kills the
   # old process namespace. Clear it only after confirming no gateway is alive.
@@ -745,33 +1271,355 @@ cleanup_stale_hermes_gateway_runtime() {
 # socat bridges 0.0.0.0:<public> to 127.0.0.1:<internal>.
 SOCAT_PID=""
 DASHBOARD_SOCAT_PID=""
+_HERMES_PROC_ROOT="/proc"
+# OpenShell owns container PID 1 and starts this script as the sandbox user in
+# its managed topology. Bind every child identity to this immutable supervisor
+# process rather than assuming the script itself is PID 1. Direct-container
+# root entrypoints still capture 1 here.
+readonly HERMES_STARTUP_SUPERVISOR_PID="$$"
+GATEWAY_PID_START_IDENTITY=""
+DASHBOARD_PID_START_IDENTITY=""
+SOCAT_PID_START_IDENTITY=""
+DASHBOARD_SOCAT_PID_START_IDENTITY=""
+GATEWAY_LOG_TAIL_PID_START_IDENTITY=""
+DASHBOARD_LOG_TAIL_PID_START_IDENTITY=""
+
+hermes_role_identity_value() {
+  case "$1" in
+    gateway) printf '%s' "${GATEWAY_PID_START_IDENTITY:-}" ;;
+    dashboard) printf '%s' "${DASHBOARD_PID_START_IDENTITY:-}" ;;
+    api-socat) printf '%s' "${SOCAT_PID_START_IDENTITY:-}" ;;
+    dashboard-socat) printf '%s' "${DASHBOARD_SOCAT_PID_START_IDENTITY:-}" ;;
+    gateway-log) printf '%s' "${GATEWAY_LOG_TAIL_PID_START_IDENTITY:-}" ;;
+    dashboard-log) printf '%s' "${DASHBOARD_LOG_TAIL_PID_START_IDENTITY:-}" ;;
+    *) return 1 ;;
+  esac
+}
+
+hermes_set_role_identity() {
+  local role="$1"
+  local value="$2"
+  case "$role" in
+    gateway) GATEWAY_PID_START_IDENTITY="$value" ;;
+    dashboard) DASHBOARD_PID_START_IDENTITY="$value" ;;
+    api-socat) SOCAT_PID_START_IDENTITY="$value" ;;
+    dashboard-socat) DASHBOARD_SOCAT_PID_START_IDENTITY="$value" ;;
+    gateway-log) GATEWAY_LOG_TAIL_PID_START_IDENTITY="$value" ;;
+    dashboard-log) DASHBOARD_LOG_TAIL_PID_START_IDENTITY="$value" ;;
+    *) return 1 ;;
+  esac
+}
+
+hermes_expected_service_uid() {
+  case "$1" in
+    current) id -u ;;
+    gateway) id -u gateway ;;
+    sandbox) id -u sandbox ;;
+    *) return 1 ;;
+  esac
+}
+
+hermes_process_start_identity() {
+  local pid="$1"
+  local proc_stat
+  local stat_suffix
+  local expected_parent_pid="${HERMES_STARTUP_SUPERVISOR_PID:-$$}"
+  local process_ppid
+  local process_start
+
+  case "$pid" in
+    '' | 0 | 1 | *[!0-9]*) return 1 ;;
+  esac
+  [ -r "${_HERMES_PROC_ROOT}/${pid}/stat" ] || return 1
+  IFS= read -r proc_stat <"${_HERMES_PROC_ROOT}/${pid}/stat" || return 1
+  stat_suffix="${proc_stat##*) }"
+  process_ppid="$(awk '{print $2}' <<<"$stat_suffix")"
+  process_start="$(awk '{print $20}' <<<"$stat_suffix")"
+  [ "$process_ppid" = "$expected_parent_pid" ] || return 1
+  case "$process_start" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  printf '%s' "$process_start"
+}
+
+hermes_process_role_identity() {
+  local role="$1"
+  local pid="$2"
+  local service_user="$3"
+  local port="${4:-}"
+  local process_start
+  local expected_uid
+  local effective_uid
+  local cmdline
+
+  gateway_control_pid_is_live "$pid" || return 1
+  [ -r "${_HERMES_PROC_ROOT}/${pid}/status" ] \
+    && [ -r "${_HERMES_PROC_ROOT}/${pid}/cmdline" ] || return 1
+  process_start="$(hermes_process_start_identity "$pid")" || return 1
+  expected_uid="$(hermes_expected_service_uid "$service_user")" || return 1
+  effective_uid="$(awk '/^Uid:/ { print $3; exit }' "${_HERMES_PROC_ROOT}/${pid}/status")"
+  [ "$effective_uid" = "$expected_uid" ] || return 1
+  cmdline="$(tr '\0' ' ' <"${_HERMES_PROC_ROOT}/${pid}/cmdline")" || return 1
+  case "$role" in
+    gateway)
+      case "$cmdline" in
+        *hermes*gateway*run*) ;;
+        *) return 1 ;;
+      esac
+      ;;
+    dashboard)
+      case "$cmdline" in
+        *hermes*dashboard*) ;;
+        *) return 1 ;;
+      esac
+      ;;
+    api-socat | dashboard-socat)
+      case "$port" in
+        '' | *[!0-9]*) return 1 ;;
+      esac
+      case "$cmdline" in
+        *socat*"TCP-LISTEN:${port},"*) ;;
+        *) return 1 ;;
+      esac
+      ;;
+    gateway-log)
+      case "$cmdline" in
+        *sed*gateway-log*) ;;
+        *) return 1 ;;
+      esac
+      ;;
+    dashboard-log)
+      case "$cmdline" in
+        *sed*dashboard-log*) ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$process_start"
+}
+
+hermes_capture_tracked_role() {
+  local role="$1"
+  local pid="$2"
+  local service_user="$3"
+  local port="${4:-}"
+  local identity
+  local attempts=0
+  while [ "$attempts" -lt 50 ]; do
+    if identity="$(hermes_process_role_identity "$role" "$pid" "$service_user" "$port")"; then
+      hermes_set_role_identity "$role" "$identity"
+      return 0
+    fi
+    gateway_control_pid_is_live "$pid" || return 1
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
+hermes_tracked_role_is_current() {
+  local role="$1"
+  local pid="$2"
+  local service_user="$3"
+  local port="${4:-}"
+  local expected
+  local current
+  expected="$(hermes_role_identity_value "$role")" || return 1
+  [ -n "$expected" ] || return 1
+  current="$(hermes_process_role_identity "$role" "$pid" "$service_user" "$port")" || return 1
+  [ "$current" = "$expected" ]
+}
+
+hermes_stop_tracked_role() {
+  local role="$1"
+  local pid="$2"
+  local service_user="$3"
+  local port="${4:-}"
+  local expected_start_identity
+  local current_start_identity
+  local state
+  expected_start_identity="$(hermes_role_identity_value "$role")" || return 1
+
+  case "$pid" in
+    '' | 0 | 1 | *[!0-9]*)
+      # An empty role has never owned a process and is a safe no-op. A stored
+      # identity paired with an invalid PID is inconsistent and must not be
+      # reported as a successful stop.
+      [ -z "$expected_start_identity" ] && return 0
+      return 1
+      ;;
+  esac
+  [ -n "$expected_start_identity" ] || return 1
+
+  if ! hermes_tracked_role_is_current "$role" "$pid" "$service_user" "$port"; then
+    # Distinguish a child that is definitely gone from a live/reused/unreadable
+    # numeric PID. Only the former is a successful no-op. A matching zombie is
+    # still the exact tracked child and the shared helper can reap it safely.
+    current_start_identity="$(hermes_process_start_identity "$pid" 2>/dev/null || true)"
+    if [ -n "$current_start_identity" ]; then
+      if [ "$current_start_identity" != "$expected_start_identity" ]; then
+        echo "[SECURITY] Hermes ${role} pid ${pid} was reused; refusing to signal or treat it as stopped" >&2
+        return 1
+      fi
+      state="$(gateway_control_pid_state "$pid" 2>/dev/null || true)"
+      case "$state" in
+        Z*) ;;
+        *)
+          echo "[SECURITY] Hermes ${role} pid ${pid} still has its captured start identity but its role cannot be proven; refusing to signal or treat it as stopped" >&2
+          return 1
+          ;;
+      esac
+    elif kill -0 "$pid" 2>/dev/null; then
+      echo "[SECURITY] Hermes ${role} pid ${pid} is live but its start identity cannot be proven; refusing to signal or treat it as stopped" >&2
+      return 1
+    else
+      hermes_set_role_identity "$role" ""
+      return 0
+    fi
+  fi
+
+  gateway_control_stop_tracked_pid "$pid" "$expected_start_identity" || return 1
+  if kill -0 "$pid" 2>/dev/null; then
+    # The shared helper may return success when its final identity read says
+    # the numeric PID was replaced. That is sufficient for ordinary cleanup,
+    # but not for a gateway revocation that is about to mark the role stopped
+    # and relaunch. Require the numeric PID to be absent as a postcondition.
+    echo "[SECURITY] Hermes ${role} pid ${pid} remains live after tracked stop; refusing to treat it as stopped" >&2
+    return 1
+  fi
+  hermes_set_role_identity "$role" ""
+}
+
+hermes_tracked_service_owns_listener() {
+  local pid="$1"
+  local port="$2"
+  local service_user="$3"
+
+  if [ "$(id -u)" -ne 0 ] || [ "$service_user" = "current" ]; then
+    gateway_control_pid_owns_tcp_listener "$pid" "$port"
+    return $?
+  fi
+  case "$service_user" in
+    gateway)
+      # shellcheck disable=SC2016  # positional args expand in the stepped-down shell
+      "${STEP_DOWN_PREFIX_GATEWAY[@]}" env -u BASH_ENV \
+        bash --noprofile --norc -c \
+        'source "$1"; gateway_control_pid_owns_tcp_listener "$2" "$3"' \
+        bash "$_GATEWAY_SUPERVISOR" "$pid" "$port"
+      ;;
+    sandbox)
+      # shellcheck disable=SC2016  # positional args expand in the stepped-down shell
+      "${STEP_DOWN_PREFIX_SANDBOX[@]}" env -u BASH_ENV \
+        bash --noprofile --norc -c \
+        'source "$1"; gateway_control_pid_owns_tcp_listener "$2" "$3"' \
+        bash "$_GATEWAY_SUPERVISOR" "$pid" "$port"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 start_socat_forwarder() {
   local public_port="$1"
   local internal_port="$2"
   local label="$3"
   local pid_var="${4:-SOCAT_PID}"
+  local owner_pid="${5:-}"
+  local owner_user="${6:-current}"
   local _socat_pid
+  local _socat_role=""
+  local owner_role=""
+
+  case "$owner_user" in
+    gateway) owner_role=gateway ;;
+    sandbox) owner_role=dashboard ;;
+    current)
+      if [ "$internal_port" = "$INTERNAL_PORT" ]; then
+        owner_role=gateway
+      elif [ "$internal_port" = "$DASHBOARD_INTERNAL_PORT" ]; then
+        owner_role=dashboard
+      fi
+      ;;
+  esac
 
   if ! command -v socat >/dev/null 2>&1; then
     echo "[gateway] socat not available - ${label} port forwarding from host may not work" >&2
     return
   fi
   local attempts=0
+  local internal_ready=0
   while [ "$attempts" -lt 30 ]; do
-    if ss -tln 2>/dev/null | grep -q "127.0.0.1:${internal_port}"; then
+    if [ -n "$owner_pid" ]; then
+      if [ -z "$owner_role" ] \
+        || ! hermes_tracked_role_is_current \
+          "$owner_role" "$owner_pid" "$owner_user" "$internal_port"; then
+        echo "[gateway] ${label} service owner pid ${owner_pid} exited before binding 127.0.0.1:${internal_port}" >&2
+        return 1
+      fi
+      if hermes_tracked_service_owns_listener "$owner_pid" "$internal_port" "$owner_user"; then
+        internal_ready=1
+        break
+      fi
+    elif ss -tln 2>/dev/null | grep -q "127.0.0.1:${internal_port}"; then
+      # Compatibility for non-supervised callers; PID 1 production paths pass
+      # an exact owner PID and never rely on this transport-only fallback.
+      internal_ready=1
       break
     fi
     sleep 1
     attempts=$((attempts + 1))
   done
+  if [ "$internal_ready" -ne 1 ]; then
+    echo "[gateway] ${label} service did not bind 127.0.0.1:${internal_port}; refusing to publish an empty forward" >&2
+    return 1
+  fi
   nohup socat TCP-LISTEN:"${public_port}",bind=0.0.0.0,fork,reuseaddr \
     TCP:127.0.0.1:"${internal_port}" >/dev/null 2>&1 &
   _socat_pid=$!
+  sleep 0.1
+  if ! gateway_control_pid_is_live "$_socat_pid"; then
+    wait "$_socat_pid" 2>/dev/null || true
+    echo "[gateway] ${label} socat forwarder failed to stay running on 0.0.0.0:${public_port}" >&2
+    return 1
+  fi
+  case "$pid_var" in
+    SOCAT_PID)
+      _socat_role=api-socat
+      if ! hermes_capture_tracked_role api-socat "$_socat_pid" current "$public_port"; then
+        hermes_set_role_identity api-socat ""
+        hermes_fatal_unproven_child api-socat "$_socat_pid"
+      fi
+      ;;
+    DASHBOARD_SOCAT_PID)
+      _socat_role=dashboard-socat
+      if ! hermes_capture_tracked_role dashboard-socat "$_socat_pid" current "$public_port"; then
+        hermes_set_role_identity dashboard-socat ""
+        hermes_fatal_unproven_child dashboard-socat "$_socat_pid"
+      fi
+      ;;
+  esac
+  attempts=0
+  while [ "$attempts" -lt 30 ]; do
+    gateway_control_pid_owns_tcp_listener "$_socat_pid" "$public_port" && break
+    gateway_control_pid_is_live "$_socat_pid" || break
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  if ! gateway_control_pid_owns_tcp_listener "$_socat_pid" "$public_port"; then
+    if [ -n "$_socat_role" ]; then
+      hermes_stop_tracked_role "$_socat_role" "$_socat_pid" current "$public_port" || true
+    fi
+    echo "[gateway] ${label} socat process did not own 0.0.0.0:${public_port}" >&2
+    return 1
+  fi
   printf -v "$pid_var" '%s' "$_socat_pid"
   echo "[gateway] ${label} socat forwarder 0.0.0.0:${public_port} -> 127.0.0.1:${internal_port} (pid ${_socat_pid})" >&2
 }
 
 build_hermes_dashboard_args() {
+  # HERMES_DASHBOARD_HOME is a dedicated profile for privilege separation.
+  # Hermes otherwise treats a profiles/<name> launch as a request for its
+  # unified machine dashboard and re-execs outside this prepared profile.
   HERMES_DASHBOARD_ARGS=(
     dashboard
     --host
@@ -780,6 +1628,7 @@ build_hermes_dashboard_args() {
     "$DASHBOARD_INTERNAL_PORT"
     --skip-build
     --no-open
+    --isolated
   )
   if hermes_dashboard_tui_enabled; then
     HERMES_DASHBOARD_ARGS+=(--tui)
@@ -800,23 +1649,25 @@ prepare_hermes_dashboard_home() {
       HERMES_DASHBOARD_HOME="$HERMES_DASHBOARD_HOME" \
       _HERMES_PYTHON="$_HERMES_PYTHON" \
       _HERMES_DASHBOARD_CONFIG_SEEDER="$_HERMES_DASHBOARD_CONFIG_SEEDER" \
+      _HERMES_MANAGED_POLICY="$_HERMES_MANAGED_POLICY" \
       "${STEP_DOWN_PREFIX_SANDBOX[@]}" sh -c '
         if [ -L "$HERMES_DASHBOARD_HOME" ]; then
           echo "[SECURITY] Refusing Hermes dashboard startup because ${HERMES_DASHBOARD_HOME} is a symlink" >&2
           exit 1
         fi
-        mkdir -p "$HERMES_DASHBOARD_HOME"
+        mkdir -p "$HERMES_DASHBOARD_HOME" || exit 1
         if [ -L "$HERMES_DASHBOARD_HOME" ] || [ ! -d "$HERMES_DASHBOARD_HOME" ]; then
           echo "[SECURITY] Refusing Hermes dashboard startup because ${HERMES_DASHBOARD_HOME} is not a safe directory" >&2
           exit 1
         fi
-        chmod 700 "$HERMES_DASHBOARD_HOME"
+        chmod 700 "$HERMES_DASHBOARD_HOME" || exit 1
         # The dashboard can attempt a gateway restart from its isolated
         # HERMES_HOME. In NemoClaw the real gateway lives under /sandbox/.hermes,
         # so a failed dashboard-scoped restart can leave stale startup_failed
         # state that poisons /api/status even while the real gateway is healthy.
         rm -f "${HERMES_DASHBOARD_HOME}/gateway_state.json" 2>/dev/null || true
         exec "$_HERMES_PYTHON" "$_HERMES_DASHBOARD_CONFIG_SEEDER" \
+          "$_HERMES_MANAGED_POLICY" \
           "${HERMES_DIR}/config.yaml" "${HERMES_DASHBOARD_HOME}/config.yaml" \
           "${HERMES_DIR}/.env" "${HERMES_DASHBOARD_HOME}/.env"
       ' || rc=$?
@@ -831,19 +1682,19 @@ prepare_hermes_dashboard_home() {
     echo "[SECURITY] Refusing Hermes dashboard startup because ${HERMES_DASHBOARD_HOME} is a symlink" >&2
     return 1
   fi
-  mkdir -p "$HERMES_DASHBOARD_HOME"
+  mkdir -p "$HERMES_DASHBOARD_HOME" || return 1
   if [ -L "$HERMES_DASHBOARD_HOME" ] || [ ! -d "$HERMES_DASHBOARD_HOME" ]; then
     echo "[SECURITY] Refusing Hermes dashboard startup because ${HERMES_DASHBOARD_HOME} is not a safe directory" >&2
     return 1
   fi
-  chmod 700 "$HERMES_DASHBOARD_HOME"
+  chmod 700 "$HERMES_DASHBOARD_HOME" || return 1
   seed_hermes_dashboard_config
 }
 
-# Mirror the gateway's model routing and dotenv context into the dashboard's
-# isolated HERMES_HOME so its Models page (/api/model/options), Chat/TUI setup
-# checks, and kanban specifier/dispatcher resolve the routed model. The
-# dashboard runs under HERMES_DASHBOARD_HOME for privilege separation and
+# Mirror the gateway's model routing and non-secret dotenv context into the
+# dashboard's isolated HERMES_HOME so its Models page (/api/model/options),
+# Chat/TUI setup checks, and kanban specifier/dispatcher resolve the routed
+# model. The dashboard runs under HERMES_DASHBOARD_HOME for privilege separation and
 # otherwise only sees a Hermes-default config with an empty model. Idempotent:
 # refreshes the keys on every launch. Missing gateway config is a benign no-op
 # in the seeder; security refusals and write failures abort startup.
@@ -857,6 +1708,7 @@ seed_hermes_dashboard_config() {
   # prepare_hermes_dashboard_home after stepping down to the sandbox identity.
   rm -f "${HERMES_DASHBOARD_HOME}/gateway_state.json" 2>/dev/null || true
   env "$_HERMES_PYTHON" "$_HERMES_DASHBOARD_CONFIG_SEEDER" \
+    "$_HERMES_MANAGED_POLICY" \
     "${HERMES_DIR}/config.yaml" "$dst" \
     "${HERMES_DIR}/.env" "$env_dst" || rc=$?
 
@@ -867,50 +1719,66 @@ seed_hermes_dashboard_config() {
 }
 
 start_hermes_dashboard_current_user() {
-  build_hermes_dashboard_args
-  prepare_hermes_dashboard_home ""
-  prepare_restricted_log /tmp/dashboard.log "" 600
+  build_hermes_dashboard_args || return 1
+  prepare_hermes_dashboard_home "" || return 1
+  prepare_restricted_log /tmp/dashboard.log "" 600 || return 1
   HERMES_HOME="${HERMES_DASHBOARD_HOME}" \
     GATEWAY_HEALTH_URL="http://127.0.0.1:${INTERNAL_PORT}" \
+    NEMOCLAW_HERMES_DASHBOARD_API_SERVER_ENV="${HERMES_DIR}/.env" \
     nohup "$HERMES" "${HERMES_DASHBOARD_ARGS[@]}" >/tmp/dashboard.log 2>&1 &
   DASHBOARD_PID=$!
   echo "[gateway] hermes dashboard launched (pid $DASHBOARD_PID)" >&2
-  start_dashboard_log_stream
-  start_socat_forwarder "$DASHBOARD_PUBLIC_PORT" "$DASHBOARD_INTERNAL_PORT" "dashboard" DASHBOARD_SOCAT_PID
+  if ! hermes_capture_tracked_role dashboard "$DASHBOARD_PID" current "$DASHBOARD_INTERNAL_PORT"; then
+    hermes_fatal_unproven_child dashboard "$DASHBOARD_PID"
+  fi
+  ensure_dashboard_log_stream || return 1
+  start_socat_forwarder \
+    "$DASHBOARD_PUBLIC_PORT" "$DASHBOARD_INTERNAL_PORT" "dashboard" DASHBOARD_SOCAT_PID \
+    "$DASHBOARD_PID" current
 }
 
 start_hermes_dashboard_sandbox_user() {
-  build_hermes_dashboard_args
-  prepare_hermes_dashboard_home sandbox:sandbox
-  prepare_restricted_log /tmp/dashboard.log sandbox:sandbox 600
+  build_hermes_dashboard_args || return 1
+  prepare_hermes_dashboard_home sandbox:sandbox || return 1
+  prepare_restricted_log /tmp/dashboard.log sandbox:sandbox 600 || return 1
   HERMES_HOME="${HERMES_DASHBOARD_HOME}" \
     GATEWAY_HEALTH_URL="http://127.0.0.1:${INTERNAL_PORT}" \
+    NEMOCLAW_HERMES_DASHBOARD_API_SERVER_ENV="${HERMES_DIR}/.env" \
     nohup "${STEP_DOWN_PREFIX_SANDBOX[@]}" sh -c 'umask 0077; exec "$@" >/tmp/dashboard.log 2>&1' sh "$HERMES" "${HERMES_DASHBOARD_ARGS[@]}" &
   DASHBOARD_PID=$!
   echo "[gateway] hermes dashboard launched as 'sandbox' user (pid $DASHBOARD_PID)" >&2
-  start_dashboard_log_stream
-  start_socat_forwarder "$DASHBOARD_PUBLIC_PORT" "$DASHBOARD_INTERNAL_PORT" "dashboard" DASHBOARD_SOCAT_PID
+  if ! hermes_capture_tracked_role dashboard "$DASHBOARD_PID" sandbox "$DASHBOARD_INTERNAL_PORT"; then
+    hermes_fatal_unproven_child dashboard "$DASHBOARD_PID"
+  fi
+  ensure_dashboard_log_stream || return 1
+  start_socat_forwarder \
+    "$DASHBOARD_PUBLIC_PORT" "$DASHBOARD_INTERNAL_PORT" "dashboard" DASHBOARD_SOCAT_PID \
+    "$DASHBOARD_PID" sandbox
 }
 
 wait_for_hermes_gateway_internal() {
   local gateway_pid="$1"
-  local attempts=0
+  local deadline=$((SECONDS + 90))
   local code
-  while [ "$attempts" -lt 60 ]; do
+  local service_user=current
+  [ "$(id -u)" -eq 0 ] && service_user=gateway
+  while [ "$SECONDS" -lt "$deadline" ]; do
     # Status-code extraction (not curl -sf) so a 401 counts as alive: Hermes
     # v0.16.0+ may guard the api_server with API_SERVER_KEY, and the probe is
     # unauthenticated. A 401 still proves the gateway is bound and serving.
     # Mirrors GATEWAY_ALIVE_CODES in src/lib/verify-deployment.ts.
-    code=$(curl -so /dev/null -w '%{http_code}' --max-time 2 \
-      "http://127.0.0.1:${INTERNAL_PORT}/health" 2>/dev/null || echo 000)
-    case "$code" in
-      200 | 401) return 0 ;;
-    esac
-    if ! kill -0 "$gateway_pid" 2>/dev/null; then
+    if hermes_tracked_role_is_current gateway "$gateway_pid" "$service_user" "$INTERNAL_PORT" \
+      && hermes_tracked_service_owns_listener "$gateway_pid" "$INTERNAL_PORT" "$service_user"; then
+      code=$(curl -so /dev/null -w '%{http_code}' --max-time 2 \
+        "http://127.0.0.1:${INTERNAL_PORT}/health" 2>/dev/null || echo 000)
+      case "$code" in
+        200 | 401) return 0 ;;
+      esac
+    fi
+    if ! hermes_tracked_role_is_current gateway "$gateway_pid" "$service_user" "$INTERNAL_PORT"; then
       wait "$gateway_pid"
       return $?
     fi
-    attempts=$((attempts + 1))
     sleep 1
   done
   echo "[gateway] Hermes gateway did not become healthy on internal port ${INTERNAL_PORT}" >&2
@@ -954,6 +1822,36 @@ export http_proxy="$_PROXY_URL"
 export https_proxy="$_PROXY_URL"
 export no_proxy="$_NO_PROXY_VAL"
 
+# Corporate proxy CA merge (NemoClaw#6210).
+# OpenShell injects SSL_CERT_FILE for its own L7 proxy CA at runtime. When a
+# separate corporate MITM proxy sits in front of the host and re-signs external
+# TLS with a different root, that root is absent from the OpenShell bundle, so
+# external endpoints (e.g. api.telegram.org) fail verification even when policy
+# allows the connection. If onboard baked an operator-supplied corporate CA
+# into the image, append it to the OpenShell bundle — never replace it (the
+# #1828 OpenShell CA behavior stays intact) — and repoint SSL_CERT_FILE at the
+# merged bundle before the CURL/REQUESTS/GIT derivation below picks it up.
+_NEMOCLAW_CORPORATE_CA_FILE="/usr/local/share/nemoclaw/corporate-ca.pem"
+_NEMOCLAW_CORPORATE_CA_HELPER="/usr/local/lib/nemoclaw/corporate-ca-runtime.sh"
+if [ ! -f "$_NEMOCLAW_CORPORATE_CA_HELPER" ]; then
+  _HERMES_START_SOURCE="${BASH_SOURCE[0]}"
+  _HERMES_START_DIR="${_HERMES_START_SOURCE%/*}"
+  if [ "$_HERMES_START_DIR" = "$_HERMES_START_SOURCE" ]; then
+    _HERMES_START_DIR="."
+  fi
+  _NEMOCLAW_CORPORATE_CA_HELPER="$(cd "$_HERMES_START_DIR" && pwd)/../../scripts/lib/corporate-ca-runtime.sh"
+  unset _HERMES_START_SOURCE _HERMES_START_DIR
+fi
+if [ ! -f "$_NEMOCLAW_CORPORATE_CA_HELPER" ] || [ -L "$_NEMOCLAW_CORPORATE_CA_HELPER" ]; then
+  echo "[nemoclaw] required corporate CA runtime helper is missing or unsafe" >&2
+  exit 1
+fi
+# shellcheck source=scripts/lib/corporate-ca-runtime.sh
+source "$_NEMOCLAW_CORPORATE_CA_HELPER"
+if [ "${NEMOCLAW_MANAGED_STARTUP_APPLIED:-0}" != "1" ]; then
+  merge_corporate_proxy_ca
+fi
+unset _NEMOCLAW_CORPORATE_CA_HELPER
 # OpenShell injects SSL_CERT_FILE/CURL_CA_BUNDLE for its L7 proxy CA. Persist
 # them into connect-session shells so Python Slack probes and Hermes tools trust
 # the same proxy CA that the entrypoint received at startup.
@@ -989,13 +1887,14 @@ export http_proxy="$_PROXY_URL"
 export https_proxy="$_PROXY_URL"
 export no_proxy="$_NO_PROXY_VAL"
 export HERMES_HOME="${HERMES_DIR}"
+export HERMES_LAZY_INSTALL_TARGET="/sandbox/.hermes/lazy-packages"
 PROXYEOF
     cat <<'TUIENVEOF'
 if [ -f /opt/hermes/ui-tui/dist/entry.js ]; then
   export HERMES_TUI_DIR="/opt/hermes/ui-tui"
 fi
 TUIENVEOF
-    for _ca_env_name in SSL_CERT_FILE CURL_CA_BUNDLE REQUESTS_CA_BUNDLE GIT_SSL_CAINFO; do
+    for _ca_env_name in SSL_CERT_FILE CURL_CA_BUNDLE REQUESTS_CA_BUNDLE GIT_SSL_CAINFO NODE_EXTRA_CA_CERTS; do
       _ca_env_value="${!_ca_env_name:-}"
       if [ -n "$_ca_env_value" ]; then
         printf 'export %s=%q\n' "$_ca_env_name" "$_ca_env_value"
@@ -1190,21 +2089,34 @@ refresh_hermes_provider_placeholders() {
     --hash-file "$HERMES_HASH_FILE"
     --boundary-validator "$_HERMES_BOUNDARY_VALIDATOR"
     --mode "$mode"
+    --startup-owner
   )
   if [ -f "$runtime_plan" ]; then
     args+=(--runtime-plan "$runtime_plan")
   fi
-  "$_HERMES_PYTHON" "${args[@]}"
+  "$_HERMES_PYTHON" -I "${args[@]}"
   validate_hermes_env_secret_boundary
 }
 
 refresh_hermes_runtime_config_hashes() {
   local mode="${1:-strict}"
+  # A locked root seals config.yaml, .env, and .config-hash as root-owned, and
+  # the lock transaction already wrote a coherent hash for them. The compat
+  # refresh runs as the sandbox identity, which by design cannot replace a
+  # sealed hash: the sticky config root refuses the rename, so every launch
+  # under shields failed here and the supervisor stopped respawning (#7865).
+  # There is also nothing to refresh, because the sealed inputs cannot drift.
+  # The MCP integrity inspection that follows still validates the sealed hash,
+  # so a genuinely incoherent locked tree keeps failing closed.
+  if [ "$mode" = "compat" ] && hermes_config_root_is_locked; then
+    return 0
+  fi
   local cmd=(
-    "$_HERMES_PYTHON" "$_HERMES_RUNTIME_CONFIG_GUARD" refresh-hashes
+    "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" refresh-hashes
     --hermes-dir "$HERMES_DIR"
     --hash-file "$HERMES_HASH_FILE"
     --mode "$mode"
+    --startup-owner
   )
   if [ "$mode" = "compat" ] && [ "$(id -u)" -eq 0 ]; then
     "${STEP_DOWN_PREFIX_SANDBOX[@]}" "${cmd[@]}"
@@ -1213,18 +2125,96 @@ refresh_hermes_runtime_config_hashes() {
   "${cmd[@]}"
 }
 
+inspect_hermes_mcp_integrity() {
+  local hash_file="${1:-}"
+  local guard_status
+  local -a guard_command
+  [ -n "$hash_file" ] || {
+    if [ "$(id -u)" -eq 0 ]; then
+      hash_file="$HERMES_HASH_FILE"
+    else
+      hash_file="${HERMES_DIR}/.config-hash"
+    fi
+  }
+  # Keep the guard as the startup owner's direct child. A command
+  # substitution here would interpose a shell process and invalidate the
+  # exact-parent proof used by --startup-owner. State is returned only through
+  # the kernel-owned exit status: 0=current, 10=pending, anything else=failure.
+  # This avoids a same-UID writable result file or ambiguous shell byte parsing.
+  guard_command=(
+    "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" inspect-mcp-integrity
+    --hermes-dir "$HERMES_DIR"
+    --hash-file "$hash_file"
+    --startup-owner
+    --mcp-state-exit-code
+  )
+  if [ "$(id -u)" -eq 0 ]; then
+    # Hardened managed runtimes can remove root's DAC override before startup.
+    # Read the sandbox-owned mutable config through its owning identity; the
+    # step-down exec still leaves the guard as the startup owner's direct child.
+    guard_command=("${STEP_DOWN_PREFIX_SANDBOX[@]}" "${guard_command[@]}")
+  fi
+  if "${guard_command[@]}" >/dev/null; then
+    guard_status=0
+  else
+    guard_status=$?
+  fi
+  case "$guard_status" in
+    0) HERMES_MCP_RECONCILE_PENDING=0 ;;
+    10) HERMES_MCP_RECONCILE_PENDING=1 ;;
+    *)
+      HERMES_MCP_INTEGRITY_FAILED=1
+      echo "[SECURITY] HERMES_MCP_CONFIG_DRIFT: MCP intent cannot be matched to the persisted gateway state; rebuild the sandbox from its NemoClaw registry state" >&2
+      return 1
+      ;;
+  esac
+  HERMES_MCP_INTEGRITY_FAILED=0
+}
+
+commit_hermes_mcp_applied_if_pending() {
+  local mode=compat
+  [ "$HERMES_MCP_RECONCILE_PENDING" -eq 1 ] || return 0
+  [ "$(id -u)" -eq 0 ] && mode=both
+  "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" commit-mcp-applied \
+    --hermes-dir "$HERMES_DIR" \
+    --hash-file "$HERMES_HASH_FILE" \
+    --mode "$mode" \
+    --startup-owner >/dev/null || return 1
+  HERMES_MCP_RECONCILE_PENDING=0
+}
+
 ensure_hermes_runtime_api_server_key() {
   local mode="${1:-strict}"
   local env_file="${HERMES_DIR}/.env"
+  local result_file
+  local guard_status
   [ -f "$env_file" ] || return 0
 
   local result
-  result="$(
-    "$_HERMES_PYTHON" "$_HERMES_RUNTIME_CONFIG_GUARD" ensure-api-key \
-      --hermes-dir "$HERMES_DIR" \
-      --hash-file "$HERMES_HASH_FILE" \
-      --mode "$mode"
-  )" || return $?
+  if [ "$EUID" -eq 0 ] && [ -d /run/nemoclaw ] && [ -w /run/nemoclaw ]; then
+    result_file="$(mktemp /run/nemoclaw/hermes-api-key-result.XXXXXX)" || return 1
+  else
+    result_file="$(mktemp "${TMPDIR:-/tmp}/hermes-api-key-result.XXXXXX")" || return 1
+  fi
+  chmod 600 "$result_file" || {
+    rm -f "$result_file"
+    return 1
+  }
+  # Keep the guard as the startup owner's direct child: --startup-owner is
+  # authenticated by exact parent identity. Its own alarm bounds this call;
+  # wrapping it in `timeout` would interpose a different parent process.
+  if "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" ensure-api-key \
+    --hermes-dir "$HERMES_DIR" \
+    --hash-file "$HERMES_HASH_FILE" \
+    --mode "$mode" \
+    --startup-owner >"$result_file"; then
+    guard_status=0
+  else
+    guard_status=$?
+  fi
+  IFS= read -r result <"$result_file" || result=""
+  rm -f "$result_file"
+  [ "$guard_status" -eq 0 ] || return "$guard_status"
 
   case "$result" in
     minted=0) return 0 ;;
@@ -1249,19 +2239,1181 @@ ensure_hermes_runtime_api_server_key() {
 
 validate_hermes_env_secret_boundary() {
   local env_file="${HERMES_DIR}/.env"
-  [ -e "$env_file" ] || return 0
   if [ -L "$env_file" ]; then
     echo "[SECURITY] Refusing Hermes startup because ${env_file} is a symlink" >&2
     return 1
   fi
-  python3 "$_HERMES_BOUNDARY_VALIDATOR" env-file "$env_file"
+  # `_HERMES_PYTHON` was resolved from the trusted absolute-path list earlier;
+  # use it here so a PATH-shadowed `python3` cannot substitute the validator.
+  "${_HERMES_BOUNDARY_TIMEOUT[@]}" \
+    "$_HERMES_PYTHON" -I "$_HERMES_BOUNDARY_VALIDATOR" env-file "$env_file"
 }
 
 validate_hermes_runtime_env_secret_boundary() {
-  python3 "$_HERMES_BOUNDARY_VALIDATOR" runtime-env
+  "${_HERMES_BOUNDARY_TIMEOUT[@]}" \
+    "$_HERMES_PYTHON" -I "$_HERMES_BOUNDARY_VALIDATOR" runtime-env
+}
+
+hermes_gateway_healthy() {
+  local pid="$1"
+  local code
+  local service_user=current
+  [ "$(id -u)" -eq 0 ] && service_user=gateway
+  hermes_tracked_role_is_current gateway "$pid" "$service_user" "$INTERNAL_PORT" || return 1
+  code="$(curl -so /dev/null -w '%{http_code}' --max-time 2 \
+    "http://127.0.0.1:${INTERNAL_PORT}/health" 2>/dev/null || echo 000)"
+  case "$code" in
+    200 | 401) hermes_tracked_service_owns_listener "$pid" "$INTERNAL_PORT" gateway ;;
+    *) return 1 ;;
+  esac
+}
+
+HERMES_RESTART_FAILURE_CODE=internal
+
+hermes_restart_failure_revokes_gateway() {
+  case "${1:-}" in
+    secret-boundary-refusal | mcp-integrity) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_running_hermes_boundary() {
+  HERMES_RESTART_FAILURE_CODE=validator-missing
+  [ -f "$_HERMES_BOUNDARY_VALIDATOR" ] || return 1
+  HERMES_RESTART_FAILURE_CODE=secret-boundary-refusal
+  validate_hermes_env_secret_boundary || return 1
+  validate_hermes_runtime_env_secret_boundary || return 1
+  HERMES_RESTART_FAILURE_CODE=preload-missing
+  # shellcheck disable=SC2119
+  validate_tmp_permissions || return 1
+}
+
+prepare_hermes_gateway_restart() {
+  if ! validate_running_hermes_boundary; then
+    return 1
+  fi
+
+  # A restart is a lifecycle action, not authority to bless arbitrary bytes
+  # written by the sandbox user. Supported host config commands refresh the
+  # root-owned strict hash when they make a change; direct in-sandbox edits do
+  # not. Require that trusted anchor for both mutable-default and shields-up
+  # sandboxes instead of chowning attacker-controlled paths or adopting a new
+  # hash here.
+  HERMES_RESTART_FAILURE_CODE=hash-mismatch
+  verify_hermes_config_integrity || return 1
+  prepare_hermes_lazy_dependencies
+}
+
+hermes_restart_unseal_on_exit() {
+  [ "$HERMES_RESTART_SEALED" -eq 1 ] || return 0
+  [ "$HERMES_RESTART_UNSEALING" -eq 0 ] || return 1
+  unseal_hermes_restart_inputs || true
+}
+
+hermes_restart_cleanup_on_signal() {
+  if [ "$HERMES_RESTART_UNSEALING" -eq 1 ]; then
+    HERMES_RESTART_SIGNAL_PENDING=1
+    return 0
+  fi
+  stop_hermes_gateway_fail_closed
+  if [ "$HERMES_RESTART_SEALED" -eq 1 ]; then
+    unseal_hermes_restart_inputs || true
+  fi
+  refresh_hermes_supervised_child_pids
+  hermes_cleanup_on_signal
+}
+
+install_hermes_restart_seal_traps() {
+  trap hermes_restart_unseal_on_exit EXIT
+  trap hermes_restart_cleanup_on_signal SIGTERM SIGINT HUP
+}
+
+restore_hermes_runtime_traps() {
+  trap - EXIT HUP
+  trap hermes_cleanup_on_signal SIGTERM SIGINT
+}
+
+seal_hermes_restart_inputs() {
+  local output
+  local owner_output
+  local original_failure_code
+  HERMES_RESTART_FAILURE_CODE=unsafe-config
+  HERMES_RESTART_SEALED=0
+  install_hermes_restart_seal_traps
+  if ! output="$(
+    ${_HERMES_GUARD_TIMEOUT[@]+"${_HERMES_GUARD_TIMEOUT[@]}"} "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" seal-restart \
+      --hermes-dir "$HERMES_DIR" \
+      --hash-file "$HERMES_HASH_FILE" \
+      --state-file "$HERMES_RESTART_SEAL_STATE" \
+      --lock-token "$GATEWAY_CONTROL_NONCE" 2>&1
+  )"; then
+    printf '%s\n' "$output" >&2
+    case "$output" in
+      *"strict hash verification failed"*) HERMES_RESTART_FAILURE_CODE=hash-mismatch ;;
+    esac
+    # The guard normally rolls back failures it owns. If rollback itself was
+    # interrupted, recover only a state whose cryptographic token is this
+    # request nonce. A concurrent config/shields transaction has a different
+    # token and must never be unsealed or used as authority to stop the healthy
+    # gateway.
+    original_failure_code="$HERMES_RESTART_FAILURE_CODE"
+    if owner_output="$(
+      ${_HERMES_GUARD_TIMEOUT[@]+"${_HERMES_GUARD_TIMEOUT[@]}"} "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" inspect-mutation-owner \
+        --hermes-dir "$HERMES_DIR" \
+        --state-file "$HERMES_RESTART_SEAL_STATE" \
+        --lock-token "$GATEWAY_CONTROL_NONCE" 2>&1
+    )"; then
+      case "$owner_output" in
+        *"token_match=1"*)
+          case "$owner_output" in
+            *"original_locked=1"*) HERMES_RESTART_ORIGINAL_LOCKED=1 ;;
+            *) HERMES_RESTART_ORIGINAL_LOCKED=0 ;;
+          esac
+          HERMES_RESTART_SEALED=1
+          if unseal_hermes_restart_inputs; then
+            HERMES_RESTART_FAILURE_CODE="$original_failure_code"
+          fi
+          return 1
+          ;;
+      esac
+    else
+      printf '%s\n' "$owner_output" >&2
+    fi
+    restore_hermes_runtime_traps
+    return 1
+  fi
+  case "$output" in
+    *"original_locked=1"*) HERMES_RESTART_ORIGINAL_LOCKED=1 ;;
+    *) HERMES_RESTART_ORIGINAL_LOCKED=0 ;;
+  esac
+  HERMES_RESTART_SEALED=1
+}
+
+unseal_hermes_restart_inputs() {
+  local output
+  if [ "$HERMES_RESTART_SEALED" -ne 1 ] && [ ! -e "$HERMES_RESTART_SEAL_STATE" ]; then
+    return 0
+  fi
+  if [ "$HERMES_RESTART_UNSEALING" -eq 1 ]; then
+    HERMES_RESTART_FAILURE_CODE=unsafe-config
+    return 1
+  fi
+  HERMES_RESTART_UNSEALING=1
+  trap 'HERMES_RESTART_SIGNAL_PENDING=1' SIGTERM SIGINT HUP
+  if ! output="$(
+    ${_HERMES_GUARD_TIMEOUT[@]+"${_HERMES_GUARD_TIMEOUT[@]}"} "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" unseal-restart \
+      --hermes-dir "$HERMES_DIR" \
+      --state-file "$HERMES_RESTART_SEAL_STATE" 2>&1
+  )"; then
+    printf '%s\n' "$output" >&2
+    HERMES_RESTART_FAILURE_CODE=unsafe-config
+    HERMES_RESTART_UNSEALING=0
+    trap hermes_restart_cleanup_on_signal SIGTERM SIGINT HUP
+    if [ "$HERMES_RESTART_SIGNAL_PENDING" -eq 1 ]; then
+      # Do not recursively retry an unseal that just failed. Retain the token,
+      # clear the EXIT retry, and honor the deferred stop signal fail-closed.
+      HERMES_RESTART_SIGNAL_PENDING=0
+      trap - EXIT HUP TERM INT
+      refresh_hermes_supervised_child_pids
+      hermes_cleanup_on_signal
+    fi
+    return 1
+  fi
+  HERMES_RESTART_SEALED=0
+  HERMES_RESTART_UNSEALING=0
+  restore_hermes_runtime_traps
+  if [ "$HERMES_RESTART_SIGNAL_PENDING" -eq 1 ]; then
+    HERMES_RESTART_SIGNAL_PENDING=0
+    hermes_cleanup_on_signal
+  fi
+}
+
+stop_hermes_gateway_fail_closed() {
+  if ! hermes_stop_tracked_role gateway "${GATEWAY_PID:-0}" gateway "$INTERNAL_PORT"; then
+    echo "[CRITICAL] Hermes gateway revocation could not prove and stop the tracked child; exiting PID 1 for whole-container cleanup without signaling the unproven PID" >&2
+    exit 1
+  fi
+  mark_hermes_gateway_stopped
+}
+
+hermes_restart_seal_orphaned() {
+  local marker_meta
+  local sandbox_meta
+
+  [ ! -e "$HERMES_RESTART_SEAL_STATE" ] || return 1
+  marker_meta="$(stat -c '%u:%g %a' "$HERMES_RESTART_ORPHAN_MARKER" 2>/dev/null || true)"
+  sandbox_meta="$(stat -c '%u:%g %a' /sandbox 2>/dev/null || true)"
+  # Mutable mode keeps /sandbox sandbox-owned. Locked mode deliberately uses
+  # root:sandbox with the sticky bit so the sandbox user cannot rename the
+  # root-owned .hermes entry. Only an in-flight transaction uses root:root;
+  # that remains the durable discriminator when `/run` recovery state is lost.
+  case "$marker_meta" in
+    "0:0 400") ;;
+    *)
+      case "$sandbox_meta" in
+        "0:0 "*) ;;
+        *) return 1 ;;
+      esac
+      ;;
+  esac
+
+  # Hash validation only enriches the diagnostic. Never let missing/partial
+  # child seal state turn the recognized orphan transaction into normal start.
+  if ! verify_hermes_config_integrity; then
+    echo "[SECURITY] Orphaned Hermes restart seal also failed strict hash validation" >&2
+  fi
+  return 0
+}
+
+resume_startup_hermes_shields_lock() {
+  local result_file
+  local begin_output
+  local lock_token
+
+  result_file="$(mktemp "$(dirname "$HERMES_RESTART_SEAL_STATE")/hermes-shields-resume.XXXXXX")" || return 1
+  chmod 600 "$result_file" || {
+    rm -f "$result_file"
+    return 1
+  }
+  # These guard calls must remain direct PID 1 children. The internal Python
+  # alarm is their deadline; the recursive helper is separately wrapped by the
+  # container-side timeout because it has no startup-owner parent contract.
+  if ! "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" begin-shields-transition \
+    --hermes-dir "$HERMES_DIR" \
+    --hash-file "$HERMES_HASH_FILE" \
+    --state-file "$HERMES_RESTART_SEAL_STATE" \
+    --shields-mode locked \
+    --startup-owner >"$result_file"; then
+    rm -f "$result_file"
+    return 1
+  fi
+  IFS= read -r begin_output <"$result_file" || begin_output=""
+  rm -f "$result_file"
+  case "$begin_output" in
+    lock_token=*" original_locked="[01])
+      lock_token="${begin_output#lock_token=}"
+      lock_token="${lock_token%% *}"
+      ;;
+    *)
+      echo "[SECURITY] Invalid Hermes shields resume response" >&2
+      return 1
+      ;;
+  esac
+  if [ "${#lock_token}" -ne 64 ]; then
+    echo "[SECURITY] Invalid Hermes shields resume token" >&2
+    return 1
+  fi
+  case "$lock_token" in
+    *[!0-9a-f]*)
+      echo "[SECURITY] Invalid Hermes shields resume token" >&2
+      return 1
+      ;;
+  esac
+
+  "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" run-state-dir-transition \
+    --hermes-dir "$HERMES_DIR" \
+    --state-file "$HERMES_RESTART_SEAL_STATE" \
+    --state-action lock \
+    --lock-token "$lock_token" \
+    --startup-owner || return 1
+  "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" apply-shields-transition \
+    --hermes-dir "$HERMES_DIR" \
+    --state-file "$HERMES_RESTART_SEAL_STATE" \
+    --lock-token "$lock_token" \
+    --startup-owner >/dev/null || return 1
+  "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" finish-shields-transition \
+    --hermes-dir "$HERMES_DIR" \
+    --hash-file "$HERMES_HASH_FILE" \
+    --state-file "$HERMES_RESTART_SEAL_STATE" \
+    --lock-token "$lock_token" \
+    --startup-owner >/dev/null
+}
+
+recover_startup_hermes_mutation() {
+  local attempts=0
+  local owner_output
+
+  while [ -e "$HERMES_CONFIG_MUTATION_LOCK" ] || [ -e "$HERMES_RESTART_SEAL_STATE" ]; do
+    if ! owner_output="$(
+      ${_HERMES_GUARD_TIMEOUT[@]+"${_HERMES_GUARD_TIMEOUT[@]}"} "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" inspect-mutation-owner \
+        --hermes-dir "$HERMES_DIR" \
+        --state-file "$HERMES_RESTART_SEAL_STATE" 2>&1
+    )"; then
+      printf '%s\n' "$owner_output" >&2
+      return 1
+    fi
+
+    case "$owner_output" in
+      *"resumable_lock=1"*)
+        if resume_startup_hermes_shields_lock; then
+          echo "[security] Resumed interrupted Hermes shields lock before startup" >&2
+          attempts=0
+          continue
+        fi
+        echo "[SECURITY] HERMES_SHIELDS_RESUME_PENDING: the root-only shields clamp remains active; retry sandbox startup after the recursive guard can complete" >&2
+        return 1
+        ;;
+    esac
+
+    case "$owner_output" in
+      *"owner_active=1"*)
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 300 ]; then
+          echo "[SECURITY] HERMES_CONFIG_MUTATION_BUSY: a root config transaction is still active; retry sandbox startup after it finishes" >&2
+          return 1
+        fi
+        sleep 0.1
+        continue
+        ;;
+    esac
+
+    case "$owner_output" in
+      *"state=1"*)
+        case "$owner_output" in
+          *"recovery_safe=0"*)
+            echo "[SECURITY] HERMES_CONFIG_MUTATION_ORPHANED: an interrupted shields transition is sealed fail-closed; restore from a trusted backup and recreate the sandbox (an in-place rebuild cannot read the sealed state)" >&2
+            return 1
+            ;;
+        esac
+        # The recorded owner is gone. Recovery is now exclusively owned by PID
+        # 1; restore the exact metadata/digest transaction before startup reads
+        # any mutable Hermes path.
+        HERMES_RESTART_SEALED=1
+        install_hermes_restart_seal_traps
+        unseal_hermes_restart_inputs || return 1
+        ;;
+      *"lock=1"*)
+        if "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" recover-prestate-lock \
+          --hermes-dir "$HERMES_DIR" \
+          --state-file "$HERMES_RESTART_SEAL_STATE" \
+          --startup-owner >/dev/null; then
+          echo "[security] Removed a dead Hermes pre-state mutation lock" >&2
+          attempts=0
+          continue
+        fi
+        echo "[SECURITY] HERMES_CONFIG_MUTATION_ORPHANED: mutation lock recovery failed; retry startup or restore from a trusted backup" >&2
+        return 1
+        ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+hermes_socat_bridge_healthy() {
+  local role="$1"
+  local pid="$2"
+  local port="$3"
+  hermes_tracked_role_is_current "$role" "$pid" current "$port" || return 1
+  gateway_control_pid_owns_tcp_listener "$pid" "$port"
+}
+
+hermes_api_socat_bridge_healthy() {
+  local pid="$1"
+  local port="$2"
+  local code
+  hermes_socat_bridge_healthy api-socat "$pid" "$port" || return 1
+  # A listener-owning socat parent can survive a gateway SIGUSR1 replacement
+  # while its relay path no longer reaches the replacement. Validate the same
+  # public HTTP path clients use so the managed supervisor repairs that stale
+  # bridge instead of treating its listener as sufficient proof of health.
+  code="$(curl -so /dev/null -w '%{http_code}' --max-time 2 \
+    "http://127.0.0.1:${port}/health" 2>/dev/null || echo 000)"
+  case "$code" in
+    200 | 401) hermes_socat_bridge_healthy api-socat "$pid" "$port" ;;
+    *) return 1 ;;
+  esac
+}
+
+hermes_dashboard_healthy() {
+  local pid="$1"
+  local code
+  local service_user=current
+  [ "$(id -u)" -eq 0 ] && service_user=sandbox
+  hermes_tracked_role_is_current dashboard "$pid" "$service_user" "$DASHBOARD_INTERNAL_PORT" || return 1
+  hermes_tracked_service_owns_listener "$pid" "$DASHBOARD_INTERNAL_PORT" sandbox || return 1
+  code="$(curl -so /dev/null -w '%{http_code}' --max-time 3 \
+    "http://127.0.0.1:${DASHBOARD_INTERNAL_PORT}/" 2>/dev/null || true)"
+  case "$code" in
+    200 | 301 | 302 | 307 | 308) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+hermes_auxiliaries_need_recovery() {
+  hermes_api_socat_bridge_healthy "${SOCAT_PID:-}" "$PUBLIC_PORT" || return 0
+  hermes_dashboard_healthy "${DASHBOARD_PID:-}" || return 0
+  hermes_socat_bridge_healthy dashboard-socat "${DASHBOARD_SOCAT_PID:-}" "$DASHBOARD_PUBLIC_PORT" || return 0
+  return 1
+}
+
+cleanup_sealed_hermes_gateway_runtime() {
+  # shellcheck disable=SC2016  # positional args expand in the stepped-down shell
+  "${STEP_DOWN_PREFIX_GATEWAY[@]}" sh -c '
+    rm -f "$1/runtime/gateway.pid" "$1/runtime/gateway.lock"
+  ' sh "$HERMES_DIR"
+}
+
+launch_hermes_gateway() {
+  # This function is called from an `if ! ...` recovery branch, where Bash
+  # disables errexit throughout the function call. Propagate every security-
+  # sensitive preparation failure explicitly before creating a child.
+  apply_shields_up_runtime_env || return 1
+  if [ "$HERMES_RESTART_SEALED" -ne 1 ]; then
+    cleanup_stale_hermes_gateway_runtime || return 1
+  fi
+  HERMES_HOME="${HERMES_DIR}" \
+    nohup "${STEP_DOWN_PREFIX_GATEWAY[@]}" sh -c \
+    'umask 0007; exec "$@" >>/tmp/gateway.log 2>&1' sh "$HERMES" gateway run &
+  GATEWAY_PID=$!
+  if ! hermes_capture_tracked_role gateway "$GATEWAY_PID" gateway "$INTERNAL_PORT"; then
+    hermes_fatal_unproven_child gateway "$GATEWAY_PID"
+  fi
+  # shellcheck disable=SC2034  # read by cleanup_on_signal from sandbox-init.sh
+  SANDBOX_WAIT_PID="$GATEWAY_PID"
+  echo "[gateway] hermes gateway launched as 'gateway' user (pid $GATEWAY_PID)" >&2
+}
+
+ensure_hermes_supervised_auxiliaries() {
+  local gateway_user=current
+  local dashboard_user=current
+  if [ "$(id -u)" -eq 0 ]; then
+    gateway_user=gateway
+    dashboard_user=sandbox
+  fi
+
+  # Structural identity/listener loss requires exact relay replacement. A
+  # transient public HTTP miss does not: forked socat accepts each request on
+  # a fresh backend connection, so churning its proven listener can prolong
+  # the outage while the replacement gateway is still settling. Preserve the
+  # exact parent and let the supervised recovery loop retry readiness instead.
+  if ! hermes_socat_bridge_healthy api-socat "${SOCAT_PID:-}" "$PUBLIC_PORT"; then
+    hermes_stop_tracked_role api-socat "${SOCAT_PID:-0}" current "$PUBLIC_PORT" || return 1
+    SOCAT_PID=""
+    start_socat_forwarder \
+      "$PUBLIC_PORT" "$INTERNAL_PORT" "API" SOCAT_PID "$GATEWAY_PID" "$gateway_user" || return 1
+  fi
+  hermes_api_socat_bridge_healthy "$SOCAT_PID" "$PUBLIC_PORT" || return 1
+  if ! hermes_dashboard_healthy "${DASHBOARD_PID:-}"; then
+    # A live PID is not sufficient: it may be reused, alive without the exact
+    # dashboard listener, or serving a wedged HTTP process. Stop both tracked
+    # children before relaunch so the replacement cannot lose either bind race.
+    hermes_stop_tracked_role dashboard-socat "${DASHBOARD_SOCAT_PID:-0}" current "$DASHBOARD_PUBLIC_PORT" || return 1
+    DASHBOARD_SOCAT_PID=""
+    hermes_stop_tracked_role dashboard "${DASHBOARD_PID:-0}" "$dashboard_user" "$DASHBOARD_INTERNAL_PORT" || return 1
+    DASHBOARD_PID=""
+    if [ "$(id -u)" -eq 0 ]; then
+      start_hermes_dashboard_sandbox_user || return 1
+    else
+      start_hermes_dashboard_current_user || return 1
+    fi
+  elif ! hermes_socat_bridge_healthy dashboard-socat "${DASHBOARD_SOCAT_PID:-}" "$DASHBOARD_PUBLIC_PORT"; then
+    hermes_stop_tracked_role dashboard-socat "${DASHBOARD_SOCAT_PID:-0}" current "$DASHBOARD_PUBLIC_PORT" || return 1
+    DASHBOARD_SOCAT_PID=""
+    start_socat_forwarder \
+      "$DASHBOARD_PUBLIC_PORT" "$DASHBOARD_INTERNAL_PORT" "dashboard" DASHBOARD_SOCAT_PID \
+      "$DASHBOARD_PID" "$dashboard_user" || return 1
+  fi
+  ensure_dashboard_log_stream || return 1
+  ensure_gateway_log_stream || return 1
+}
+
+refresh_hermes_supervised_child_pids() {
+  local gateway_user=current
+  local dashboard_user=current
+  SANDBOX_CHILD_PIDS=()
+  if [ "$(id -u)" -eq 0 ]; then
+    gateway_user=gateway
+    dashboard_user=sandbox
+  fi
+  hermes_tracked_role_is_current gateway "${GATEWAY_PID:-}" "$gateway_user" "$INTERNAL_PORT" \
+    && SANDBOX_CHILD_PIDS+=("$GATEWAY_PID")
+  hermes_tracked_role_is_current dashboard "${DASHBOARD_PID:-}" "$dashboard_user" "$DASHBOARD_INTERNAL_PORT" \
+    && SANDBOX_CHILD_PIDS+=("$DASHBOARD_PID")
+  hermes_tracked_role_is_current api-socat "${SOCAT_PID:-}" current "$PUBLIC_PORT" \
+    && SANDBOX_CHILD_PIDS+=("$SOCAT_PID")
+  hermes_tracked_role_is_current dashboard-socat "${DASHBOARD_SOCAT_PID:-}" current "$DASHBOARD_PUBLIC_PORT" \
+    && SANDBOX_CHILD_PIDS+=("$DASHBOARD_SOCAT_PID")
+  hermes_tracked_role_is_current gateway-log "${GATEWAY_LOG_TAIL_PID:-}" current \
+    && SANDBOX_CHILD_PIDS+=("$GATEWAY_LOG_TAIL_PID")
+  hermes_tracked_role_is_current dashboard-log "${DASHBOARD_LOG_TAIL_PID:-}" current \
+    && SANDBOX_CHILD_PIDS+=("$DASHBOARD_LOG_TAIL_PID")
+  # Each tracked child can be absent while a service is replaced. Return success
+  # so `set -e` callers can launch the replacement gateway.
+  return 0
+}
+
+hermes_cleanup_on_signal() {
+  local gateway_user=current
+  [ "$(id -u)" -eq 0 ] && gateway_user=gateway
+  refresh_hermes_supervised_child_pids
+  if ! hermes_tracked_role_is_current gateway "${GATEWAY_PID:-}" "$gateway_user" "$INTERNAL_PORT"; then
+    # The shared cleanup helper must never wait on or signal a PID that has
+    # been reused/adopted since NemoClaw captured the gateway start identity.
+    SANDBOX_WAIT_PID=""
+  fi
+  cleanup_on_signal
+}
+
+mark_hermes_gateway_stopped() {
+  GATEWAY_PID=0
+  GATEWAY_PID_START_IDENTITY=""
+  # shellcheck disable=SC2034  # read by cleanup_on_signal from sandbox-init.sh
+  SANDBOX_WAIT_PID=""
+  refresh_hermes_supervised_child_pids
+}
+
+hermes_reap_exited_gateway() {
+  local pid="${GATEWAY_PID:-0}"
+  local expected_start_identity="${GATEWAY_PID_START_IDENTITY:-}"
+  local current_start_identity state
+  local rc=0
+  case "$pid" in
+    '' | 0 | 1 | *[!0-9]*) return 1 ;;
+  esac
+  [ -n "$expected_start_identity" ] || return 1
+
+  current_start_identity="$(hermes_process_start_identity "$pid" 2>/dev/null || true)"
+  if [ -n "$current_start_identity" ] \
+    && [ "$current_start_identity" != "$expected_start_identity" ]; then
+    echo "[SECURITY] Hermes gateway pid $pid no longer matches its captured start identity; refusing to poll or reap it" >&2
+    return 2
+  fi
+
+  # kill -0 also succeeds for zombies. Only the exact matching zombie is safe
+  # to reap. A live process, or one whose state/identity cannot be proven, must
+  # not send PID 1 into an unbounded wait or let an interrupted wait forget a
+  # still-running gateway.
+  if kill -0 "$pid" 2>/dev/null; then
+    state="$(gateway_control_pid_state "$pid" 2>/dev/null || true)"
+    case "$state" in
+      Z*) [ "$current_start_identity" = "$expected_start_identity" ] || return 2 ;;
+      *)
+        if [ "${GATEWAY_CONTROL_SIGNAL_PENDING:-0}" -eq 1 ] \
+          && hermes_tracked_role_is_current gateway "$pid" gateway "$INTERNAL_PORT"; then
+          return 3
+        fi
+        echo "[SECURITY] Hermes gateway pid $pid cannot be proven exited with its captured role identity; refusing to reap it" >&2
+        return 2
+        ;;
+    esac
+  fi
+
+  # If the proc entry is already gone, Bash's child-status table keeps this
+  # wait scoped to the original direct child rather than an unrelated PID.
+  wait "$pid" 2>/dev/null || rc=$?
+  # USR1 may interrupt wait before it reaps the exact child. Preserve the
+  # tracked identity and let the authenticated request handler own the child.
+  if [ "${GATEWAY_CONTROL_SIGNAL_PENDING:-0}" -eq 1 ] \
+    && hermes_tracked_role_is_current gateway "$pid" gateway "$INTERNAL_PORT"; then
+    return 3
+  fi
+  echo "[gateway] Hermes gateway pid $pid exited (rc=$rc); awaiting host recovery" >&2
+  mark_hermes_gateway_stopped
+}
+
+handle_hermes_gateway_control_request() {
+  gateway_control_take_request || return 1
+  local old_pid="${GATEWAY_PID:-0}"
+  local failure_code
+
+  if [ "$GATEWAY_CONTROL_ACTION" = "probe" ]; then
+    if ! prepare_hermes_gateway_restart; then
+      gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+      return 1
+    fi
+    if [ "$HERMES_MCP_RECONCILE_PENDING" -eq 1 ]; then
+      gateway_control_fail mcp-reconcile-required "$old_pid"
+      return 1
+    fi
+    if ! gateway_control_pid_is_live "$old_pid" \
+      || ! hermes_gateway_healthy "$old_pid" \
+      || hermes_auxiliaries_need_recovery; then
+      gateway_control_fail health-timeout "$old_pid"
+      return 1
+    fi
+    gateway_control_complete already-running "$old_pid" "$old_pid"
+    return 0
+  fi
+
+  if [ "$GATEWAY_CONTROL_ACTION" = "recover" ] \
+    && gateway_control_pid_is_live "$old_pid" \
+    && hermes_gateway_healthy "$old_pid"; then
+    # Recovery may also recreate the dashboard from the shared Hermes config.
+    # Verify the root-owned trust anchor before any auxiliary consumes it; a
+    # healthy gateway is not authority to bless direct sandbox config drift.
+    if ! prepare_hermes_gateway_restart; then
+      if hermes_restart_failure_revokes_gateway "$HERMES_RESTART_FAILURE_CODE"; then
+        stop_hermes_gateway_fail_closed
+      fi
+      gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+      return 1
+    fi
+    if [ "$HERMES_MCP_RECONCILE_PENDING" -eq 0 ]; then
+      if hermes_auxiliaries_need_recovery; then
+        if ! seal_hermes_restart_inputs; then
+          if [ "$HERMES_RESTART_SEALED" -eq 1 ]; then
+            stop_hermes_gateway_fail_closed
+          fi
+          gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+          return 1
+        fi
+        # Re-run boundary + hash validation against the fresh sealed inodes. A
+        # pre-open attacker fd cannot change these pathnames after this point.
+        if ! prepare_hermes_gateway_restart; then
+          failure_code="$HERMES_RESTART_FAILURE_CODE"
+          if hermes_restart_failure_revokes_gateway "$failure_code"; then
+            # A post-seal boundary refusal means the currently running service no
+            # longer has a boundary we can prove safe. Stop it even if metadata
+            # restoration subsequently fails.
+            stop_hermes_gateway_fail_closed
+          fi
+          if ! unseal_hermes_restart_inputs; then
+            gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+            return 1
+          fi
+          gateway_control_fail "$failure_code" "$old_pid"
+          return 1
+        fi
+        if ! ensure_hermes_supervised_auxiliaries; then
+          if ! unseal_hermes_restart_inputs; then
+            stop_hermes_gateway_fail_closed
+            gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+          else
+            gateway_control_fail launch-failed "$old_pid"
+          fi
+          refresh_hermes_supervised_child_pids
+          return 1
+        fi
+        if ! unseal_hermes_restart_inputs; then
+          stop_hermes_gateway_fail_closed
+          gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+          return 1
+        fi
+      fi
+      refresh_hermes_supervised_child_pids
+      gateway_control_complete already-running "$old_pid" "$old_pid"
+      return 0
+    fi
+  fi
+
+  if ! prepare_hermes_gateway_restart; then
+    if hermes_restart_failure_revokes_gateway "$HERMES_RESTART_FAILURE_CODE"; then
+      stop_hermes_gateway_fail_closed
+    fi
+    gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+    return 1
+  fi
+
+  # Seal and revalidate while the old gateway is still healthy. A seal failure
+  # must not turn a rejected config into an avoidable outage.
+  if ! seal_hermes_restart_inputs; then
+    if [ "$HERMES_RESTART_SEALED" -eq 1 ]; then
+      stop_hermes_gateway_fail_closed
+    fi
+    gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+    return 1
+  fi
+  if ! prepare_hermes_gateway_restart; then
+    failure_code="$HERMES_RESTART_FAILURE_CODE"
+    if hermes_restart_failure_revokes_gateway "$failure_code"; then
+      # Do not leave the old gateway alive after a boundary refusal merely
+      # because restoring the restart seal also fails.
+      stop_hermes_gateway_fail_closed
+    fi
+    if ! unseal_hermes_restart_inputs; then
+      gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+      return 1
+    fi
+    gateway_control_fail "$failure_code" "$old_pid"
+    return 1
+  fi
+
+  if ! hermes_stop_tracked_role gateway "$old_pid" gateway "$INTERNAL_PORT"; then
+    if ! unseal_hermes_restart_inputs; then
+      gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+    else
+      gateway_control_fail internal "$old_pid"
+    fi
+    return 1
+  fi
+  mark_hermes_gateway_stopped
+
+  if ! cleanup_sealed_hermes_gateway_runtime; then
+    if ! unseal_hermes_restart_inputs; then
+      gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+    else
+      gateway_control_fail unsafe-config "$old_pid"
+    fi
+    return 1
+  fi
+
+  if ! launch_hermes_gateway || ! wait_for_hermes_gateway_internal "$GATEWAY_PID"; then
+    stop_hermes_gateway_fail_closed
+    if ! unseal_hermes_restart_inputs; then
+      gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+    else
+      gateway_control_fail health-timeout "$old_pid"
+    fi
+    return 1
+  fi
+  if ! ensure_hermes_supervised_auxiliaries; then
+    refresh_hermes_supervised_child_pids
+    if ! unseal_hermes_restart_inputs; then
+      stop_hermes_gateway_fail_closed
+      gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+    else
+      gateway_control_fail launch-failed "$old_pid"
+    fi
+    return 1
+  fi
+  if ! unseal_hermes_restart_inputs; then
+    stop_hermes_gateway_fail_closed
+    gateway_control_fail "$HERMES_RESTART_FAILURE_CODE" "$old_pid"
+    return 1
+  fi
+  if ! commit_hermes_mcp_applied_if_pending; then
+    stop_hermes_gateway_fail_closed
+    gateway_control_fail mcp-integrity "$old_pid"
+    return 1
+  fi
+  refresh_hermes_supervised_child_pids
+  nemoclaw_runtime_state_mutation_checkpoint || {
+    stop_hermes_gateway_fail_closed
+    gateway_control_fail internal "$old_pid"
+    return 1
+  }
+  gateway_control_complete ok "$old_pid" "$GATEWAY_PID"
+}
+
+prepare_hermes_nonroot_runtime() {
+  if ! verify_config_integrity_if_locked "${HERMES_DIR}"; then
+    echo "[SECURITY] Config integrity check failed — refusing to start (non-root mode)" >&2
+    return 1
+  fi
+  # Classify raw .env material at its dedicated boundary before the MCP
+  # integrity guard authenticates the full config/env snapshot. Otherwise a
+  # mutable default with a raw secret fails as generic MCP drift and bypasses
+  # the actionable, redacted secret-boundary refusal. Repeat after the trusted
+  # startup mutations below so their outputs remain covered as well.
+  validate_hermes_env_secret_boundary || return 1
+  # The non-root Hermes runtime can persist safe config/env changes while it is
+  # running. Reconcile that mutable compatibility anchor only after the secret
+  # boundary is valid; refresh-hashes still requires the recorded MCP intent to
+  # match exactly before it advances the anchor.
+  refresh_hermes_runtime_config_hashes compat || return 1
+  inspect_hermes_mcp_integrity "${HERMES_DIR}/.config-hash" || return 1
+  prepare_hermes_lazy_dependencies || return 1
+  ensure_hermes_runtime_api_server_key compat || return 1
+  apply_shields_up_runtime_env || return 1
+  validate_hermes_env_secret_boundary || return 1
+  validate_hermes_runtime_env_secret_boundary || return 1
+  refresh_hermes_provider_placeholders compat || return 1
+  refresh_hermes_runtime_config_hashes compat || return 1
+  inspect_hermes_mcp_integrity "${HERMES_DIR}/.config-hash" || return 1
+  configure_messaging_channels || return 1
+  prepare_tirith_marker_retry || return 1
+}
+
+prepare_hermes_root_runtime_dir() {
+  local runtime_metadata
+  if [ -L "$HERMES_RUNTIME_DIR" ]; then
+    echo "[SECURITY] Refusing Hermes startup because $HERMES_RUNTIME_DIR is a symbolic link" >&2
+    return 1
+  fi
+  if [ ! -e "$HERMES_RUNTIME_DIR" ]; then
+    install -d -m 0755 -o root -g root -- "$HERMES_RUNTIME_DIR" || {
+      echo "[SECURITY] Refusing Hermes startup because $HERMES_RUNTIME_DIR could not be created safely" >&2
+      return 1
+    }
+  fi
+  if [ ! -d "$HERMES_RUNTIME_DIR" ] || [ -L "$HERMES_RUNTIME_DIR" ]; then
+    echo "[SECURITY] Refusing Hermes startup because $HERMES_RUNTIME_DIR is not a real directory" >&2
+    return 1
+  fi
+  runtime_metadata="$(stat -c '%u:%g:%a' -- "$HERMES_RUNTIME_DIR" 2>/dev/null)" || {
+    echo "[SECURITY] Refusing Hermes startup because $HERMES_RUNTIME_DIR metadata is unavailable" >&2
+    return 1
+  }
+  if [ "$runtime_metadata" != "0:0:755" ]; then
+    # The managed runtime can present this directory before the root-separated
+    # gateway starts. Restore the trust boundary from root, and refuse when the
+    # restore is not permitted.
+    chown root:root -- "$HERMES_RUNTIME_DIR" 2>/dev/null
+    chmod 0755 -- "$HERMES_RUNTIME_DIR" 2>/dev/null
+    runtime_metadata="$(stat -c '%u:%g:%a' -- "$HERMES_RUNTIME_DIR" 2>/dev/null)" || runtime_metadata=""
+  fi
+  if [ "$runtime_metadata" != "0:0:755" ]; then
+    echo "[SECURITY] Refusing Hermes startup because $HERMES_RUNTIME_DIR must be root-owned with mode 0755" >&2
+    return 1
+  fi
+  return 0
+}
+
+publish_hermes_root_runtime_marker() {
+  local marker_name="$1"
+  local marker_value="$2"
+  local marker_path temporary_marker
+  case "$marker_name" in
+    '' | *[!A-Za-z0-9_-]*)
+      echo "[SECURITY] Refusing Hermes startup because the runtime marker name is invalid" >&2
+      return 1
+      ;;
+  esac
+  prepare_hermes_root_runtime_dir || return 1
+  marker_path="${HERMES_RUNTIME_DIR}/${marker_name}"
+  temporary_marker="$(mktemp "${HERMES_RUNTIME_DIR}/.${marker_name}.XXXXXX")" || {
+    echo "[SECURITY] Refusing Hermes startup because ${marker_path} could not be prepared" >&2
+    return 1
+  }
+  if ! printf '%s\n' "$marker_value" >"$temporary_marker" \
+    || ! chown root:root "$temporary_marker" \
+    || ! chmod 0444 "$temporary_marker" \
+    || ! mv -f -- "$temporary_marker" "$marker_path"; then
+    rm -f -- "$temporary_marker"
+    echo "[SECURITY] Refusing Hermes startup because ${marker_path} could not be published atomically" >&2
+    return 1
+  fi
+}
+
+prepare_hermes_root_runtime() {
+  verify_hermes_config_integrity || return 1
+  prepare_hermes_lazy_dependencies || return 1
+  ensure_hermes_config_root_mode || return 1
+  ensure_hermes_runtime_api_server_key both || return 1
+  apply_shields_up_runtime_env || return 1
+  validate_hermes_env_secret_boundary || return 1
+  validate_hermes_runtime_env_secret_boundary || return 1
+  refresh_hermes_provider_placeholders both || return 1
+  configure_messaging_channels || return 1
+  prepare_tirith_marker_retry || return 1
+}
+
+launch_hermes_gateway_current_user() {
+  cleanup_stale_hermes_gateway_runtime || return 1
+  HERMES_HOME="${HERMES_DIR}" \
+    nohup "$HERMES" gateway run >>/tmp/gateway.log 2>&1 &
+  GATEWAY_PID=$!
+  if ! hermes_capture_tracked_role gateway "$GATEWAY_PID" current "$INTERNAL_PORT"; then
+    hermes_fatal_unproven_child gateway "$GATEWAY_PID"
+  fi
+  # shellcheck disable=SC2034  # read by cleanup_on_signal from sandbox-init.sh
+  SANDBOX_WAIT_PID="$GATEWAY_PID"
+  echo "[gateway] hermes gateway launched (pid $GATEWAY_PID)" >&2
+}
+
+HERMES_MANAGED_GATEWAY_EXIT_TIMES=()
+HERMES_MANAGED_GATEWAY_EXIT_COUNT=0
+readonly HERMES_MANAGED_EXPECTED_EXIT_DIR="/run/nemoclaw"
+readonly HERMES_MANAGED_EXPECTED_EXIT_MARKER="managed-gateway-expected-exit"
+readonly HERMES_MANAGED_CONTROLLER_PATH="/usr/local/lib/nemoclaw/managed-gateway-control.py"
+
+quarantine_hermes_managed_gateway_relaunch() {
+  while :; do
+    sleep 60 || true
+  done
+}
+
+hermes_managed_controller_argv_is_expected() {
+  [ "$#" -eq 5 ] || return 1
+  case "${1##*/}" in
+    python3) ;;
+    *) return 1 ;;
+  esac
+  [ "$2" = "-I" ] && [ "$3" = "$HERMES_MANAGED_CONTROLLER_PATH" ] || return 1
+  case "$4" in
+    restart | recover) ;;
+    *) return 1 ;;
+  esac
+  case "$5" in
+    '' | *[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#5}" -eq 64 ]
+}
+
+hermes_managed_controller_is_live() {
+  local pid="$1"
+  local expected_start_identity="$2"
+  local proc_root="${_HERMES_PROC_ROOT:-/proc}"
+  local first_start second_start first_state second_state first_uids second_uids
+  local -a first_argv=()
+  local -a second_argv=()
+
+  case "$pid" in
+    '' | 0 | 1 | *[!0-9]*) return 1 ;;
+  esac
+  case "$expected_start_identity" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [ -r "${proc_root}/${pid}/status" ] \
+    && [ -r "${proc_root}/${pid}/cmdline" ] || return 1
+
+  first_start="$(gateway_control_pid_start_identity "$pid")" || return 1
+  first_state="$(gateway_control_pid_state "$pid")" || return 1
+  first_uids="$(awk '/^Uid:/ { print $2 ":" $3 ":" $4 ":" $5; exit }' "${proc_root}/${pid}/status")" || return 1
+  while IFS= read -r -d "" elem; do first_argv+=("$elem"); done <"${proc_root}/${pid}/cmdline" || return 1
+  hermes_managed_controller_argv_is_expected "${first_argv[@]}" || return 1
+
+  second_start="$(gateway_control_pid_start_identity "$pid")" || return 1
+  second_state="$(gateway_control_pid_state "$pid")" || return 1
+  second_uids="$(awk '/^Uid:/ { print $2 ":" $3 ":" $4 ":" $5; exit }' "${proc_root}/${pid}/status")" || return 1
+  while IFS= read -r -d "" elem; do second_argv+=("$elem"); done <"${proc_root}/${pid}/cmdline" || return 1
+  hermes_managed_controller_argv_is_expected "${second_argv[@]}" || return 1
+
+  [ "$first_start" = "$expected_start_identity" ] \
+    && [ "$second_start" = "$expected_start_identity" ] \
+    && [ "$first_uids" = "0:0:0:0" ] \
+    && [ "$second_uids" = "0:0:0:0" ] \
+    && [ "$first_state" != "Z" ] \
+    && [ "$second_state" != "Z" ] \
+    && [ "${first_argv[*]}" = "${second_argv[*]}" ]
+}
+
+hermes_managed_gateway_exit_was_host_authorized() {
+  local pid="$1"
+  local start_identity="$2"
+  local marker dir_metadata marker_metadata
+  local version marker_pid marker_start_identity controller_pid controller_start_identity extra
+  local trailing=""
+
+  case "$pid" in
+    '' | 0 | 1 | *[!0-9]*) return 1 ;;
+  esac
+  case "$start_identity" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+
+  [ -d "$HERMES_MANAGED_EXPECTED_EXIT_DIR" ] \
+    && [ ! -L "$HERMES_MANAGED_EXPECTED_EXIT_DIR" ] || return 1
+  dir_metadata="$(stat -c '%u:%g %a' "$HERMES_MANAGED_EXPECTED_EXIT_DIR" 2>/dev/null || true)"
+  [ "$dir_metadata" = "0:0 711" ] || return 1
+
+  marker="${HERMES_MANAGED_EXPECTED_EXIT_DIR}/${HERMES_MANAGED_EXPECTED_EXIT_MARKER}"
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  marker_metadata="$(stat -c '%u:%g %a %h' "$marker" 2>/dev/null || true)"
+  [ "$marker_metadata" = "0:0 444 1" ] || return 1
+
+  # bash 4.1+ named FDs ({var}<file) are not available on bash 3.2 (macOS).
+  # Use a grouped redirect instead — variables assigned inside {} remain in scope.
+  {
+    if ! IFS=' ' read -r \
+      version marker_pid marker_start_identity controller_pid controller_start_identity extra; then
+      return 1
+    fi
+    if IFS= read -r trailing || [ -n "$trailing" ]; then
+      return 1
+    fi
+  } <"$marker" || return 1
+
+  [ "$version" = "v1" ] \
+    && [ "$marker_pid" = "$pid" ] \
+    && [ "$marker_start_identity" = "$start_identity" ] \
+    && [ -z "${extra:-}" ] || return 1
+  case "$controller_pid" in
+    '' | 0 | 1 | *[!0-9]*) return 1 ;;
+  esac
+  case "$controller_start_identity" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  hermes_managed_controller_is_live "$controller_pid" "$controller_start_identity"
+}
+
+record_hermes_managed_gateway_exit() {
+  local now timestamp
+  local -a retained=()
+
+  now="$(date +%s)"
+  HERMES_MANAGED_GATEWAY_EXIT_TIMES+=("$now")
+  for timestamp in "${HERMES_MANAGED_GATEWAY_EXIT_TIMES[@]+"${HERMES_MANAGED_GATEWAY_EXIT_TIMES[@]}"}"; do
+    [ $((now - timestamp)) -le 60 ] && retained+=("$timestamp")
+  done
+  HERMES_MANAGED_GATEWAY_EXIT_TIMES=("${retained[@]+"${retained[@]}"}")
+  HERMES_MANAGED_GATEWAY_EXIT_COUNT=${#HERMES_MANAGED_GATEWAY_EXIT_TIMES[@]}
+  if [ "$HERMES_MANAGED_GATEWAY_EXIT_COUNT" -ge 5 ]; then
+    echo "[gateway] CRITICAL: $HERMES_MANAGED_GATEWAY_EXIT_COUNT exits in 60s window — Hermes relaunch is quarantined until sandbox recreation; check /tmp/gateway.log" >&2
+    quarantine_hermes_managed_gateway_relaunch
+    return 1
+  fi
+}
+
+recover_hermes_gateway_current_user() {
+  local replacement_reached_internal_health
+
+  while :; do
+    replacement_reached_internal_health=0
+    until prepare_hermes_nonroot_runtime; do
+      if [ "$HERMES_MCP_INTEGRITY_FAILED" -eq 1 ]; then
+        echo "[SECURITY] Hermes automatic respawn is quarantined until MCP integrity is restored by rebuilding the sandbox" >&2
+        quarantine_hermes_managed_gateway_relaunch
+        return 1
+      fi
+      echo "[gateway] Hermes runtime preparation refused automatic respawn; retrying in 5s" >&2
+      sleep 5 || true
+    done
+    if ! launch_hermes_gateway_current_user; then
+      echo "[gateway] Hermes gateway launch failed; retrying under the same supervisor" >&2
+      sleep 5 || true
+      continue
+    fi
+    if wait_for_hermes_gateway_internal "$GATEWAY_PID"; then
+      replacement_reached_internal_health=1
+      # The gateway and its socat relay are separate supervised children. A
+      # transient relay repair failure must not churn an internally healthy,
+      # identity-pinned replacement or charge that churn against the gateway
+      # crash budget. Retry only while the exact gateway remains healthy, and
+      # re-prove it after auxiliary repair before committing applied MCP state.
+      while hermes_tracked_role_is_current \
+        gateway "$GATEWAY_PID" current "$INTERNAL_PORT" \
+        && hermes_gateway_healthy "$GATEWAY_PID"; do
+        if ensure_hermes_supervised_auxiliaries; then
+          if ! hermes_tracked_role_is_current \
+            gateway "$GATEWAY_PID" current "$INTERNAL_PORT" \
+            || ! hermes_gateway_healthy "$GATEWAY_PID"; then
+            break
+          fi
+          finalize_tirith_marker_retry
+          if ! commit_hermes_mcp_applied_if_pending; then
+            echo "[SECURITY] HERMES_MCP_APPLIED_COMMIT_FAILED: stopping the uncommitted Hermes gateway" >&2
+            hermes_stop_tracked_role gateway "$GATEWAY_PID" current "$INTERNAL_PORT" || return 1
+            mark_hermes_gateway_stopped
+            return 1
+          fi
+          refresh_hermes_supervised_child_pids
+          nemoclaw_runtime_state_mutation_checkpoint || return 1
+          return 0
+        fi
+        echo "[gateway] Hermes auxiliary repair failed; retrying while the exact gateway remains healthy" >&2
+        sleep 1 || true
+      done
+    fi
+
+    if [ "$replacement_reached_internal_health" -eq 1 ]; then
+      echo "[gateway] Hermes replacement gateway lost its listener or health endpoint during auxiliary validation; stopping the exact child" >&2
+    else
+      echo "[gateway] Hermes replacement gateway failed listener or health validation; stopping the exact child" >&2
+    fi
+    if ! hermes_stop_tracked_role \
+      gateway "$GATEWAY_PID" current "$INTERNAL_PORT"; then
+      echo "[gateway] CRITICAL: exact Hermes replacement could not be stopped; managed supervisor is quarantined without another launch" >&2
+      quarantine_hermes_managed_gateway_relaunch
+      return 1
+    fi
+    mark_hermes_gateway_stopped
+    record_hermes_managed_gateway_exit || return 1
+    sleep 2 || true
+  done
+}
+
+supervise_hermes_gateway_current_user() {
+  local exited_gateway_pid exited_gateway_start_identity rc respawn_count unhealthy_streak=0
+
+  while :; do
+    # Keep one exact supervisor alive for the full managed OpenShell process
+    # tree and continuously repair its dashboard and internal relays.
+    while hermes_tracked_role_is_current gateway "$GATEWAY_PID" current "$INTERNAL_PORT"; do
+      if hermes_gateway_healthy "$GATEWAY_PID"; then
+        unhealthy_streak=0
+        if ! ensure_hermes_supervised_auxiliaries; then
+          echo "[gateway] Hermes auxiliary repair failed; retrying while the exact gateway remains supervised" >&2
+        fi
+      else
+        unhealthy_streak=$((unhealthy_streak + 1))
+        echo "[gateway] Hermes gateway failed health validation ($unhealthy_streak/4)" >&2
+        if [ "$unhealthy_streak" -ge 4 ]; then
+          echo "[gateway] CRITICAL: Hermes gateway lost its listener or health endpoint; stopping the exact child for recovery" >&2
+          if ! hermes_stop_tracked_role \
+            gateway "$GATEWAY_PID" current "$INTERNAL_PORT"; then
+            echo "[gateway] CRITICAL: unhealthy Hermes gateway could not be stopped; managed supervisor is quarantined without another launch" >&2
+            quarantine_hermes_managed_gateway_relaunch
+            return 1
+          fi
+          break
+        fi
+      fi
+      refresh_hermes_supervised_child_pids
+      sleep 1 || true
+    done
+
+    exited_gateway_pid="$GATEWAY_PID"
+    exited_gateway_start_identity="${GATEWAY_PID_START_IDENTITY:-}"
+    rc=0
+    wait "$GATEWAY_PID" 2>/dev/null || rc=$?
+    mark_hermes_gateway_stopped
+
+    if hermes_managed_gateway_exit_was_host_authorized \
+      "$exited_gateway_pid" "$exited_gateway_start_identity"; then
+      echo "[gateway] Hermes gateway pid $exited_gateway_pid exited (rc=$rc; authenticated host authorization); respawning without charging crash quarantine in 2s" >&2
+    else
+      record_hermes_managed_gateway_exit || return 1
+      respawn_count="$HERMES_MANAGED_GATEWAY_EXIT_COUNT"
+      echo "[gateway] Hermes gateway pid $exited_gateway_pid exited (rc=$rc); respawning (#$respawn_count in 60s window) in 2s" >&2
+    fi
+    sleep 2 || true
+
+    recover_hermes_gateway_current_user || return 1
+    unhealthy_streak=0
+    echo "[gateway] Hermes gateway respawned (pid $GATEWAY_PID)" >&2
+  done
+}
+
+bootstrap_hermes_gateway_current_user() {
+  launch_hermes_gateway_current_user || return 1
+  start_gateway_log_stream
+  refresh_hermes_supervised_child_pids
+  trap hermes_cleanup_on_signal SIGTERM SIGINT
+
+  if wait_for_hermes_gateway_internal "$GATEWAY_PID" \
+    && ensure_hermes_supervised_auxiliaries; then
+    finalize_tirith_marker_retry
+    if ! commit_hermes_mcp_applied_if_pending; then
+      echo "[SECURITY] HERMES_MCP_APPLIED_COMMIT_FAILED: stopping the uncommitted Hermes gateway" >&2
+      hermes_stop_tracked_role gateway "$GATEWAY_PID" current "$INTERNAL_PORT" || return 1
+      mark_hermes_gateway_stopped
+      return 1
+    fi
+    refresh_hermes_supervised_child_pids
+    nemoclaw_runtime_state_mutation_checkpoint || return 1
+    return 0
+  fi
+
+  echo "[gateway] Initial Hermes gateway failed health or auxiliary validation; stopping the exact child for supervised recovery" >&2
+  if ! hermes_stop_tracked_role \
+    gateway "$GATEWAY_PID" current "$INTERNAL_PORT"; then
+    echo "[gateway] CRITICAL: initial Hermes gateway could not be stopped; managed supervisor is quarantined without another launch" >&2
+    quarantine_hermes_managed_gateway_relaunch
+    return 1
+  fi
+  mark_hermes_gateway_stopped
+  record_hermes_managed_gateway_exit || return 1
+  sleep 2 || true
+  recover_hermes_gateway_current_user || return 1
+  refresh_hermes_supervised_child_pids
+  nemoclaw_runtime_state_mutation_checkpoint || return 1
 }
 
 # ── Main ─────────────────────────────────────────────────────────
+
+# A PID 1 interruption within the same container writable layer can leave the
+# root-only seal token behind. Restore it before any startup migration or config
+# read. `/run` is not persistent across container recreation, so recognize the
+# distinctive frozen parent + sealed-file posture when the token is gone and
+# require a rebuild instead of guessing the original ownership/mode/flags.
+if [ "$(id -u)" -eq 0 ]; then
+  recover_startup_hermes_mutation || exit 1
+  if hermes_restart_seal_orphaned; then
+    echo "[SECURITY] HERMES_RESTART_SEAL_ORPHANED: restart recovery metadata was lost; restore from a trusted backup and recreate the sandbox" >&2
+    exit 1
+  fi
+  if hermes_config_root_is_locked && ! hermes_locked_parent_is_protected; then
+    echo "[SECURITY] HERMES_LOCKED_PARENT_UNPROTECTED: /sandbox must be root:sandbox 1775 while Hermes shields are up; restore from a trusted backup and recreate the sandbox (shields up cannot run while PID 1 refuses startup)" >&2
+    exit 1
+  fi
+elif [ -e "$HERMES_CONFIG_MUTATION_LOCK" ] \
+  || [ -e "$HERMES_RESTART_SEAL_STATE" ] \
+  || [ -e "$HERMES_RESTART_ORPHAN_MARKER" ] \
+  || hermes_restart_seal_orphaned; then
+  echo "[SECURITY] HERMES_RESTART_SEAL_ORPHANED: non-root startup cannot safely recover an interrupted root config transaction; restore from a trusted backup and recreate the sandbox" >&2
+  exit 1
+fi
 
 # Migrate legacy symlink layout before anything else reads .hermes
 migrate_legacy_layout "/sandbox/.hermes" "/sandbox/.hermes-data" "hermes" || exit 1
@@ -1274,23 +3426,12 @@ if [ "$(id -u)" -ne 0 ]; then
   export HOME=/sandbox
   export HERMES_HOME="${HERMES_DIR}"
 
-  # macOS VM startup currently runs this entrypoint as the sandbox user and
-  # remaps rootfs ownership to the host uid. In that mode the strict /etc hash
-  # cannot remain a root-owned trust anchor, so use the same locked-aware
-  # mutable-default verifier as OpenClaw. The root path below keeps strict
-  # verification against /etc/nemoclaw/hermes.config-hash.
-  if ! verify_config_integrity_if_locked "${HERMES_DIR}"; then
-    echo "[SECURITY] Config integrity check failed — refusing to start (non-root mode)" >&2
-    exit 1
-  fi
-  ensure_hermes_runtime_api_server_key compat
-  apply_shields_up_runtime_env
-  validate_hermes_env_secret_boundary
-  validate_hermes_runtime_env_secret_boundary
-  refresh_hermes_provider_placeholders compat
-  refresh_hermes_runtime_config_hashes compat
-  configure_messaging_channels
-  retry_tirith_marker_if_needed
+  # macOS VM and OpenShell-managed startup run this entrypoint as the sandbox
+  # user. In that mode the strict /etc hash cannot remain a root-owned trust
+  # anchor, so use the same locked-aware mutable verifier as OpenClaw. Repeat
+  # this preparation before every automatic respawn so a stopped gateway never
+  # relaunches with stale or boundary-unsafe runtime inputs.
+  prepare_hermes_nonroot_runtime || exit 1
 
   if [ ${#NEMOCLAW_CMD[@]} -gt 0 ]; then
     exec "${NEMOCLAW_CMD[@]}"
@@ -1306,50 +3447,41 @@ if [ "$(id -u)" -ne 0 ]; then
 
   # Start Hermes gateway. Messaging egress goes directly through OpenShell.
   umask 0007
-  HERMES_HOME="${HERMES_DIR}" \
-    nohup "$HERMES" gateway run >/tmp/gateway.log 2>&1 &
-  GATEWAY_PID=$!
-  echo "[gateway] hermes gateway launched (pid $GATEWAY_PID)" >&2
-  start_gateway_log_stream
-  wait_for_hermes_gateway_internal "$GATEWAY_PID"
-  start_socat_forwarder "$PUBLIC_PORT" "$INTERNAL_PORT" "API" SOCAT_PID
-  start_hermes_dashboard_current_user
-  # NOTE: PIDs are collected after launch; a signal arriving between trap
-  # registration and the final append is a small race window (same as before
-  # the shared-library refactor). Acceptable for entrypoint-level cleanup.
-  SANDBOX_CHILD_PIDS=("$GATEWAY_PID" "$DASHBOARD_PID")
-  [ -n "${GATEWAY_LOG_TAIL_PID:-}" ] && SANDBOX_CHILD_PIDS+=("$GATEWAY_LOG_TAIL_PID")
-  [ -n "${DASHBOARD_LOG_TAIL_PID:-}" ] && SANDBOX_CHILD_PIDS+=("$DASHBOARD_LOG_TAIL_PID")
-  # shellcheck disable=SC2034  # read by cleanup_on_signal from sandbox-init.sh
-  SANDBOX_WAIT_PID="$GATEWAY_PID"
-  trap cleanup_on_signal SIGTERM SIGINT
-  [ -n "${SOCAT_PID:-}" ] && SANDBOX_CHILD_PIDS+=("$SOCAT_PID")
-  [ -n "${DASHBOARD_SOCAT_PID:-}" ] && SANDBOX_CHILD_PIDS+=("$DASHBOARD_SOCAT_PID")
+  bootstrap_hermes_gateway_current_user || exit 1
   print_dashboard_urls
 
-  wait "$GATEWAY_PID"
+  supervise_hermes_gateway_current_user
   exit $?
 fi
 
 # ── Root path (full privilege separation via setpriv) ──────────
 
 export HERMES_HOME="${HERMES_DIR}"
-verify_hermes_config_integrity
-ensure_hermes_config_root_mode
-ensure_hermes_runtime_api_server_key strict
-apply_shields_up_runtime_env
-validate_hermes_env_secret_boundary
-validate_hermes_runtime_env_secret_boundary
-refresh_hermes_provider_placeholders strict
-refresh_hermes_runtime_config_hashes compat
-configure_messaging_channels
-retry_tirith_marker_if_needed
+prepare_hermes_root_runtime
 
 if [ ${#NEMOCLAW_CMD[@]} -gt 0 ]; then
   exec "${STEP_DOWN_PREFIX_SANDBOX[@]}" "${NEMOCLAW_CMD[@]}"
 fi
 
-cleanup_stale_hermes_gateway_runtime
+# Same-uid MCP transaction commands are valid only in OpenShell's non-root
+# workload topology. Stamp the legacy root-separated path before its gateway
+# can start so ordinary sandbox exec fails closed there.
+# invalidState: an ordinary sandbox process claims same-UID mutation authority
+# while Hermes actually runs in the legacy root-separated topology.
+# sourceBoundary: OpenShell owns workload topology; NemoClaw owns the immutable
+# root-lifecycle marker and stamps it before starting the root-separated gateway.
+# whyNotSourceFix: OpenShell 0.0.106 supports both topologies but exposes no
+# attested same-UID capability that this packaged entrypoint can query.
+# regressionTest: hermes-mcp-config-transaction.test.ts rejects both probe and
+# add when the root-lifecycle marker identifies the legacy topology.
+# removalCondition: remove this marker stamp when OpenShell unifies the topology
+# or exposes an attested execution-identity capability.
+publish_hermes_root_runtime_marker hermes-root-lifecycle root-separated || exit 1
+
+# SECURITY: publish the resolved API port as a root-owned read-only marker.
+# Root-separated helpers read this marker. The temporary file receives its
+# final ownership and mode before one atomic rename replaces any stale entry.
+publish_hermes_root_runtime_marker hermes-api-port "$PUBLIC_PORT" || exit 1
 
 # SECURITY: Protect gateway log from sandbox user tampering
 prepare_restricted_log /tmp/gateway.log gateway:gateway 600
@@ -1358,28 +3490,72 @@ prepare_restricted_log /tmp/gateway.log gateway:gateway 600
 # shellcheck disable=SC2119
 validate_tmp_permissions
 
+# Migrate and seed the dashboard profile before Hermes reads the shared home.
+# Waiting until dashboard launch leaves restored legacy state in the gateway's
+# HERMES_HOME during its readiness check.
+prepare_hermes_dashboard_home sandbox:sandbox || exit 1
+
 # Start Hermes gateway. Messaging egress goes directly through OpenShell.
-HERMES_HOME="${HERMES_DIR}" \
-  nohup "${STEP_DOWN_PREFIX_GATEWAY[@]}" sh -c 'umask 0007; exec "$@" >/tmp/gateway.log 2>&1' sh "$HERMES" gateway run &
-GATEWAY_PID=$!
-echo "[gateway] hermes gateway launched as 'gateway' user (pid $GATEWAY_PID)" >&2
+launch_hermes_gateway
 start_gateway_log_stream
 wait_for_hermes_gateway_internal "$GATEWAY_PID"
-start_socat_forwarder "$PUBLIC_PORT" "$INTERNAL_PORT" "API" SOCAT_PID
-start_hermes_dashboard_sandbox_user
+ensure_hermes_supervised_auxiliaries
+finalize_tirith_marker_retry
+if ! commit_hermes_mcp_applied_if_pending; then
+  echo "[SECURITY] HERMES_MCP_APPLIED_COMMIT_FAILED: stopping the uncommitted Hermes gateway" >&2
+  stop_hermes_gateway_fail_closed
+  exit 1
+fi
 restore_hermes_config_permissions_after_dashboard_start
 # NOTE: PIDs are collected after launch; a signal arriving between trap
 # registration and the final append is a small race window (same as before
 # the shared-library refactor). Acceptable for entrypoint-level cleanup.
-SANDBOX_CHILD_PIDS=("$GATEWAY_PID" "$DASHBOARD_PID")
-[ -n "${GATEWAY_LOG_TAIL_PID:-}" ] && SANDBOX_CHILD_PIDS+=("$GATEWAY_LOG_TAIL_PID")
-[ -n "${DASHBOARD_LOG_TAIL_PID:-}" ] && SANDBOX_CHILD_PIDS+=("$DASHBOARD_LOG_TAIL_PID")
+refresh_hermes_supervised_child_pids
 # shellcheck disable=SC2034  # read by cleanup_on_signal from sandbox-init.sh
 SANDBOX_WAIT_PID="$GATEWAY_PID"
-trap cleanup_on_signal SIGTERM SIGINT
-[ -n "${SOCAT_PID:-}" ] && SANDBOX_CHILD_PIDS+=("$SOCAT_PID")
-[ -n "${DASHBOARD_SOCAT_PID:-}" ] && SANDBOX_CHILD_PIDS+=("$DASHBOARD_SOCAT_PID")
+trap hermes_cleanup_on_signal SIGTERM SIGINT
+if ! gateway_control_init; then
+  echo "[gateway-control] privileged gateway control unavailable" >&2
+fi
+if ! "$_HERMES_PYTHON" -I "$_HERMES_RUNTIME_CONFIG_GUARD" publish-startup-ready \
+  --hermes-dir "$HERMES_DIR" \
+  --startup-owner >/dev/null; then
+  echo "[gateway-control] failed to publish Hermes startup readiness" >&2
+  exit 1
+fi
+nemoclaw_runtime_state_mutation_checkpoint || exit 1
 print_dashboard_urls
 
-# Keep container running by waiting on the gateway process.
-wait "$GATEWAY_PID"
+# PID 1 remains alive even when Hermes stops its gateway. Host recovery uses
+# the authenticated control helper to validate and launch a replacement; no
+# unrelated exec process owns or races the child lifecycle.
+while :; do
+  while [ -n "${GATEWAY_PID:-}" ] \
+    && [ "$GATEWAY_PID" -gt 1 ] \
+    && hermes_tracked_role_is_current gateway "$GATEWAY_PID" gateway "$INTERNAL_PORT" \
+    && [ "$GATEWAY_CONTROL_SIGNAL_PENDING" -eq 0 ]; do
+    sleep 1 || true
+  done
+
+  if [ "$GATEWAY_CONTROL_SIGNAL_PENDING" -eq 1 ]; then
+    handle_hermes_gateway_control_request || true
+    continue
+  fi
+
+  if [ -n "${GATEWAY_PID:-}" ] \
+    && [ "$GATEWAY_PID" -gt 0 ] \
+    && ! hermes_tracked_role_is_current gateway "$GATEWAY_PID" gateway "$INTERNAL_PORT"; then
+    reap_status=0
+    hermes_reap_exited_gateway || reap_status=$?
+    case "$reap_status" in
+      0) ;;
+      3)
+        handle_hermes_gateway_control_request || true
+        continue
+        ;;
+      *) exit 1 ;;
+    esac
+  else
+    sleep 1 || true
+  fi
+done

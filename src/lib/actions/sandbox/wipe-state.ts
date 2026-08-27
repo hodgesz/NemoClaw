@@ -3,16 +3,18 @@
 
 import path from "node:path";
 
-import { YW, R } from "../../cli/terminal-style";
+import { R, YW } from "../../cli/terminal-style";
 import { shellQuote } from "../../core/shell-quote";
 import * as registry from "../../state/registry";
+import { SANDBOX_DESTROY_TIMEOUT_MS } from "./destroy-gateway";
 
-type RunOpenshellResult = { status: number | null };
+type RunOpenshellResult = { error?: Error; status: number | null };
 type RunOpenshell = (args: string[], opts?: Record<string, unknown>) => RunOpenshellResult;
 
 type AgentStateInfo = {
   configPaths: { dir: string };
   stateDirs: string[];
+  stateDirPrefixes: string[];
   stateFiles: { path: string }[];
 };
 
@@ -28,6 +30,8 @@ export type WipeSandboxStateDeps = {
   warn?: (message: string) => void;
 };
 
+export class SandboxWorkspaceCleanupTimeoutError extends Error {}
+
 /**
  * Wipe a sandbox's persistent state (the agent-manifest state dirs/files such
  * as `workspace/USER.md`) while the sandbox is still live, before
@@ -42,17 +46,16 @@ export type WipeSandboxStateDeps = {
  *   resurrects the old workspace files (USER.md, SOUL.md, ...).
  * - Source boundary: the durable PVC retention is owned upstream by
  *   OpenShell's `sandbox delete` semantics. This wipe is a host-side
- *   workaround so destroy is the inverse of `backupSandboxState`: it removes
- *   exactly the set the snapshot/backup path treats as durable state, plus
- *   the discovered multi-agent `workspace-*` dirs.
+ *   workaround so destroy removes the exact directories, declared directory
+ *   prefixes, and files that the agent contract treats as persistent state.
  * - Source-fix constraint: making `openshell sandbox delete` purge the PVC
  *   by default is an upstream OpenShell change and would also affect
  *   non-NemoClaw consumers that rely on PVC retention. NemoClaw needs the
  *   clean-re-onboard contract today, so the wipe issues `sandbox exec` while
  *   the sandbox is still live and lets the subsequent `sandbox delete` tear
  *   the pod down.
- * - Regression test: test/destroy-wipe-sandbox-state.test.ts covers the
- *   workspace target, the multi-agent glob, the best-effort warn path, the
+ * - Regression test: test/runtime/sandbox/destroy-wipe-sandbox-state.test.ts covers the
+ *   workspace target, declared prefix expansion, the best-effort warn path, the
  *   path-escape rejection (state_dirs + state_files), and the contract
  *   assertion that the script targets workspace/ under the config dir with
  *   no `..` segments or quoted absolute path arguments.
@@ -178,6 +181,9 @@ export function wipeSandboxState(sandboxName: string, deps: WipeSandboxStateDeps
   const validStateDirs = agent.stateDirs
     .map(validateManifestPath)
     .filter((p): p is string => p !== null);
+  const validStateDirPrefixes = agent.stateDirPrefixes
+    .map(validateManifestPath)
+    .filter((p): p is string => p !== null);
   const validStateFiles = agent.stateFiles
     .map((file) => validateManifestPath(file.path))
     .filter((p): p is string => p !== null);
@@ -185,41 +191,53 @@ export function wipeSandboxState(sandboxName: string, deps: WipeSandboxStateDeps
   const targets = [
     ...validStateDirs.map(shellQuote),
     ...validStateFiles.map(shellQuote),
-    // Left unquoted so the sandbox shell expands the multi-agent
-    // `workspace-<name>` glob (#1260). A no-match leaves the literal token,
-    // which `rm -rf` silently ignores.
-    "workspace-*",
+    // Quote the manifest-derived prefix and leave only the appended wildcard
+    // unquoted. A no-match leaves the literal token, which `rm -rf` ignores.
+    ...validStateDirPrefixes.map((prefix) => `${shellQuote(prefix)}*`),
   ];
 
-  // cd into the config dir first so relative names and the glob resolve there;
+  // cd into the config dir first so relative names and globs resolve there;
   // `exit 0` keeps a partially provisioned (dir-absent) sandbox a clean no-op.
-  const script = `cd ${shellQuote(dir)} 2>/dev/null || exit 0; rm -rf -- ${targets.join(" ")}`;
+  const wipeCommand = targets.length > 0 ? `rm -rf -- ${targets.join(" ")}` : ":";
+  const script = `cd ${shellQuote(dir)} 2>/dev/null || exit 0; ${wipeCommand}`;
 
   const result = runOpenshell(
     ["sandbox", "exec", "--name", sandboxName, "--", "sh", "-c", script],
     {
       ignoreError: true,
+      killSignal: "SIGKILL",
       stdio: ["ignore", "ignore", "ignore"],
+      timeout: SANDBOX_DESTROY_TIMEOUT_MS,
     },
   );
+  if ((result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") {
+    throw new SandboxWorkspaceCleanupTimeoutError(
+      `OpenShell workspace cleanup timed out after ${String(SANDBOX_DESTROY_TIMEOUT_MS / 1000)} seconds. Its remote result is unknown, so NemoClaw preserved the sandbox registry entry.`,
+    );
+  }
   if (result.status !== 0) {
     // #5455 PRA-2 (best-effort failure semantics, justified): destroy must
     // remove the registry entry and tear down the OpenShell pod even when
-    // the wipe exec returns non-zero. The most common nonzero path is "the
-    // sandbox is no longer live" (gateway down, container already stopped,
-    // openshell connectivity transient): blocking destroy there would leave
-    // the user with an unkillable broken sandbox. The next re-onboard with
-    // the same name is the only path where stale workspace state actually
-    // surfaces, so the contract is: warn loudly here, let destroy proceed,
-    // and the re-onboard banner re-surfaces the warning if the PVC is
-    // detected as non-empty. The behavioral validation for that full
-    // destroy -> re-onboard -> clean-workspace contract (#5455 PRA-1) is an
-    // E2E concern -- the helper-level test below pins the warning and the
-    // CLI-level lifecycle test in test/cli/destroy-gateway-cleanup.test.ts
-    // pins the gateway-select-then-exec-then-delete order.
+    // the wipe exec returns non-zero. A child-process timeout is different:
+    // its remote result is unknown, so destroy stops above and preserves the
+    // registry entry. The most common completed nonzero path is "the sandbox
+    // is no longer live" (gateway down, container already stopped, OpenShell
+    // connectivity transient). Blocking destroy there would leave the user
+    // with an unkillable broken sandbox. The next re-onboard with the same
+    // name is the only path where stale workspace state actually surfaces, so
+    // the contract is: warn loudly here, let destroy proceed, and the
+    // re-onboard banner re-surfaces the warning if the PVC is detected as
+    // non-empty. The behavioral validation for that full destroy ->
+    // re-onboard -> clean-workspace contract (#5455 PRA-1) is an E2E concern.
+    // The helper-level test below pins the warning, and the CLI-level lifecycle
+    // test in test/cli/destroy-gateway-cleanup.test.ts pins the
+    // gateway-select-then-exec-then-delete order.
     warn(
       `  ${YW}⚠${R} Could not wipe workspace state for '${sandboxName}' (sandbox not live?); ` +
-        "re-onboarding with the same name may resurface old files.",
+        "re-onboarding with the same name may resurface old files. " +
+        "To start clean, re-onboard with a different sandbox name, or — when this " +
+        "is your last sandbox — re-run destroy with --cleanup-gateway to purge the " +
+        "retained cluster volume.",
     );
   }
 }

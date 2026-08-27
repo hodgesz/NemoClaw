@@ -1,15 +1,34 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-// Import from compiled dist/ so coverage is attributed correctly.
+import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
+
+// The ready summary resolves the sandbox's API port from the registry. Stub the
+// lookup so these unit tests never read the developer's real state file.
+const getSandboxMock = vi.hoisted(() =>
+  vi.fn((): { hermesApiPort?: number | null } | null => null),
+);
+vi.mock("../state/registry", () => ({ getSandbox: getSandboxMock }));
+
+const mocks = vi.hoisted(() => ({
+  run: vi.fn(),
+}));
+
+vi.mock("../runner", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../runner")>()),
+  run: mocks.run,
+}));
+
+import { sandboxConfigSyncArgs } from "../onboard/config-sync";
+import type { AgentDefinition } from "./defs";
+// Import source directly so tests cannot pass against a stale build.
 import {
   collectHermesStartupDiagnostics,
   handleAgentSetup,
+  type OnboardContext,
   printDashboardUi,
   verifyAgentBinaryAvailable,
-} from "../../../dist/lib/agent/onboard";
-import type { AgentDefinition } from "./defs";
+} from "./onboard";
 
 function makeAgent(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
   return {
@@ -24,9 +43,29 @@ function makeAgent(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
       configFile: "/tmp/agent/config.yaml",
       envFile: null,
       format: "yaml",
+      shieldsFiles: [],
     },
     inferenceProviderOptions: [],
+    mcpCapability: {
+      support: "disabled",
+      reason: "test fixture",
+    },
+    stateDirectories: [],
     stateDirs: [],
+    stateDirPrefixes: [],
+    backupStateDirs: [],
+    backupStateDirPrefixes: [],
+    nonBackupStateDirs: [],
+    nonBackupStateDirPrefixes: [],
+    stateLockPlan: {
+      version: 1,
+      readOnlyRoots: [],
+      confidentialRoots: [],
+      readOnlyPrefixes: [],
+      confidentialPrefixes: [],
+      writableSubpaths: [],
+    },
+    stateLockPlanInImage: false,
     stateFiles: [],
     userManagedFiles: [],
     versionCommand: "agent --version",
@@ -95,23 +134,20 @@ const buildUrlsLoopback = (token: string | null, port: number): string[] => {
   return [`http://127.0.0.1:${port}/${hash}`];
 };
 
-describe("printDashboardUi — regression for #2078 (port 8642 is not a chat UI)", () => {
-  const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+describe("printDashboardUi with port 8642 outside the chat UI (#2078)", () => {
+  let logSpy: MockInstance<typeof console.log>;
   const noteSpy = vi.fn();
 
   beforeEach(() => {
-    logSpy.mockClear();
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     noteSpy.mockReset();
+    getSandboxMock.mockReturnValue(null);
   });
 
   afterEach(() => {
-    logSpy.mockClear();
+    logSpy.mockRestore();
     delete process.env.NEMOCLAW_HERMES_DASHBOARD;
     delete process.env.NEMOCLAW_HERMES_DASHBOARD_PORT;
-  });
-
-  afterAll(() => {
-    logSpy.mockRestore();
   });
 
   it("labels an API-kind agent as the API — not a UI — and does not embed a token in the URL", () => {
@@ -145,10 +181,10 @@ describe("printDashboardUi — regression for #2078 (port 8642 is not a chat UI)
 
   it("prints the optional Hermes web dashboard URL when dashboard mode is enabled", () => {
     process.env.NEMOCLAW_HERMES_DASHBOARD = "1";
-    process.env.NEMOCLAW_HERMES_DASHBOARD_PORT = "9120";
 
     printDashboardUi("sandbox-x", null, apiAgent, {
       note: noteSpy,
+      effectiveDashboardPort: 9120,
       buildControlUiUrls: buildUrlsLoopback,
     });
 
@@ -189,7 +225,7 @@ describe("printDashboardUi — regression for #2078 (port 8642 is not a chat UI)
     expect(noteSpy).not.toHaveBeenCalled();
   });
 
-  it("announces manifest-declared secondary forward_ports alongside the primary dashboard", () => {
+  it("uses the effective Hermes dashboard port while preserving the secondary API (#6277)", () => {
     const hermesShipped = makeAgent({
       name: "hermes",
       displayName: "Hermes Agent",
@@ -207,13 +243,15 @@ describe("printDashboardUi — regression for #2078 (port 8642 is not a chat UI)
 
     printDashboardUi("hermes-box", null, hermesShipped, {
       note: noteSpy,
+      effectiveDashboardPort: 9121,
       buildControlUiUrls: buildUrlsLoopback,
     });
 
     const output = logSpy.mock.calls.map((args) => String(args[0])).join("\n");
     expect(output).toContain("Hermes Agent Dashboard");
-    expect(output).toContain("Port 18789 must be forwarded before opening this URL.");
-    expect(output).toContain("http://127.0.0.1:18789/");
+    expect(output).toContain("Port 9121 must be forwarded before opening this URL.");
+    expect(output).toContain("http://127.0.0.1:9121/");
+    expect(output).not.toContain("http://127.0.0.1:18789/");
     expect(output).toContain("Hermes Agent OpenAI-compatible API");
     expect(output).toContain("Port 8642 must be forwarded before connecting.");
     expect(output).toContain("http://127.0.0.1:8642/v1");
@@ -248,41 +286,6 @@ describe("printDashboardUi — regression for #2078 (port 8642 is not a chat UI)
     expect(output).not.toContain("http://127.0.0.1:9100/v1");
   });
 
-  it("emits a URL for a secondary forward port that resolves to the scheme default", () => {
-    // Regression: `new URL("http://h:80").port === ""`. A strict equality
-    // filter against String(port) silently drops the URL line. The helper
-    // must normalise scheme-default ports before filtering.
-    const buildUrlsWithDefaultPort = (_token: string | null, port: number): string[] => {
-      if (port === 80) return ["http://127.0.0.1:80/"];
-      return [`http://127.0.0.1:${port}/`];
-    };
-
-    const httpAgent = makeAgent({
-      name: "experimental",
-      displayName: "Experimental",
-      forwardPort: 18789,
-      forward_ports: [18789, 80],
-      healthProbe: { url: "http://localhost:18789/health", port: 18789, timeout_seconds: 30 },
-      dashboard: {
-        kind: "ui",
-        label: "Dashboard",
-        path: "/",
-        healthPath: "/health",
-        auth: "session",
-      },
-    });
-
-    printDashboardUi("agent-box", null, httpAgent, {
-      note: noteSpy,
-      buildControlUiUrls: buildUrlsWithDefaultPort,
-    });
-
-    const output = logSpy.mock.calls.map((args) => String(args[0])).join("\n");
-    expect(output).toContain("Experimental additional port");
-    expect(output).toContain("Port 80 must be forwarded before connecting.");
-    expect(output).toMatch(/http:\/\/127\.0\.0\.1(:80)?\//);
-  });
-
   it("redacts tokenized URLs for UI-kind agents and shows the token retrieval command", () => {
     const token = "a".repeat(64);
     printDashboardUi("sandbox-y", token, uiAgent, {
@@ -301,7 +304,11 @@ describe("printDashboardUi — regression for #2078 (port 8642 is not a chat UI)
 });
 
 describe("agent setup session boundaries", () => {
-  function createAgentSetupContext(runCaptureOpenshell = vi.fn(() => "")) {
+  function createAgentSetupContext(
+    runCaptureOpenshell: OnboardContext["runCaptureOpenshell"] = vi.fn(() => ""),
+    timing: Pick<OnboardContext, "now" | "sleepSeconds"> = {},
+    policyRequirements: Pick<OnboardContext, "revalidatePolicyRequirements"> = {},
+  ) {
     return {
       context: {
         step: vi.fn(),
@@ -312,9 +319,21 @@ describe("agent setup session boundaries", () => {
         recordStepComplete: vi.fn(async () => undefined),
         recordStepFailed: vi.fn(async () => undefined),
         skippedStepMessage: vi.fn(),
+        ...timing,
+        ...policyRequirements,
       },
     };
   }
+
+  beforeEach(() => {
+    getSandboxMock.mockReset();
+    getSandboxMock.mockReturnValue(null);
+  });
+
+  afterEach(() => {
+    mocks.run.mockReset();
+    vi.restoreAllMocks();
+  });
 
   it("records resume success through the supplied completion boundary", async () => {
     const runCaptureOpenshell = vi.fn(() => "ok");
@@ -351,6 +370,258 @@ describe("agent setup session boundaries", () => {
       model: "model-x",
     });
     expect(context.recordStepFailed).not.toHaveBeenCalled();
+  });
+
+  it("writes non-default agent configuration through noninteractive sandbox exec", async () => {
+    const runCaptureOpenshell = vi.fn(() => "NEMOCLAW_AGENT_BINARY_CHECK:ok");
+    const { context } = createAgentSetupContext(runCaptureOpenshell);
+    const agent = makeAgent({
+      name: "hermes",
+      healthProbe: { url: "", port: 0, timeout_seconds: 0 },
+    });
+
+    await handleAgentSetup("sandbox-x", "meta-llama", "vllm-local", agent, false, null, context);
+
+    expect(mocks.run).toHaveBeenCalledTimes(1);
+    const [args, options] = mocks.run.mock.calls[0];
+    expect(args).toEqual(["/usr/bin/openshell", ...sandboxConfigSyncArgs("sandbox-x")]);
+    expect(options).toMatchObject({
+      input: expect.any(String),
+      stdio: ["pipe", "ignore", "inherit"],
+    });
+    expect(options.input).toContain('"provider": "vllm-local"');
+    expect(options.input).toContain('"model": "meta-llama"');
+    expect(options.input).toContain('"agent": "hermes"');
+  });
+
+  it("retries a configured gateway probe through the supplied scheduler", async () => {
+    let nowMs = 0;
+    const sleepSeconds = vi.fn((seconds: number) => {
+      nowMs += seconds * 1000;
+    });
+    const runCaptureOpenshell = vi
+      .fn<OnboardContext["runCaptureOpenshell"]>(() => "ok")
+      .mockReturnValueOnce("NEMOCLAW_AGENT_BINARY_CHECK:ok")
+      .mockReturnValueOnce("");
+    const { context } = createAgentSetupContext(runCaptureOpenshell, {
+      now: () => nowMs,
+      sleepSeconds,
+    });
+
+    await handleAgentSetup(
+      "sandbox-x",
+      "model-x",
+      "provider-x",
+      makeAgent({
+        healthProbe: { url: "http://127.0.0.1:19000/", port: 19000, timeout_seconds: 1 },
+      }),
+      false,
+      null,
+      context,
+    );
+
+    expect(runCaptureOpenshell.mock.calls.filter(([args]) => args.includes("curl"))).toHaveLength(
+      2,
+    );
+    expect(sleepSeconds).toHaveBeenCalledWith(0.25);
+    expect(context.recordStepComplete).toHaveBeenCalledWith("agent_setup", {
+      sandboxName: "sandbox-x",
+      provider: "provider-x",
+      model: "model-x",
+    });
+    expect(context.recordStepFailed).not.toHaveBeenCalled();
+  });
+
+  it("refuses completion when policy authority changes during the gateway wait (#9833)", async () => {
+    let nowMs = 0;
+    const sleepSeconds = vi.fn((seconds: number) => {
+      nowMs += seconds * 1000;
+    });
+    const runCaptureOpenshell = vi
+      .fn<OnboardContext["runCaptureOpenshell"]>(() => "ok")
+      .mockReturnValueOnce("NEMOCLAW_AGENT_BINARY_CHECK:ok")
+      .mockReturnValueOnce("");
+    const refuseCompletion = () => {
+      throw new Error("policy authority changed");
+    };
+    const policyChecks = new Map([
+      ["record completed agent setup for sandbox 'sandbox-x'", refuseCompletion],
+    ]);
+    const revalidatePolicyRequirements = vi.fn((operation: string) =>
+      policyChecks.get(operation)?.(),
+    );
+    const { context } = createAgentSetupContext(
+      runCaptureOpenshell,
+      { now: () => nowMs, sleepSeconds },
+      { revalidatePolicyRequirements },
+    );
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await expect(
+      handleAgentSetup(
+        "sandbox-x",
+        "model-x",
+        "provider-x",
+        makeAgent({
+          healthProbe: { url: "http://127.0.0.1:19000/", port: 19000, timeout_seconds: 1 },
+        }),
+        false,
+        null,
+        context,
+      ),
+    ).rejects.toThrow("policy authority changed");
+
+    expect(sleepSeconds).toHaveBeenCalledWith(0.25);
+    expect(context.recordStepComplete).not.toHaveBeenCalled();
+    expect(logSpy.mock.calls.flat().join("\n")).not.toContain("gateway is healthy");
+  });
+
+  it("records gateway failure when the configured deadline expires", async () => {
+    let nowMs = 0;
+    const sleepSeconds = vi.fn((seconds: number) => {
+      nowMs += seconds * 1000;
+    });
+    const runCaptureOpenshell = vi
+      .fn<OnboardContext["runCaptureOpenshell"]>(() => "")
+      .mockReturnValueOnce("NEMOCLAW_AGENT_BINARY_CHECK:ok");
+    const { context } = createAgentSetupContext(runCaptureOpenshell, {
+      now: () => nowMs,
+      sleepSeconds,
+    });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit:${String(code)}`);
+    }) as typeof process.exit);
+
+    await expect(
+      handleAgentSetup(
+        "sandbox-x",
+        "model-x",
+        "provider-x",
+        makeAgent({
+          healthProbe: { url: "http://127.0.0.1:19000/", port: 19000, timeout_seconds: 1 },
+        }),
+        false,
+        null,
+        context,
+      ),
+    ).rejects.toThrow("process.exit:1");
+
+    expect(
+      runCaptureOpenshell.mock.calls.filter(([args]) => args.includes("curl")).length,
+    ).toBeGreaterThan(1);
+    expect(sleepSeconds).toHaveBeenCalledWith(0.25);
+    expect(context.recordStepFailed).toHaveBeenCalledWith(
+      "agent_setup",
+      "Agent gateway did not respond within 1s",
+    );
+    expect(context.recordStepComplete).not.toHaveBeenCalled();
+  });
+
+  // The manifest names 8642; a second sandbox is allocated its own port (#9739).
+  const hermesProbeAgent = makeAgent({
+    name: "hermes",
+    displayName: "Hermes Agent",
+    healthProbe: { url: "http://localhost:8642/health", port: 8642, timeout_seconds: 1 },
+  });
+
+  function probeUrlsFrom(
+    runCaptureOpenshell: ReturnType<typeof vi.fn<OnboardContext["runCaptureOpenshell"]>>,
+  ): string[] {
+    return runCaptureOpenshell.mock.calls
+      .map(([args]) => args)
+      .filter((args) => args.includes("curl"))
+      .map((args) => String(args[args.length - 1]));
+  }
+
+  it("probes the sandbox's own Hermes API port instead of the manifest default (#9739)", async () => {
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8643 });
+    const runCaptureOpenshell = vi
+      .fn<OnboardContext["runCaptureOpenshell"]>(() => "ok")
+      .mockReturnValueOnce("NEMOCLAW_AGENT_BINARY_CHECK:ok");
+    const { context } = createAgentSetupContext(runCaptureOpenshell);
+
+    await handleAgentSetup(
+      "hermes-core-test",
+      "model-x",
+      "provider-x",
+      hermesProbeAgent,
+      false,
+      null,
+      context,
+    );
+
+    expect(probeUrlsFrom(runCaptureOpenshell)).toEqual(["http://localhost:8643/health"]);
+    expect(context.recordStepFailed).not.toHaveBeenCalled();
+    expect(context.recordStepComplete).toHaveBeenCalledWith("agent_setup", {
+      sandboxName: "hermes-core-test",
+      provider: "provider-x",
+      model: "model-x",
+    });
+  });
+
+  it("keeps the manifest probe port for a sandbox that owns the default API port (#9739)", async () => {
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8642 });
+    const runCaptureOpenshell = vi
+      .fn<OnboardContext["runCaptureOpenshell"]>(() => "ok")
+      .mockReturnValueOnce("NEMOCLAW_AGENT_BINARY_CHECK:ok");
+    const { context } = createAgentSetupContext(runCaptureOpenshell);
+
+    await handleAgentSetup(
+      "hermes-first",
+      "model-x",
+      "provider-x",
+      hermesProbeAgent,
+      false,
+      null,
+      context,
+    );
+
+    expect(probeUrlsFrom(runCaptureOpenshell)).toEqual(["http://localhost:8642/health"]);
+    expect(context.recordStepFailed).not.toHaveBeenCalled();
+  });
+
+  it("leaves a non-Hermes probe URL on its manifest port when the registry records a Hermes API port (#9739)", async () => {
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8643 });
+    const runCaptureOpenshell = vi
+      .fn<OnboardContext["runCaptureOpenshell"]>(() => "ok")
+      .mockReturnValueOnce("NEMOCLAW_AGENT_BINARY_CHECK:ok");
+    const { context } = createAgentSetupContext(runCaptureOpenshell);
+
+    await handleAgentSetup(
+      "not-hermes",
+      "model-x",
+      "provider-x",
+      makeAgent({
+        healthProbe: { url: "http://localhost:8642/health", port: 8642, timeout_seconds: 1 },
+      }),
+      false,
+      null,
+      context,
+    );
+
+    expect(probeUrlsFrom(runCaptureOpenshell)).toEqual(["http://localhost:8642/health"]);
+    expect(context.recordStepFailed).not.toHaveBeenCalled();
+  });
+
+  it("retargets the resume health probe at the sandbox's own API port (#9739)", async () => {
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8643 });
+    const runCaptureOpenshell = vi.fn<OnboardContext["runCaptureOpenshell"]>(() => "ok");
+    const { context } = createAgentSetupContext(runCaptureOpenshell);
+
+    await handleAgentSetup(
+      "hermes-core-test",
+      "model-x",
+      "provider-x",
+      hermesProbeAgent,
+      true,
+      null,
+      context,
+    );
+
+    expect(probeUrlsFrom(runCaptureOpenshell)).toEqual(["http://localhost:8643/health"]);
+    expect(context.skippedStepMessage).toHaveBeenCalledWith("agent_setup", "hermes-core-test");
+    expect(context.startRecordedStep).not.toHaveBeenCalled();
   });
 });
 
@@ -460,5 +731,100 @@ describe("collectHermesStartupDiagnostics", () => {
 
     expect(output).toContain("SLACK_BOT_TOKEN=");
     expect(output).not.toContain(slackToken);
+  });
+});
+
+describe("printDashboardUi announces per-sandbox Hermes API ports (#8543)", () => {
+  let logSpy: MockInstance<typeof console.log>;
+  const noteSpy = vi.fn();
+
+  const hermesShipped = makeAgent({
+    name: "hermes",
+    displayName: "Hermes Agent",
+    forwardPort: 18789,
+    forward_ports: [18789, 8642],
+    healthProbe: { url: "http://localhost:8642/health", port: 8642, timeout_seconds: 90 },
+    dashboard: {
+      kind: "ui",
+      label: "Dashboard",
+      path: "/",
+      healthPath: "/api/status",
+      auth: "session",
+    },
+  });
+
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    noteSpy.mockReset();
+    getSandboxMock.mockReturnValue(null);
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  it("announces the sandbox's own API port instead of the manifest default", () => {
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8643 });
+
+    printDashboardUi("hermes-clone", null, hermesShipped, {
+      note: noteSpy,
+      effectiveDashboardPort: 18790,
+      buildControlUiUrls: buildUrlsLoopback,
+    });
+
+    const output = logSpy.mock.calls.map((args) => String(args[0])).join("\n");
+    expect(output).toContain("Port 8643 must be forwarded before connecting.");
+    expect(output).toContain("http://127.0.0.1:8643/v1");
+    expect(output).not.toContain("Port 8642 must be forwarded before connecting.");
+  });
+
+  it("announces the sandbox's own API port from an API-kind dashboard", () => {
+    const hermesApiDashboard = makeAgent({
+      name: "hermes",
+      displayName: "Hermes Agent",
+      forwardPort: 18789,
+      forward_ports: [18789, 8642],
+      healthProbe: { url: "http://localhost:8642/health", port: 8642, timeout_seconds: 90 },
+      dashboard: {
+        kind: "api",
+        label: "OpenAI-compatible API",
+        path: "/v1",
+        healthPath: "/health",
+        auth: "none",
+      },
+    });
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8645 });
+
+    printDashboardUi("hermes-api-box", null, hermesApiDashboard, {
+      note: noteSpy,
+      buildControlUiUrls: buildUrlsLoopback,
+    });
+
+    const output = logSpy.mock.calls.map((args) => String(args[0])).join("\n");
+    expect(output).toContain("Hermes Agent OpenAI-compatible API");
+    expect(output).toContain("Port 8645 must be forwarded before connecting.");
+    expect(output).toContain("http://127.0.0.1:8645/");
+    expect(output).not.toContain("http://127.0.0.1:8642/");
+  });
+
+  it("keeps the declared port for an agent that has no per-sandbox API port", () => {
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8643 });
+    const dualAgent = makeAgent({
+      name: "experimental",
+      displayName: "Experimental",
+      forwardPort: 18789,
+      forward_ports: [18789, 9100],
+      healthProbe: { url: "http://localhost:9100/health", port: 9100, timeout_seconds: 30 },
+    });
+
+    printDashboardUi("other-box", null, dualAgent, {
+      note: noteSpy,
+      effectiveDashboardPort: 18790,
+      buildControlUiUrls: buildUrlsLoopback,
+    });
+
+    const output = logSpy.mock.calls.map((args) => String(args[0])).join("\n");
+    expect(output).toContain("Port 9100 must be forwarded before connecting.");
+    expect(output).not.toContain("8643");
   });
 });

@@ -3,19 +3,22 @@
 
 import type { WebSearchConfig } from "../inference/web-search";
 import type { SandboxMessagingPlan } from "../messaging/manifest/types";
+import { bridgeSecretEnvsForChannel } from "./messaging-bridge-provider";
 import {
   enforceMessagingChannelConflicts as defaultEnforceMessagingChannelConflicts,
   type MessagingConflictGuardDeps,
 } from "./messaging-conflict-guard";
 import {
-  prepareCreateSandboxMessaging as defaultPrepareCreateSandboxMessaging,
   type CreateSandboxMessagingPrepInput,
   type CreateSandboxMessagingPrepResult,
+  prepareCreateSandboxMessaging as defaultPrepareCreateSandboxMessaging,
   type NamedMessagingChannel,
 } from "./messaging-prep";
 
 export interface SandboxMessagingPreflightInput {
   sandboxName: string;
+  agentName?: string | null;
+  requireExactProviderBinding?: boolean;
   channels: readonly NamedMessagingChannel[];
   enabledChannels: readonly string[] | null;
   webSearchConfig: WebSearchConfig | null;
@@ -25,9 +28,10 @@ export interface SandboxMessagingPreflightInput {
 export interface SandboxMessagingPreflightDeps {
   readMessagingPlanFromEnv(): SandboxMessagingPlan | null;
   resolveDisabledChannels(sandboxName: string): string[];
-  gatewayName: string;
+  gatewayName(): string;
   registry: MessagingConflictGuardDeps["registry"];
   providerExistsInGateway(name: string): boolean;
+  providerMatchesGatewayCredential(name: string, type: string, credentialEnv: string): boolean;
   isNonInteractive(): boolean;
   promptYesNoOrDefault(
     message: string,
@@ -68,6 +72,8 @@ export async function prepareSandboxMessagingPreflight(
 
   const result = (deps.prepareCreateSandboxMessaging ?? defaultPrepareCreateSandboxMessaging)({
     sandboxName: input.sandboxName,
+    agentName: input.agentName,
+    requireExactProviderBinding: input.requireExactProviderBinding,
     channels: input.channels,
     enabledChannels: input.enabledChannels,
     disabledChannels,
@@ -79,13 +85,26 @@ export async function prepareSandboxMessagingPreflight(
     registerExtraPlaceholderProviders: deps.registerExtraPlaceholderProviders,
     getMessagingChannelForEnvKey: deps.getMessagingChannelForEnvKey,
     providerExistsInGateway: deps.providerExistsInGateway,
+    providerMatchesGatewayCredential: deps.providerMatchesGatewayCredential,
   });
 
-  if (result.missingBraveApiKey) {
-    deps.error("  Brave Search is enabled, but BRAVE_API_KEY is not available in this process.");
+  // Fail before the caller can act on this intent: onboard may delete and
+  // recreate the sandbox, and a selected channel that resolved to nothing would
+  // be dropped from the replacement without a word.
+  result.missingBridgeChannels.forEach((channel) => {
     deps.error(
-      "  Re-run with BRAVE_API_KEY set, or disable Brave Search before recreating the sandbox.",
+      `  ${channel} mints its outbound token gateway-side and needs ${bridgeSecretEnvsForChannel(channel).join(", ")} to configure it.`,
     );
+    deps.error("  Paste the secret at the enrollment prompt or export the env var, then re-run.");
+  });
+  if (result.missingBridgeChannels.length > 0) {
+    deps.exitProcess(1);
+  }
+
+  if (result.missingWebSearchCredentialEnv) {
+    const envKey = result.missingWebSearchCredentialEnv;
+    deps.error(`  Web search is enabled, but ${envKey} is not available in this process.`);
+    deps.error(`  Re-run with ${envKey} set, or disable web search before recreating the sandbox.`);
     deps.exitProcess(1);
   }
 
@@ -105,7 +124,7 @@ async function checkMessagingPlanConflicts(
     deps.enforceMessagingChannelConflicts ?? defaultEnforceMessagingChannelConflicts;
   await enforceMessagingChannelConflicts({
     sandboxName,
-    gatewayName: deps.gatewayName,
+    gatewayName: deps.gatewayName(),
     currentPlan,
     currentSandboxDisabledChannels: disabledChannels,
     registry: deps.registry,

@@ -19,9 +19,10 @@ import {
   describeOnboardProvider,
   loadOnboardConfig,
 } from "./onboard/config.js";
+import { getPluginConfig } from "./plugin-config.js";
 import { registerRuntimeContext } from "./runtime-context.js";
-import { scanForSecrets, isMemoryPath } from "./security/secret-scanner.js";
 import { safeResolvePath } from "./security/safe-resolve-path.js";
+import { isMemoryPath, scanForSecrets } from "./security/secret-scanner.js";
 
 type PluginScalar = string | number | boolean | null | undefined;
 type PluginValue = PluginScalar | PluginRecord | PluginValue[];
@@ -307,34 +308,7 @@ function registeredProviderForConfig(
   };
 }
 
-const DEFAULT_PLUGIN_CONFIG: NemoClawConfig = {
-  blueprintVersion: "latest",
-  blueprintRegistry: "ghcr.io/nvidia/nemoclaw-blueprint",
-  sandboxName: "openclaw",
-  inferenceProvider: "nvidia",
-};
-
-export function getPluginConfig(api: OpenClawPluginApi): NemoClawConfig {
-  const raw = api.pluginConfig ?? {};
-  return {
-    blueprintVersion:
-      typeof raw["blueprintVersion"] === "string"
-        ? raw["blueprintVersion"]
-        : DEFAULT_PLUGIN_CONFIG.blueprintVersion,
-    blueprintRegistry:
-      typeof raw["blueprintRegistry"] === "string"
-        ? raw["blueprintRegistry"]
-        : DEFAULT_PLUGIN_CONFIG.blueprintRegistry,
-    sandboxName:
-      typeof raw["sandboxName"] === "string"
-        ? raw["sandboxName"]
-        : DEFAULT_PLUGIN_CONFIG.sandboxName,
-    inferenceProvider:
-      typeof raw["inferenceProvider"] === "string"
-        ? raw["inferenceProvider"]
-        : DEFAULT_PLUGIN_CONFIG.inferenceProvider,
-  };
-}
+export { getPluginConfig };
 
 // ---------------------------------------------------------------------------
 // Plugin entry point
@@ -437,9 +411,9 @@ export default function register(api: OpenClawPluginApi): void {
     "  Slash:     /nemoclaw",
   ];
 
-  api.logger.info("");
+  process.stderr.write("\n");
   for (const line of renderBox(bannerLines)) {
-    api.logger.info(line);
+    process.stderr.write(`[gateway] ${line}\n`);
   }
-  api.logger.info("");
+  process.stderr.write("\n");
 }

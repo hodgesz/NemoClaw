@@ -11,6 +11,11 @@ export interface RunSandboxConfigSyncDeps {
   runConnectScript: (sandboxName: string, scriptContent: string) => void;
 }
 
+/** Run config sync without allocating the interactive sandbox terminal transport. */
+export function sandboxConfigSyncArgs(sandboxName: string): string[] {
+  return ["sandbox", "exec", "-n", sandboxName, "--no-tty", "--", "bash", "-s"];
+}
+
 // Write `~/.nemoclaw/config.json` and normalize OpenClaw config-dir perms
 // inside the sandbox. Idempotent — safe to invoke from the rebuild resume
 // path where the Dockerfile leaves config.json as a zero-byte placeholder
@@ -37,7 +42,9 @@ export function buildSandboxConfigSyncScript(selectionConfig: ProviderSelectionC
   // chance to perform its own startup initialization.
   return `
 set -euo pipefail
-nemoclaw_dir="\${HOME:-/sandbox}/.nemoclaw"
+# OpenShell exec and the OpenClaw gateway can expose different HOME values.
+# The managed gateway always reads its NemoClaw state from /sandbox.
+nemoclaw_dir="/sandbox/.nemoclaw"
 nemoclaw_config="$nemoclaw_dir/config.json"
 mkdir -p -m 700 "$nemoclaw_dir"
 nemoclaw_dir_uid="$(stat -c '%u' "$nemoclaw_dir" 2>/dev/null || echo '')"

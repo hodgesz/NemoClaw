@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
-
 import {
   createBuiltInChannelManifestRegistry,
   createBuiltInRenderTemplateResolver,
 } from "../channels";
 import { createBuiltInMessagingHookRegistry, MessagingHookRegistry } from "../hooks";
 import { type ChannelManifest, createChannelManifestRegistry } from "../manifest";
+import { compactSandboxMessagingPlanForPersistence } from "../persistence";
 import { MessagingWorkflowPlanner } from "./workflow-planner";
 
 const TEST_CREDENTIALS: Readonly<Record<string, string>> = {
@@ -50,7 +50,6 @@ const CREDENTIAL_ONLY_MANIFEST: ChannelManifest = {
     },
   ],
   render: [],
-  state: {},
   hooks: [],
 };
 
@@ -221,21 +220,20 @@ describe("MessagingWorkflowPlanner", () => {
           if (context.channelId === "telegram") {
             throw new Error("existing channels should not re-enroll");
           }
-          const outputs: Record<string, { kind: "secret"; value: string }> = {};
-          for (const output of context.outputDeclarations ?? []) {
-            if (output.kind === "secret") {
-              const value =
-                context.channelId === "slack" && output.id === "botToken"
-                  ? "xoxb-test-slack-bot-token"
-                  : context.channelId === "slack" && output.id === "appToken"
-                    ? "xapp-test-slack-app-token"
-                    : `test-${context.channelId}-${output.id}`;
-              outputs[output.id] = {
-                kind: "secret",
-                value,
-              };
-            }
-          }
+          const outputs = Object.fromEntries(
+            (context.outputDeclarations ?? [])
+              .filter((output) => output.kind === "secret")
+              .map((output) => {
+                const value =
+                  context.channelId === "slack" && output.id === "botToken"
+                    ? "xoxb-test-slack-bot-token"
+                    : context.channelId === "slack" && output.id === "appToken"
+                      ? "xapp-test-slack-app-token"
+                      : `test-${context.channelId}-${output.id}`;
+                return [output.id, { kind: "secret" as const, value }];
+              }),
+          );
+
           return { outputs };
         },
       },
@@ -494,21 +492,20 @@ describe("MessagingWorkflowPlanner", () => {
           if (context.channelId === "telegram") {
             throw new Error("existing channels should not re-enroll");
           }
-          const outputs: Record<string, { kind: "secret"; value: string }> = {};
-          for (const output of context.outputDeclarations ?? []) {
-            if (output.kind === "secret") {
-              const value =
-                context.channelId === "slack" && output.id === "botToken"
-                  ? "xoxb-test-slack-bot-token"
-                  : context.channelId === "slack" && output.id === "appToken"
-                    ? "xapp-test-slack-app-token"
-                    : `test-${context.channelId}-${output.id}`;
-              outputs[output.id] = {
-                kind: "secret",
-                value,
-              };
-            }
-          }
+          const outputs = Object.fromEntries(
+            (context.outputDeclarations ?? [])
+              .filter((output) => output.kind === "secret")
+              .map((output) => {
+                const value =
+                  context.channelId === "slack" && output.id === "botToken"
+                    ? "xoxb-test-slack-bot-token"
+                    : context.channelId === "slack" && output.id === "appToken"
+                      ? "xapp-test-slack-app-token"
+                      : `test-${context.channelId}-${output.id}`;
+                return [output.id, { kind: "secret" as const, value }];
+              }),
+          );
+
           return { outputs };
         },
       },
@@ -559,7 +556,7 @@ describe("MessagingWorkflowPlanner", () => {
     ]);
   });
 
-  it("does not trust credential availability from mismatched sandbox entry plans", async () => {
+  it("does not trust credential availability across sandbox or channel boundaries", async () => {
     const registry = createChannelManifestRegistry([CREDENTIAL_ONLY_MANIFEST]);
     const localPlanner = new MessagingWorkflowPlanner(
       registry,
@@ -602,6 +599,30 @@ describe("MessagingWorkflowPlanner", () => {
       channelId: "matrix",
       credentialAvailable: false,
     });
+
+    // `botToken` is the input id of telegram, discord, slack and wechat, so a Telegram token
+    // must not satisfy the WeChat host-QR secret.
+    const crossChannel = await withEnv(
+      { WECHAT_ACCOUNT_ID: "wechat-account-1", WECHAT_BOT_TOKEN: undefined },
+      () =>
+        planner().buildPlan({
+          sandboxName: "demo",
+          agent: "openclaw",
+          workflow: "onboard",
+          isInteractive: false,
+          configuredChannels: ["telegram", "wechat"],
+          credentialAvailability: { botToken: true, TELEGRAM_BOT_TOKEN: true },
+        }),
+    );
+
+    expect(crossChannel.channels.find((channel) => channel.channelId === "wechat")).toMatchObject({
+      active: false,
+      configured: false,
+    });
+    expect(
+      crossChannel.credentialBindings.find((binding) => binding.channelId === "wechat"),
+    ).toMatchObject({ credentialAvailable: false });
+    expect(crossChannel.agentRender.map((entry) => entry.channelId)).not.toContain("wechat");
   });
 
   it("mutates disabled channel state in an existing sandbox entry plan", async () => {
@@ -665,6 +686,111 @@ describe("MessagingWorkflowPlanner", () => {
         (entry) => entry.channelId === "telegram" && entry.module === "telegram-diagnostics",
       ),
     ).toBe(true);
+  });
+
+  it("restores the Hermes rebuild plan after disabling and re-enabling all channels (#7144)", async () => {
+    const channels = ["telegram", "discord", "wechat", "slack", "whatsapp"] as const;
+    await withEnv(
+      {
+        TELEGRAM_ALLOWED_IDS: "1001,1002",
+        DISCORD_SERVER_ID: "guild-1",
+        DISCORD_USER_ID: "discord-user-1",
+        WECHAT_ACCOUNT_ID: "wechat-account",
+        WECHAT_ALLOWED_IDS: "wechat-user-1,wechat-user-2",
+        SLACK_ALLOWED_USERS: "U100,U200",
+        WHATSAPP_ALLOWED_IDS: "+15550000001,+15550000002",
+      },
+      async () => {
+        const lifecyclePlanner = planner();
+        const baseline = await lifecyclePlanner.buildPlan({
+          sandboxName: "demo",
+          agent: "hermes",
+          workflow: "rebuild",
+          isInteractive: false,
+          configuredChannels: channels,
+          credentialAvailability: {
+            TELEGRAM_BOT_TOKEN: true,
+            DISCORD_BOT_TOKEN: true,
+            WECHAT_BOT_TOKEN: true,
+            SLACK_BOT_TOKEN: true,
+            SLACK_APP_TOKEN: true,
+          },
+        });
+        expect(baseline.channels.every((channel) => channel.active && !channel.disabled)).toBe(
+          true,
+        );
+        expect(new Set(baseline.agentRender.map((entry) => entry.channelId))).toEqual(
+          new Set(channels),
+        );
+        expect(
+          baseline.agentRender.every(
+            (entry) =>
+              entry.target === "~/.hermes/.env" || entry.target === "~/.hermes/config.yaml",
+          ),
+        ).toBe(true);
+        expect(compactSandboxMessagingPlanForPersistence(baseline)).not.toHaveProperty(
+          "agentRender",
+        );
+        const persistedEntry = (plan: typeof baseline) => ({
+          name: "demo",
+          messaging: {
+            schemaVersion: 1 as const,
+            plan: compactSandboxMessagingPlanForPersistence(plan) as unknown as typeof baseline,
+          },
+        });
+
+        let current = baseline;
+        for (const channelId of channels) {
+          const stopped = await lifecyclePlanner.buildChannelStopPlanFromSandboxEntry({
+            sandboxName: "demo",
+            agent: "hermes",
+            sandboxEntry: persistedEntry(current),
+            channelId,
+          });
+          expect(stopped).not.toBeNull();
+          current = stopped!;
+        }
+        const disabledRebuild = await lifecyclePlanner.buildRebuildPlanFromSandboxEntry({
+          sandboxName: "demo",
+          agent: "hermes",
+          sandboxEntry: persistedEntry(current),
+        });
+        expect(disabledRebuild?.disabledChannels).toEqual([
+          "discord",
+          "slack",
+          "telegram",
+          "wechat",
+          "whatsapp",
+        ]);
+        expect(
+          disabledRebuild?.channels.every((channel) => !channel.active && channel.disabled),
+        ).toBe(true);
+        expect(disabledRebuild?.runtimeSetup).toEqual({
+          nodePreloads: [],
+          envAliases: [],
+          secretScans: [],
+        });
+
+        current = disabledRebuild!;
+        for (const channelId of channels) {
+          const started = await lifecyclePlanner.buildChannelStartPlanFromSandboxEntry({
+            sandboxName: "demo",
+            agent: "hermes",
+            sandboxEntry: persistedEntry(current),
+            channelId,
+          });
+          expect(started).not.toBeNull();
+          current = started!;
+        }
+        const restoredRebuild = await lifecyclePlanner.buildRebuildPlanFromSandboxEntry({
+          sandboxName: "demo",
+          agent: "hermes",
+          sandboxEntry: persistedEntry(current),
+        });
+
+        expect(restoredRebuild).toEqual(baseline);
+      },
+    );
   });
 
   it("removes Teams host forwarding while the channel is disabled", async () => {

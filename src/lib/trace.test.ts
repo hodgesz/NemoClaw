@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runCurlProbe } from "./adapters/http/probe";
+import { finishOnboardTrace, startOnboardTrace } from "./onboard/tracing";
 import {
   addTraceEvent,
   flushTrace,
@@ -100,13 +101,16 @@ describe("onboard trace artifacts", () => {
 
   it("sanitizes curl probe URLs and records status metadata", () => {
     withTraceFile((traceFile) => {
+      // Use a URL with a benign query parameter (`model`) that the curl-arg
+      // validator allows through but the trace sanitizer still redacts as
+      // part of its blanket query-string redaction. Inline `Authorization:
+      // Bearer ...` was removed because validateCurlProbeArgs rejects inline
+      // credential headers — credentials must go via the trusted --config
+      // tmpfile. The credential-shaped query-name rejection in
+      // CURL_SECRET_QUERY_PARAM_PATTERN now also refuses `session_token`,
+      // `api_key`, etc. See PR #5975.
       const result = runCurlProbe(
-        [
-          "-sS",
-          "-H",
-          "Authorization: Bearer should-not-appear",
-          "https://example.test/v1/chat/completions?key=secret",
-        ],
+        ["-sS", "https://example.test/v1/chat/completions?model=should-not-appear"],
         {
           spawnSyncImpl: () =>
             ({
@@ -127,9 +131,8 @@ describe("onboard trace artifacts", () => {
       );
 
       expect(text).not.toContain("should-not-appear");
-      expect(text).not.toContain("key=secret");
       expect(span?.attributes["http.url"]).toBe(
-        "https://example.test/v1/chat/completions?key=%3CREDACTED%3E",
+        "https://example.test/v1/chat/completions?model=%3CREDACTED%3E",
       );
       expect(span?.events[0].attributes).toMatchObject({ ok: true, http_status: 200 });
     });
@@ -204,11 +207,30 @@ describe("onboard trace artifacts", () => {
     }
   });
 
-  it("treats false-like NEMOCLAW_TRACE values as disabled", () => {
+  it("treats false-like NEMOCLAW_TRACE values as disabled and records the flag it acted on", () => {
     process.env[TRACE_ENABLED_ENV] = "false";
     resetTraceForTests();
-
     expect(getTraceCollector()).toBeNull();
+
+    // "2" enables the collector without being canonically truthy; the span must agree.
+    const originalCwd = process.cwd();
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-trace-noncanonical-"));
+    try {
+      process.chdir(tmpDir);
+      process.env[TRACE_ENABLED_ENV] = "2";
+      resetTraceForTests();
+
+      const handle = startOnboardTrace({}, process.env);
+      const traceFile = handle.collector?.outputPath ?? "";
+      expect(traceFile).toContain(path.join(".e2e", "traces", "nemoclaw-trace-"));
+      finishOnboardTrace(handle, true);
+
+      const root = readTraceArtifact(traceFile).resource_spans[0].scope_spans[0].spans[0];
+      expect(root.attributes.trace_enabled).toBe(true);
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(tmpDir, { force: true, recursive: true });
+    }
   });
 
   it("removes the registered exit listener when resetting tests", () => {

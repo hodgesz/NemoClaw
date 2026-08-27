@@ -6,13 +6,13 @@ import { createRequire } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const requireDist = createRequire(import.meta.url);
-const onboardSession = requireDist("../../../../dist/lib/state/onboard-session.js");
+const onboardSession = requireDist("../../state/onboard-session.js");
 const {
   isLocalInferenceProvider,
   getRebuildCredentialEnvFromRegistry,
   getRebuildEndpointFromRegistry,
   prepareRebuildResumeConfig,
-} = requireDist("../../../../dist/lib/actions/sandbox/rebuild-resume-config.js");
+} = requireDist("./rebuild-resume-config.js");
 
 const noopLog = () => undefined;
 const throwingBail = (msg: string): never => {
@@ -113,10 +113,7 @@ describe("getRebuildEndpointFromRegistry", () => {
 
   it("uses canonical durable custom endpoint metadata from the sandbox registry", () => {
     expect(
-      getRebuildEndpointFromRegistry(
-        "compatible-endpoint",
-        " http://127.0.0.1:19999/v1/?x=1#frag ",
-      ),
+      getRebuildEndpointFromRegistry("compatible-endpoint", " http://127.0.0.1:19999/v1/ "),
     ).toEqual({
       known: true,
       endpointUrl: "http://127.0.0.1:19999/v1",
@@ -133,14 +130,140 @@ describe("getRebuildEndpointFromRegistry", () => {
     expect(
       getRebuildEndpointFromRegistry("compatible-endpoint", "https://u:p@example.test/v1"),
     ).toEqual({ known: false });
+    expect(
+      getRebuildEndpointFromRegistry("compatible-endpoint", "https://example.test/v1?x=1"),
+    ).toEqual({ known: false });
+    expect(
+      getRebuildEndpointFromRegistry("compatible-endpoint", "https://example.test/v1;id"),
+    ).toEqual({ known: false });
+    expect(
+      getRebuildEndpointFromRegistry("compatible-endpoint", "https://example.test/v1%0ax"),
+    ).toEqual({ known: false });
+    expect(
+      getRebuildEndpointFromRegistry("compatible-endpoint", "\thttps://example.test/v1"),
+    ).toEqual({ known: false });
+    expect(
+      getRebuildEndpointFromRegistry("compatible-endpoint", "https://example.test/v1\n"),
+    ).toEqual({ known: false });
+    expect(
+      getRebuildEndpointFromRegistry("compatible-endpoint", "\u00a0https://example.test/v1"),
+    ).toEqual({ known: false });
+    expect(
+      getRebuildEndpointFromRegistry("compatible-endpoint", "https://example.test/v1\u2029"),
+    ).toEqual({ known: false });
+    expect(
+      getRebuildEndpointFromRegistry("compatible-endpoint", "http://@example.test/v1"),
+    ).toEqual({ known: false });
+    expect(
+      getRebuildEndpointFromRegistry("compatible-endpoint", "https:user:password@example.test/v1"),
+    ).toEqual({ known: false });
+    expect(
+      getRebuildEndpointFromRegistry("compatible-endpoint", "https://example.test/v1#frag"),
+    ).toEqual({ known: false });
   });
 });
 
 describe("prepareRebuildResumeConfig", () => {
+  it("preserves a stale Hermes API marker so rebuild re-arms provider setup (#6289)", () => {
+    vi.spyOn(onboardSession, "loadSession").mockReturnValue(null);
+
+    const config = prepareRebuildResumeConfig(
+      "alpha",
+      entry({
+        provider: "compatible-anthropic-endpoint",
+        model: "nvidia/nvidia/nemotron-3-super-v3",
+        endpointUrl: "https://inference-api.nvidia.com",
+        credentialEnv: "COMPATIBLE_ANTHROPIC_API_KEY",
+        preferredInferenceApi: "anthropic-messages",
+      }),
+      "hermes",
+      noopLog,
+      throwingBail,
+    );
+
+    expect(config).toMatchObject({
+      agent: "hermes",
+      provider: "compatible-anthropic-endpoint",
+      model: "nvidia/nvidia/nemotron-3-super-v3",
+      endpointUrl: "https://inference-api.nvidia.com",
+      credentialEnv: "COMPATIBLE_ANTHROPIC_API_KEY",
+      preferredInferenceApi: "anthropic-messages",
+    });
+  });
+
+  it("preserves legacy OpenClaw custom Anthropic routes during rebuild (#6289)", () => {
+    vi.spyOn(onboardSession, "loadSession").mockReturnValue(null);
+
+    const config = prepareRebuildResumeConfig(
+      "alpha",
+      entry({
+        provider: "compatible-anthropic-endpoint",
+        model: "claude-sonnet-proxy",
+        endpointUrl: "https://anthropic-compatible.example/v1",
+        credentialEnv: "COMPATIBLE_ANTHROPIC_API_KEY",
+        preferredInferenceApi: "anthropic-messages",
+      }),
+      null,
+      noopLog,
+      throwingBail,
+    );
+
+    expect(config?.preferredInferenceApi).toBe("anthropic-messages");
+  });
+
+  it("recovers a complete legacy selection only from the target's matching session", () => {
+    vi.spyOn(onboardSession, "loadSession").mockReturnValue({
+      sandboxName: "alpha",
+      provider: "nvidia-prod",
+      model: "nvidia/legacy-model",
+      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+      preferredInferenceApi: "openai-completions",
+    });
+    const config = prepareRebuildResumeConfig("alpha", entry(), null, noopLog, throwingBail);
+    expect(config).toMatchObject({
+      provider: "nvidia-prod",
+      model: "nvidia/legacy-model",
+      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+      preferredInferenceApi: "openai-completions",
+    });
+  });
+
+  it("surfaces the legacy local credential migration while clearing the stale key", () => {
+    vi.spyOn(onboardSession, "loadSession").mockReturnValue({
+      sandboxName: "alpha",
+      provider: "ollama-local",
+      model: "llama3.2",
+      credentialEnv: "OPENAI_API_KEY",
+    });
+    const log = vi.fn();
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const config = prepareRebuildResumeConfig(
+      "alpha",
+      entry({ provider: "ollama-local", model: "llama3.2" }),
+      null,
+      log,
+      throwingBail,
+    );
+
+    expect(config?.credentialEnv).toBeNull();
+    expect(consoleLog).toHaveBeenCalledWith(expect.stringContaining("GH #2519"));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("clearing for rebuild"));
+  });
+
+  it("fails closed when neither registry nor matching session has a complete selection", () => {
+    vi.spyOn(onboardSession, "loadSession").mockReturnValue({ sandboxName: "other" });
+    expect(() => prepareRebuildResumeConfig("alpha", entry(), null, noopLog, throwingBail)).toThrow(
+      "Cannot determine recorded inference provider and model",
+    );
+  });
+
   it("validates and canonicalizes a matching custom-endpoint session endpoint", () => {
     vi.spyOn(onboardSession, "loadSession").mockReturnValue({
       sandboxName: "alpha",
-      endpointUrl: " http://127.0.0.1:19999/v1/?x=1#frag ",
+      provider: "compatible-endpoint",
+      model: "m",
+      endpointUrl: " http://127.0.0.1:19999/v1/ ",
     });
     const config = prepareRebuildResumeConfig(
       "alpha",
@@ -155,6 +278,7 @@ describe("prepareRebuildResumeConfig", () => {
       credentialEnv: "COMPATIBLE_API_KEY",
       pinEndpoint: false,
       endpointUrl: "http://127.0.0.1:19999/v1",
+      registryInferenceRoute: null,
     });
   });
 
@@ -168,7 +292,8 @@ describe("prepareRebuildResumeConfig", () => {
       entry({
         provider: "compatible-endpoint",
         model: "m",
-        endpointUrl: "https://registry.example.test/v1?x=1#frag",
+        endpointUrl: "https://registry.example.test/v1",
+        preferredInferenceApi: "openai-completions",
       }),
       null,
       noopLog,
@@ -180,12 +305,22 @@ describe("prepareRebuildResumeConfig", () => {
       pinEndpoint: true,
       endpointUrl: "https://registry.example.test/v1",
     });
+    expect(config?.registryInferenceRoute).toEqual({
+      provider: "compatible-endpoint",
+      model: "m",
+      endpointUrl: "https://registry.example.test/v1",
+      endpointSource: null,
+      preferredInferenceApi: "openai-completions",
+      source: "registry",
+    });
   });
 
   it("ignores target-scoped explicit env when the custom-endpoint session matches the sandbox", () => {
     vi.spyOn(onboardSession, "loadSession").mockReturnValue({
       sandboxName: "alpha",
-      endpointUrl: "https://session.example.test/v1?x=1#frag",
+      provider: "compatible-endpoint",
+      model: "m",
+      endpointUrl: "https://session.example.test/v1",
     });
     const restore = snapshotEnv([
       "NEMOCLAW_SANDBOX_NAME",
@@ -225,10 +360,37 @@ describe("prepareRebuildResumeConfig", () => {
     ).toThrow("Cannot validate recreate endpoint");
   });
 
-  it("fails closed for a matching custom-endpoint session with an invalid endpoint", () => {
+  it.each([
+    ["userinfo", "https://user:pass@example.test/v1"],
+    ["a percent-encoded control character", "https://example.test/v1%0ainjected"],
+    ["a shell metacharacter", "https://example.test/v1;id"],
+  ])(
+    "fails closed for a matching custom-endpoint session with %s before rebuild deletion",
+    (_label, endpointUrl) => {
+      vi.spyOn(onboardSession, "loadSession").mockReturnValue({
+        sandboxName: "alpha",
+        provider: "compatible-endpoint",
+        model: "m",
+        endpointUrl,
+      });
+      expect(() =>
+        prepareRebuildResumeConfig(
+          "alpha",
+          entry({ provider: "compatible-endpoint", model: "m" }),
+          null,
+          noopLog,
+          throwingBail,
+        ),
+      ).toThrow("Cannot validate recreate endpoint");
+    },
+  );
+
+  it("does not borrow a custom endpoint from a conflicting same-sandbox selection", () => {
     vi.spyOn(onboardSession, "loadSession").mockReturnValue({
       sandboxName: "alpha",
-      endpointUrl: "https://user:pass@example.test/v1",
+      provider: "nvidia-prod",
+      model: "different-model",
+      endpointUrl: "https://wrong.example.test/v1",
     });
     expect(() =>
       prepareRebuildResumeConfig(
@@ -278,7 +440,7 @@ describe("prepareRebuildResumeConfig", () => {
     try {
       process.env.NEMOCLAW_SANDBOX_NAME = "alpha";
       process.env.NEMOCLAW_PROVIDER = "custom";
-      process.env.NEMOCLAW_ENDPOINT_URL = " http://127.0.0.1:19999/v1/?x=1#frag ";
+      process.env.NEMOCLAW_ENDPOINT_URL = " http://127.0.0.1:19999/v1/ ";
       process.env.NEMOCLAW_MODEL = "m";
       const config = prepareRebuildResumeConfig(
         "alpha",
@@ -292,6 +454,7 @@ describe("prepareRebuildResumeConfig", () => {
         model: "m",
         pinEndpoint: true,
         endpointUrl: "http://127.0.0.1:19999/v1",
+        registryInferenceRoute: null,
       });
     } finally {
       restore();
@@ -309,7 +472,7 @@ describe("prepareRebuildResumeConfig", () => {
     try {
       process.env.NEMOCLAW_SANDBOX_NAME = "alpha";
       process.env.NEMOCLAW_PROVIDER = "anthropicCompatible";
-      process.env.NEMOCLAW_ENDPOINT_URL = "https://anthropic.example.test/v1?x=1#frag";
+      process.env.NEMOCLAW_ENDPOINT_URL = "https://anthropic.example.test/v1";
       process.env.NEMOCLAW_MODEL = "claude-like";
       const config = prepareRebuildResumeConfig(
         "alpha",
@@ -329,17 +492,46 @@ describe("prepareRebuildResumeConfig", () => {
     }
   });
 
-  it("rejects explicit target endpoints that do not exactly match the target boundary", () => {
-    const cases = [
-      { name: "wrong sandbox", sandboxName: "beta" },
-      { name: "wrong provider", provider: "openai" },
-      { name: "unknown provider", provider: "compatible-endpoint-alias" },
-      { name: "missing model", model: "" },
-      { name: "wrong model", model: "other-model" },
-      { name: "unsupported url", endpointUrl: "file:///tmp/x" },
-      { name: "userinfo url", endpointUrl: "https://u:p@example.test/v1" },
-    ];
-    for (const testCase of cases) {
+  it("rejects component-bearing explicit endpoints for the anthropicCompatible alias (#9106)", () => {
+    vi.spyOn(onboardSession, "loadSession").mockReturnValue({ sandboxName: "other" });
+    const restore = snapshotEnv([
+      "NEMOCLAW_SANDBOX_NAME",
+      "NEMOCLAW_PROVIDER",
+      "NEMOCLAW_ENDPOINT_URL",
+      "NEMOCLAW_MODEL",
+    ]);
+    try {
+      process.env.NEMOCLAW_SANDBOX_NAME = "alpha";
+      process.env.NEMOCLAW_PROVIDER = "anthropicCompatible";
+      process.env.NEMOCLAW_ENDPOINT_URL = "https://u:p@anthropic.example.test/v1?x=1#frag";
+      process.env.NEMOCLAW_MODEL = "claude-like";
+      expect(() =>
+        prepareRebuildResumeConfig(
+          "alpha",
+          entry({ provider: "compatible-anthropic-endpoint", model: "claude-like" }),
+          null,
+          noopLog,
+          throwingBail,
+        ),
+      ).toThrow("Cannot determine recreate endpoint");
+    } finally {
+      restore();
+    }
+  });
+
+  it.each([
+    { name: "wrong sandbox", sandboxName: "beta" },
+    { name: "wrong provider", provider: "openai" },
+    { name: "unknown provider", provider: "compatible-endpoint-alias" },
+    { name: "missing model", model: "" },
+    { name: "wrong model", model: "other-model" },
+    { name: "unsupported url", endpointUrl: "file:///tmp/x" },
+    { name: "userinfo url", endpointUrl: "https://u:p@example.test/v1" },
+    { name: "query url", endpointUrl: "https://example.test/v1?x=1" },
+    { name: "fragment url", endpointUrl: "https://example.test/v1#frag" },
+  ])(
+    "rejects explicit target endpoints that do not exactly match the target boundary [$name]",
+    (testCase) => {
       vi.restoreAllMocks();
       vi.spyOn(onboardSession, "loadSession").mockReturnValue({ sandboxName: "other" });
       const restore = snapshotEnv([
@@ -365,8 +557,8 @@ describe("prepareRebuildResumeConfig", () => {
       } finally {
         restore();
       }
-    }
-  });
+    },
+  );
 
   it("does not use an explicit endpoint when its sandbox name targets another sandbox", () => {
     vi.spyOn(onboardSession, "loadSession").mockReturnValue({ sandboxName: "other" });
@@ -403,6 +595,7 @@ describe("prepareRebuildResumeConfig", () => {
         endpointUrl: "http://127.0.0.1:19999/v1",
         credentialEnv: "COMPATIBLE_API_KEY",
         preferredInferenceApi: "openai-completions",
+        compatibleEndpointReasoning: "true",
       }),
       null,
       noopLog,
@@ -413,9 +606,104 @@ describe("prepareRebuildResumeConfig", () => {
       model: "m",
       credentialEnv: "COMPATIBLE_API_KEY",
       preferredInferenceApi: "openai-completions",
+      compatibleEndpointReasoning: "true",
       pinEndpoint: true,
       endpointUrl: "http://127.0.0.1:19999/v1",
+      registryInferenceRoute: {
+        provider: "compatible-endpoint",
+        model: "m",
+        endpointUrl: "http://127.0.0.1:19999/v1",
+        preferredInferenceApi: "openai-completions",
+        source: "registry",
+      },
     });
+  });
+
+  it("does not borrow compatible-endpoint reasoning from an unrelated session", () => {
+    vi.spyOn(onboardSession, "loadSession").mockReturnValue({
+      sandboxName: "other",
+      compatibleEndpointReasoning: "true",
+    });
+    const config = prepareRebuildResumeConfig(
+      "alpha",
+      entry({
+        provider: "compatible-endpoint",
+        model: "m",
+        endpointUrl: "https://example.test/v1",
+      }),
+      null,
+      noopLog,
+      throwingBail,
+    );
+    expect(config?.compatibleEndpointReasoning).toBeNull();
+  });
+
+  it("uses the target session as a legacy reasoning fallback", () => {
+    vi.spyOn(onboardSession, "loadSession").mockReturnValue({
+      sandboxName: "alpha",
+      provider: "compatible-endpoint",
+      model: "m",
+      compatibleEndpointReasoning: "false",
+    });
+    const config = prepareRebuildResumeConfig(
+      "alpha",
+      entry({
+        provider: "compatible-endpoint",
+        model: "m",
+        endpointUrl: "https://example.test/v1",
+      }),
+      null,
+      noopLog,
+      throwingBail,
+    );
+    expect(config?.compatibleEndpointReasoning).toBe("false");
+  });
+
+  it("treats an explicit null registry reasoning effort as authoritative", () => {
+    vi.spyOn(onboardSession, "loadSession").mockReturnValue({
+      sandboxName: "alpha",
+      provider: "compatible-endpoint",
+      model: "m",
+      endpointUrl: "https://example.test/v1",
+      compatibleEndpointReasoningEffort: "low",
+    });
+    const config = prepareRebuildResumeConfig(
+      "alpha",
+      entry({
+        provider: "compatible-endpoint",
+        model: "m",
+        endpointUrl: "https://example.test/v1",
+        compatibleEndpointReasoningEffort: null,
+      }),
+      null,
+      noopLog,
+      throwingBail,
+    );
+
+    expect(config?.compatibleEndpointReasoningEffort).toBeNull();
+  });
+
+  it("uses the target session effort only when the registry field is absent", () => {
+    vi.spyOn(onboardSession, "loadSession").mockReturnValue({
+      sandboxName: "alpha",
+      provider: "compatible-endpoint",
+      model: "m",
+      endpointUrl: "https://example.test/v1",
+      compatibleEndpointReasoningEffort: "low",
+    });
+    const config = prepareRebuildResumeConfig(
+      "alpha",
+      entry({
+        provider: "compatible-endpoint",
+        model: "m",
+        endpointUrl: "https://example.test/v1",
+      }),
+      null,
+      noopLog,
+      throwingBail,
+    );
+
+    expect(config?.compatibleEndpointReasoningEffort).toBe("low");
   });
 
   it("fails closed for invalid durable custom endpoint metadata before delete", () => {
@@ -438,7 +726,7 @@ describe("prepareRebuildResumeConfig", () => {
       entry({
         provider: "compatible-endpoint",
         model: "m",
-        endpointUrl: " https://example.test/v1?x=1#frag ",
+        endpointUrl: " https://example.test/v1/ ",
         credentialEnv: "COMPATIBLE_API_KEY",
       }),
       null,
@@ -453,7 +741,13 @@ describe("prepareRebuildResumeConfig", () => {
     const prior = process.env.NEMOCLAW_AGENT;
     process.env.NEMOCLAW_AGENT = "langchain-deepagents-code";
     try {
-      const config = prepareRebuildResumeConfig("alpha", entry(), null, noopLog, throwingBail);
+      const config = prepareRebuildResumeConfig(
+        "alpha",
+        entry({ provider: "nvidia-prod", model: "nvidia/test" }),
+        null,
+        noopLog,
+        throwingBail,
+      );
       expect(config?.ambient.agentMismatch).toEqual({
         envAgent: "langchain-deepagents-code",
         registryAgent: "openclaw",

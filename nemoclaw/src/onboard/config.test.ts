@@ -19,7 +19,7 @@ import {
 const store = new Map<string, string>();
 
 vi.mock("node:fs", async (importOriginal) => {
-  const original = await importOriginal();
+  const original = await importOriginal<typeof import("node:fs")>();
   return {
     ...original,
     existsSync: (p: string) => store.has(p),
@@ -88,10 +88,10 @@ describe("onboard/config", () => {
 
     it("handles non-URL endpoint strings gracefully", () => {
       const config = makeConfig({
-        endpointType: "local",
+        endpointType: "custom",
         endpointUrl: "not-a-url",
       });
-      expect(describeOnboardEndpoint(config)).toBe("local (not-a-url)");
+      expect(describeOnboardEndpoint(config)).toBe("custom (not-a-url)");
     });
   });
 
@@ -105,24 +105,25 @@ describe("onboard/config", () => {
       expect(describeOnboardProvider(config)).toBe("My Custom Provider");
     });
 
-    const endpointCases: [EndpointType, string][] = [
-      ["build", "NVIDIA Endpoints"],
-      ["openai", "OpenAI"],
-      ["anthropic", "Anthropic"],
-      ["gemini", "Google Gemini"],
-      ["ollama", "Local Ollama"],
-      ["vllm", "Local vLLM"],
-      ["nim-local", "Local NVIDIA NIM"],
-      ["ncp", "NVIDIA Cloud Partner"],
-      ["custom", "Other OpenAI-compatible endpoint"],
+    const endpointCases: Array<{ endpointType: EndpointType; expected: string }> = [
+      { endpointType: "build", expected: "NVIDIA Endpoints" },
+      { endpointType: "openai", expected: "OpenAI" },
+      { endpointType: "anthropic", expected: "Anthropic" },
+      { endpointType: "gemini", expected: "Google Gemini" },
+      { endpointType: "ollama", expected: "Local Ollama" },
+      { endpointType: "vllm", expected: "Local vLLM" },
+      { endpointType: "nim-local", expected: "Local NVIDIA NIM" },
+      { endpointType: "ncp", expected: "NVIDIA Cloud Partner" },
+      { endpointType: "custom", expected: "Other OpenAI-compatible endpoint" },
     ];
 
-    for (const [endpointType, expected] of endpointCases) {
-      it(`returns "${expected}" for endpoint type "${endpointType}"`, () => {
+    it.each(endpointCases)(
+      'returns "$expected" for endpoint type "$endpointType"',
+      ({ endpointType, expected }) => {
         const config = makeConfig({ endpointType, providerLabel: undefined });
         expect(describeOnboardProvider(config)).toBe(expected);
-      });
-    }
+      },
+    );
 
     it("returns Unknown for unsupported endpoint types", () => {
       const config = makeConfig({

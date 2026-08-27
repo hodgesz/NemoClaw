@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { AgentDefinition } from "../agent/defs";
+import type { HERMES_PORTABLE_OPENSHELL_VERSION } from "../adapters/openshell/resolve-shared";
 import type { SandboxEntry } from "../state/registry";
 import * as registry from "../state/registry";
 import { getSandboxAgentRegistryFields } from "./sandbox-agent";
 import type { SandboxGpuConfig } from "./sandbox-gpu-mode";
 
 export interface SandboxRegistryMetadataDeps {
-  isLinuxDockerDriverGatewayEnabled(): boolean;
+  getOpenShellComputeDriverName(): string;
   getInstalledOpenshellVersion(versionOutput?: string | null): string | null;
   runCaptureOpenshell(args: string[], opts?: Record<string, unknown>): string | null;
 }
@@ -36,7 +37,25 @@ export interface SandboxRegistryMetadataHelpers {
     dashboardPort: number,
     selectionVerified?: boolean,
     sandboxGpuConfig?: SandboxGpuConfig | null,
+    revalidatePolicyAuthority?: (operation: string) => void,
   ): void;
+}
+
+/** Build schema-5 runtime fields without ambient driver or OpenShell discovery. */
+export function getHermesPortableSandboxRuntimeRegistryFields(
+  config: SandboxGpuConfig,
+  openshellVersion: typeof HERMES_PORTABLE_OPENSHELL_VERSION,
+): ReturnType<SandboxRegistryMetadataHelpers["getSandboxRuntimeRegistryFields"]> {
+  return {
+    gpuEnabled: config.sandboxGpuEnabled,
+    hostGpuDetected: config.hostGpuDetected,
+    sandboxGpuEnabled: config.sandboxGpuEnabled,
+    sandboxGpuMode: config.mode,
+    sandboxGpuDevice: config.sandboxGpuDevice,
+    ...(config.sandboxGpuProof ? { sandboxGpuProof: config.sandboxGpuProof } : {}),
+    openshellDriver: "docker",
+    openshellVersion,
+  };
 }
 
 export function createSandboxRegistryMetadataHelpers(
@@ -55,10 +74,6 @@ export function createSandboxRegistryMetadataHelpers(
     | "openshellDriver"
     | "openshellVersion"
   > {
-    // OpenShell's Docker-driver gateway always starts with OPENSHELL_DRIVERS=docker,
-    // including on macOS arm64 (#3454). Recording "vm" for darwin here makes later
-    // setup misclassify the sandbox and run VM-only DNS monkeypatch / warning paths
-    // (#3728).
     return {
       gpuEnabled: config.sandboxGpuEnabled,
       hostGpuDetected: config.hostGpuDetected,
@@ -68,7 +83,9 @@ export function createSandboxRegistryMetadataHelpers(
       // Only persist a proof when this run produced one; omit on reuse/update
       // paths so a prior proof result is preserved rather than nulled out.
       ...(config.sandboxGpuProof ? { sandboxGpuProof: config.sandboxGpuProof } : {}),
-      openshellDriver: deps.isLinuxDockerDriverGatewayEnabled() ? "docker" : "kubernetes",
+      // Driver identity comes from the resolved compute plan, not the host
+      // gateway launcher; those layers may differ (#7744).
+      openshellDriver: deps.getOpenShellComputeDriverName(),
       openshellVersion: deps.getInstalledOpenshellVersion(
         deps.runCaptureOpenshell(["--version"], { ignoreError: true }),
       ),
@@ -93,17 +110,20 @@ export function createSandboxRegistryMetadataHelpers(
     dashboardPort: number,
     selectionVerified = true,
     sandboxGpuConfig: SandboxGpuConfig | null = null,
+    revalidatePolicyAuthority?: (operation: string) => void,
   ): void {
     const existingEntry = registry.getSandbox(sandboxName);
     const agentFields = getSandboxAgentRegistryFields(agent, false);
     const selectionUpdates = selectionVerified ? { model, provider } : {};
+    revalidatePolicyAuthority?.(`record reused sandbox metadata for '${sandboxName}'`);
     registry.updateSandbox(sandboxName, {
       ...selectionUpdates,
       dashboardPort,
-      agent: agentFields.agent,
+      agent: existingEntry?.agent !== undefined ? existingEntry.agent : agentFields.agent,
       agentVersion: existingEntry?.agentVersion ?? null,
       ...(sandboxGpuConfig ? getSandboxRuntimeRegistryFields(sandboxGpuConfig) : {}),
     });
+    revalidatePolicyAuthority?.(`make reused sandbox '${sandboxName}' the default`);
     registry.setDefault(sandboxName);
   }
 

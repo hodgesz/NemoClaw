@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as registry from "../../state/registry";
+import { hydrateDerivedSandboxMessagingPlanFields } from "../hydration";
 import type { SandboxMessagingPlan, SandboxMessagingRuntimeSetupPlan } from "../manifest";
-import { hydrateDerivedSandboxMessagingPlanFields } from "../persistence";
 import { parseSandboxMessagingPlan } from "../plan-validation";
 import { MessagingSetupApplier } from "./setup-applier";
 import type { MessagingSetupEnvOptions } from "./types";
@@ -65,7 +65,7 @@ function clonePlan(plan: SandboxMessagingPlan): SandboxMessagingPlan {
   return MessagingSetupApplier.decodePlan(MessagingSetupApplier.encodePlan(plan));
 }
 
-function mergeSandboxMessagingPlans(
+export function mergeSandboxMessagingPlans(
   existing: SandboxMessagingPlan,
   incoming: SandboxMessagingPlan,
 ): SandboxMessagingPlan {

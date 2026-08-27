@@ -19,6 +19,9 @@ export async function setupVllmLocalInference(
     applyLocalInferenceRoute,
     run,
     VLLM_LOCAL_CREDENTIAL_ENV,
+    getManagedVllmProviderBinding,
+    exitProcess,
+    error,
   } = deps;
 
   const validation = validateLocalProvider(provider);
@@ -40,28 +43,37 @@ export async function setupVllmLocalInference(
           "The sandbox uses a different network path and may work correctly.",
       );
     } else {
-      console.error(`  ${validation.message}`);
+      error(`  ${validation.message}`);
       if (validation.diagnostic) {
-        console.error(`  Diagnostic: ${validation.diagnostic}`);
+        error(`  Diagnostic: ${validation.diagnostic}`);
       }
-      process.exit(1);
+      return exitProcess(1);
     }
   }
-  const baseUrl = getLocalProviderBaseUrl(provider);
+  let managedBinding: ReturnType<typeof getManagedVllmProviderBinding>;
+  try {
+    managedBinding = getManagedVllmProviderBinding();
+  } catch {
+    error("  Managed vLLM authentication state is unsafe or unreadable.");
+    return exitProcess(1);
+  }
+  const baseUrl = managedBinding?.baseUrl ?? getLocalProviderBaseUrl(provider);
+  const providerToken = managedBinding?.apiKey ?? "dummy";
   // Use a dedicated internal credential env so the gateway does not pick
   // up the user's host OPENAI_API_KEY for local vLLM. vLLM does not enforce
-  // the bearer at runtime, but a dedicated env name prevents accidental
-  // hijacking. See GH #2519.
+  // the bearer for legacy single-host installs; managed dual-Station vLLM
+  // uses the private persisted key. The dedicated env name prevents
+  // accidental hijacking by a host OPENAI_API_KEY. See GH #2519.
   const providerResult = upsertProvider(
     "vllm-local",
     "openai",
     VLLM_LOCAL_CREDENTIAL_ENV,
     baseUrl,
-    { [VLLM_LOCAL_CREDENTIAL_ENV]: "dummy" },
+    { [VLLM_LOCAL_CREDENTIAL_ENV]: providerToken },
   );
   if (!providerResult.ok) {
-    console.error(`  ${providerResult.message}`);
-    process.exit(providerResult.status || 1);
+    error(`  ${providerResult.message}`);
+    return exitProcess(providerResult.status || 1);
   }
   if (await applyLocalInferenceRoute("vllm-local", model)) {
     return { done: true, result: { retry: "selection" } };

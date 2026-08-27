@@ -3,21 +3,24 @@
 
 import { describe, expect, it } from "vitest";
 
-import {
-  createSession,
-  filterSafeUpdates,
-  MACHINE_SNAPSHOT_VERSION,
-  normalizeSession,
-  type Session,
-  type SessionUpdates,
-  sanitizeFailure,
-} from "../../state/onboard-session";
 import type { OnboardFlowContext, OnboardFlowPhaseResult } from "./flow-context";
 import { onboardFlowPhaseResult } from "./flow-context";
 import { buildOnboardFlowPhaseSequence } from "./flow-sequence";
 import { advanceTo, branchTo, completeOnboardMachine } from "./result";
 import { OnboardRuntime, type OnboardRuntimeDeps } from "./runtime";
 import { runOnboardSequenceWithRunner } from "./sequence-runner";
+import {
+  MACHINE_SNAPSHOT_VERSION,
+  type Session,
+  type SessionUpdates,
+  cloneSession,
+  createSession,
+  createTestRuntime,
+} from "../../../../test/helpers/onboard-machine-runtime-fixture";
+
+function createRuntime(initialSession: Session = createSession()) {
+  return createTestRuntime(initialSession, { now: () => "2026-05-29T00:00:00.000Z" });
+}
 
 type Context = OnboardFlowContext<null, { type: string }, { mode: string }>;
 
@@ -38,6 +41,8 @@ function context(patch: Partial<Context> = {}): Context {
     hermesAuthMethod: null,
     hermesToolGateways: [],
     preferredInferenceApi: null,
+    compatibleEndpointReasoning: null,
+    compatibleEndpointReasoningEffort: null,
     nimContainer: null,
     webSearchConfig: null,
     webSearchSupported: false,
@@ -54,57 +59,6 @@ function result(
   next: ReturnType<typeof advanceTo>["next"],
 ): OnboardFlowPhaseResult<Context> {
   return onboardFlowPhaseResult(ctx, advanceTo(next));
-}
-
-function cloneSession(session: Session): Session {
-  return normalizeSession(JSON.parse(JSON.stringify(session))) ?? session;
-}
-
-function createRuntime(initialSession: Session = createSession()) {
-  let session = cloneSession(initialSession);
-  const updateSession = (mutator: (value: Session) => Session | void): Session => {
-    session = cloneSession(mutator(cloneSession(session)) ?? session);
-    return cloneSession(session);
-  };
-  const deps: OnboardRuntimeDeps = {
-    loadSession: () => cloneSession(session),
-    createSession,
-    saveSession: (next) => {
-      session = cloneSession(next);
-      return cloneSession(session);
-    },
-    updateSession,
-    markStepStarted: () => cloneSession(session),
-    markStepComplete: (_stepName, updates: SessionUpdates = {}) =>
-      updateSession((current) => {
-        Object.assign(current, filterSafeUpdates(updates));
-        return current;
-      }),
-    markStepCompleteRecordOnly: (_stepName, updates: SessionUpdates = {}) =>
-      updateSession((current) => {
-        Object.assign(current, filterSafeUpdates(updates));
-        return current;
-      }),
-    markStepSkipped: () => cloneSession(session),
-    markStepFailed: (stepName, message) =>
-      updateSession((current) => {
-        current.status = "failed";
-        current.failure = sanitizeFailure({ step: stepName, message, recordedAt: "now" });
-        return current;
-      }),
-    markStepFailedRecordOnly: () => cloneSession(session),
-    completeSession: (updates: SessionUpdates = {}) =>
-      updateSession((current) => {
-        Object.assign(current, filterSafeUpdates(updates));
-        current.status = "complete";
-        current.resumable = false;
-        return current;
-      }),
-    filterSafeUpdates,
-    emitEvent: () => undefined,
-    now: () => "2026-05-29T00:00:00.000Z",
-  };
-  return new OnboardRuntime(deps);
 }
 
 describe("onboard flow phase sequence", () => {
@@ -229,7 +183,13 @@ describe("onboard flow phase sequence", () => {
     });
 
     const run = await runOnboardSequenceWithRunner({
-      context: context(),
+      context: context({
+        credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+        fromDockerfile: "Dockerfile",
+        hermesToolGateways: ["local"],
+        sandboxGpuConfig: { mode: "sentinel" },
+        selectedMessagingChannels: ["slack"],
+      }),
       runtime: createRuntime(initialSession),
       phases,
     });
@@ -243,6 +203,13 @@ describe("onboard flow phase sequence", () => {
       provider: "nvidia",
       model: "model",
       sandboxName: "my-assistant",
+      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+      fromDockerfile: "Dockerfile",
+      gpu: { type: "nvidia" },
+      sandboxGpuConfig: { mode: "sentinel" },
+      gpuPassthrough: true,
+      hermesToolGateways: ["local"],
+      selectedMessagingChannels: ["slack"],
     });
   });
 });

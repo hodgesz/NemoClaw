@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
-
-import { validateSkillName } from "../../dist/lib/skill-name";
-import { checkExisting, removeSkill, verifyRemove } from "../../dist/lib/skill-remote";
-import { resolveSkillPaths } from "../../dist/lib/skill-install";
+import { resolveSkillPaths } from "./skill-install";
+import { validateSkillName } from "./skill-name";
+import { checkExisting, removeSkill, verifyRemove } from "./skill-remote";
 
 describe("validateSkillName", () => {
   it("accepts valid skill names", () => {
@@ -85,6 +84,71 @@ describe("removeSkill (unit — no SSH)", () => {
       "printf '{}' > '/sandbox/.openclaw/agents/main/sessions/sessions.json'",
     ]);
   });
+
+  it("tells Hermes users to start a fresh session after removal", () => {
+    const ctx = { configFile: "/tmp/ssh.conf", sandboxName: "test-sandbox" };
+    const paths = resolveSkillPaths(
+      { name: "hermes", configPaths: { dir: "/sandbox/.hermes" } },
+      "test-skill",
+    );
+    const commands: string[] = [];
+    const result = removeSkill(ctx, paths, {
+      sshExecImpl: (_ctx, command) => {
+        commands.push(command);
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.messages).toEqual([
+      "Start a new chat session for the removal to take effect; a gateway restart is not required.",
+    ]);
+    expect(commands).toEqual(["rm -rf '/sandbox/.hermes/skills/test-skill'"]);
+  });
+
+  it("probes the canonical Deep Agents directory for diagnostics (#7634)", () => {
+    const ctx = { configFile: "/tmp/ssh.conf", sandboxName: "test-sandbox" };
+    const paths = resolveSkillPaths(
+      { name: "langchain-deepagents-code", configPaths: { dir: "/sandbox/.deepagents" } },
+      "user-authored",
+    );
+    const commands: string[] = [];
+    checkExisting(ctx, paths, {
+      sshExecImpl: (_ctx, command) => {
+        commands.push(command);
+        return { status: 0, stdout: "ABSENT", stderr: "" };
+      },
+    });
+
+    expect(paths.uploadDirSharedWithAgent).toBe(true);
+    expect(commands).toEqual([
+      "{ test -e '/sandbox/.deepagents/agent/skills/user-authored'; } && echo EXISTS || echo ABSENT",
+    ]);
+  });
+
+  it("refuses to remove from the agent-owned Deep Agents directory (#7634)", () => {
+    const ctx = { configFile: "/tmp/ssh.conf", sandboxName: "test-sandbox" };
+    const paths = resolveSkillPaths(
+      { name: "langchain-deepagents-code", configPaths: { dir: "/sandbox/.deepagents" } },
+      "test-skill",
+    );
+    const commands: string[] = [];
+    const result = removeSkill(ctx, paths, {
+      sshExecImpl: (_ctx, command) => {
+        commands.push(command);
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.removedUploadDir).toBe(false);
+    expect(result.removedMirrorDir).toBe(false);
+    expect(result.clearedSessions).toBe(false);
+    expect(result.messages).toEqual([
+      "Error: automatic removal is unavailable for the agent-owned skill directory /sandbox/.deepagents/agent/skills/test-skill.",
+    ]);
+    expect(commands).toEqual([]);
+  });
 });
 
 describe("verifyRemove (unit — no SSH)", () => {
@@ -101,6 +165,23 @@ describe("verifyRemove (unit — no SSH)", () => {
     );
     const ctx = { configFile: "/nonexistent/ssh.conf", sandboxName: "test-sandbox" };
     expect(verifyRemove(ctx, paths)).toBe(false);
+  });
+
+  it("refuses shared Deep Agents verification without an SSH call", () => {
+    const paths = resolveSkillPaths(
+      { name: "langchain-deepagents-code", configPaths: { dir: "/sandbox/.deepagents" } },
+      "test-skill",
+    );
+    const commands: string[] = [];
+    const gone = verifyRemove({ configFile: "/tmp/ssh.conf", sandboxName: "test-sandbox" }, paths, {
+      sshExecImpl: (_ctx, command) => {
+        commands.push(command);
+        return { status: 0, stdout: "GONE", stderr: "" };
+      },
+    });
+
+    expect(gone).toBe(false);
+    expect(commands).toEqual([]);
   });
 
   it("verifies both OpenClaw skill directories are gone", () => {

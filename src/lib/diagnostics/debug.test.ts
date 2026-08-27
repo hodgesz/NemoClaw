@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-// Import from compiled dist/ so coverage is attributed correctly.
+// Import source directly so tests cannot pass against a stale build.
 import {
   buildDmesgRerunCommand,
   createTarball,
@@ -14,7 +14,7 @@ import {
   isDmesgPermissionDeniedOutput,
   isDmesgRestrictedForCurrentUser,
   redact,
-} from "../../../dist/lib/diagnostics/debug";
+} from "./debug";
 
 describe("redact", () => {
   it("redacts NVIDIA_INFERENCE_API_KEY=value patterns", () => {
@@ -59,6 +59,17 @@ describe("redact", () => {
   it("leaves clean text unchanged", () => {
     const clean = "Hello world, no secrets here";
     expect(redact(clean)).toBe(clean);
+  });
+
+  it("removes credentials from a URL", () => {
+    expect(redact("proxy: https://service-user:service-password@example.com/path")).toBe(
+      "proxy: https://example.com/path",
+    );
+  });
+
+  it("leaves a credential-free URL readable", () => {
+    const url = "https://integrate.api.nvidia.com/v1/models";
+    expect(redact(`probing ${url}`)).toBe(`probing ${url}`);
   });
 });
 

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { execFileSync, execSync, spawn, spawnSync } from "node:child_process";
+import { execFileSync, execSync, spawn } from "node:child_process";
 import {
   chmodSync,
   closeSync,
@@ -15,13 +15,19 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, join } from "node:path";
-import { dockerSpawnSync } from "../adapters/docker";
-import { resolveOpenshell } from "../adapters/openshell/resolve";
 import { renderBox } from "../cli/banner";
 import { AGENT_PRODUCT_NAME, CLI_DISPLAY_NAME, CLI_NAME } from "../cli/branding";
-import { isRecord } from "../core/json-types";
+import { isObjectRecord } from "../core/json-types";
 import { DASHBOARD_PORT } from "../core/ports";
+import { unloadOllamaModels as unloadDefaultOllamaModels } from "../inference/ollama/proxy";
 import { buildSubprocessEnv } from "../subprocess-env";
+import * as agentForwardStop from "./agent-forward-stop";
+import { registerTunnelOrigin } from "./allowed-origins";
+import * as gatewayStop from "./gateway-stop";
+import * as sandboxGatewayStop from "./sandbox-gateway-stop";
+
+export { GATEWAY_STOP_SCRIPT } from "./gateway-stop-script";
+export { stopSandboxChannels } from "./sandbox-gateway-stop";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -36,8 +42,14 @@ export interface ServiceOptions {
   repoDir?: string;
   /** Override PID directory (default: /tmp/nemoclaw-services-{sandbox}). */
   pidDir?: string;
+  /** Injectable process operations (identity + signalling) for tests. */
+  processControl?: ProcessControl;
+  /** Injectable Ollama model cleanup for tests. */
+  unloadOllamaModels?: () => void;
   /** Cloudflare named tunnel token. Falls back to CLOUDFLARE_TUNNEL_TOKEN. */
   cloudflareTunnelToken?: string;
+  /** Also release the managed host gateway port (legacy full-stop only). */
+  releaseGatewayPort?: boolean;
 }
 
 export interface ServiceStatus {
@@ -134,6 +146,23 @@ function commandLineNamesCloudflared(commandLine: string): boolean {
     .some((token) => basename(token) === "cloudflared");
 }
 
+// Process operations behind a small seam so lifecycle tests can model PID
+// reuse deterministically (per the tunnel adapter/fake test convention)
+// instead of spawning real processes or reading /proc.
+export interface ProcessControl {
+  isAlive(pid: number): boolean;
+  commandLine(pid: number): string | null;
+  signal(pid: number, sig: NodeJS.Signals): void;
+}
+
+const REAL_PROCESS_CONTROL: ProcessControl = {
+  isAlive,
+  commandLine: readProcessCommandLine,
+  signal: (pid, sig) => {
+    process.kill(pid, sig);
+  },
+};
+
 function extractTryCloudflareUrl(log: string): string | null {
   for (const rawToken of log.split(/\s+/)) {
     const candidate = rawToken.replace(/^[<("']+|[>),."']+$/g, "");
@@ -177,11 +206,11 @@ function serviceTargetsDashboard(service: string, dashboardPort: number): boolea
 }
 
 function getConfigIngressEntries(config: unknown): Array<{ hostname: string; service: string }> {
-  if (!isRecord(config) || !Array.isArray(config.ingress)) return [];
+  if (!isObjectRecord(config) || !Array.isArray(config.ingress)) return [];
 
   const entries: Array<{ hostname: string; service: string }> = [];
   for (const entry of config.ingress) {
-    if (!isRecord(entry)) continue;
+    if (!isObjectRecord(entry)) continue;
     const { hostname, service } = entry;
     if (typeof hostname === "string" && typeof service === "string") {
       entries.push({ hostname, service });
@@ -328,15 +357,33 @@ function startService(
   info(`${name} started (PID ${String(pid)})`);
 }
 
+/**
+ * The recorded process may have exited and had its PID recycled by the OS to an
+ * unrelated (possibly system) process. Signalling it would terminate a
+ * bystander, so only report a live PID as ours when its command line still
+ * names cloudflared. A null/unreadable command line stays conservative and is
+ * treated as ours, matching readCloudflaredState.
+ */
+function pidIsOurs(pid: number, pc: ProcessControl): boolean {
+  const cmdline = pc.commandLine(pid);
+  return cmdline === null || commandLineNamesCloudflared(cmdline);
+}
+
 /** Poll for process exit after SIGTERM, escalate to SIGKILL if needed. */
-function stopService(pidDir: string, name: ServiceName): void {
+function stopService(
+  pidDir: string,
+  name: ServiceName,
+  pc: ProcessControl = REAL_PROCESS_CONTROL,
+): void {
   const pid = readPid(pidDir, name);
   if (pid === null) {
     info(`${name} was not running`);
     return;
   }
 
-  if (!isAlive(pid)) {
+  // A dead PID, or a live PID recycled to a non-cloudflared process, means our
+  // service is not running. Drop the stale pid file without signalling.
+  if (!pc.isAlive(pid) || !pidIsOurs(pid, pc)) {
     info(`${name} was not running`);
     removePid(pidDir, name);
     return;
@@ -344,7 +391,7 @@ function stopService(pidDir: string, name: ServiceName): void {
 
   // Send SIGTERM
   try {
-    process.kill(pid, "SIGTERM");
+    pc.signal(pid, "SIGTERM");
   } catch {
     // Already dead between the check and the signal
     removePid(pidDir, name);
@@ -354,7 +401,7 @@ function stopService(pidDir: string, name: ServiceName): void {
 
   // Poll for exit (up to 3 seconds)
   const deadline = Date.now() + 3000;
-  while (Date.now() < deadline && isAlive(pid)) {
+  while (Date.now() < deadline && pc.isAlive(pid)) {
     // Busy-wait in 100ms increments (synchronous — matches stop being sync)
     const start = Date.now();
     while (Date.now() - start < 100) {
@@ -362,10 +409,16 @@ function stopService(pidDir: string, name: ServiceName): void {
     }
   }
 
-  // Escalate to SIGKILL if still alive
-  if (isAlive(pid)) {
+  // Escalate to SIGKILL if still alive. Re-verify identity first: the PID could
+  // have exited and been recycled to an unrelated process during the poll.
+  if (pc.isAlive(pid)) {
+    if (!pidIsOurs(pid, pc)) {
+      removePid(pidDir, name);
+      info(`${name} was not running`);
+      return;
+    }
     try {
-      process.kill(pid, "SIGKILL");
+      pc.signal(pid, "SIGKILL");
     } catch {
       /* already dead */
     }
@@ -438,153 +491,8 @@ export function showStatus(opts: ServiceOptions = {}): void {
   }
 }
 
-/**
- * Stop the OpenClaw gateway (and its messaging channels) inside the sandbox.
- *
- * Uses the OpenShell gateway container's kubectl as the privileged path so it
- * can signal the gateway process even when the sandbox SSH/exec user is
- * `sandbox` and the gateway process runs as the separate `gateway` user.  The
- * fallback `openshell sandbox exec` path uses the same verified script for
- * older/non-root deployments where the exec user can signal the gateway.
- *
- * The in-sandbox script intentionally does not rely on a bare `pkill -f`
- * result: `pkill -f openclaw[- ]gateway` can match the transient shell/pkill
- * command line and report success while the real `openclaw-gateway` process
- * survives.  Instead, it gathers concrete PIDs from `ps`, excludes its own
- * process tree, sends TERM/KILL as needed, and only reports success after a
- * post-stop process scan is empty.
- */
-export function stopSandboxChannels(sandboxName: string): void {
-  info(`Stopping in-sandbox OpenClaw gateway (sandbox: ${sandboxName})...`);
-
-  const privilegedResult = stopSandboxChannelsViaKubectl(sandboxName);
-  if (reportStopResult(privilegedResult)) return;
-
-  const openshell = resolveOpenshell();
-  if (!openshell) {
-    warn("openshell not found — cannot stop in-sandbox messaging channels.");
-    return;
-  }
-
-  const fallbackResult = spawnSync(
-    openshell,
-    ["sandbox", "exec", "--name", sandboxName, "--", "sh", "-lc", GATEWAY_STOP_SCRIPT],
-    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 20000 },
-  );
-  reportStopResult(fallbackResult);
-}
-
-const GATEWAY_CLUSTER_CONTAINER = "openshell-cluster-nemoclaw";
-
-const GATEWAY_STOP_SCRIPT = String.raw`
-set -eu
-self="$$"
-parent="$PPID"
-find_gateway_pids() {
-  ps -eo pid=,args= 2>/dev/null | awk -v self="$self" -v parent="$parent" '
-    $1 ~ /^[0-9]+$/ && $1 != self && $1 != parent {
-      cmd = $0
-      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", cmd)
-      if (cmd ~ /(^|[[:space:]\/])openclaw-gateway([[:space:]]|$)/ || cmd ~ /(^|[[:space:]\/])openclaw[[:space:]]+gateway([[:space:]]|$)/) {
-        seen[$1] = 1
-      }
-    }
-    END { for (pid in seen) print pid }
-  '
-}
-
-pids="$(find_gateway_pids)"
-if [ -z "$pids" ]; then
-  exit 1
-fi
-
-# Ask the gateway to shut down cleanly so its signal handler can stop channel
-# pollers and other children.
-kill -TERM $pids 2>/dev/null || true
-
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  remaining="$(find_gateway_pids)"
-  [ -z "$remaining" ] && exit 0
-  sleep 0.2
-done
-
-# If the process ignored SIGTERM, stop it anyway.  The caller must not report
-# success until the verification below observes that the gateway is gone.
-kill -KILL $remaining 2>/dev/null || true
-for _ in 1 2 3 4 5; do
-  remaining="$(find_gateway_pids)"
-  [ -z "$remaining" ] && exit 0
-  sleep 0.2
-done
-
-printf '%s\n' "$remaining" >&2
-exit 2
-`;
-
-type StopAttemptResult = ReturnType<typeof spawnSync>;
-
-function stopSandboxChannelsViaKubectl(sandboxName: string): StopAttemptResult | null {
-  const podsResult = dockerSpawnSync(
-    ["exec", GATEWAY_CLUSTER_CONTAINER, "kubectl", "get", "pods", "-n", "openshell", "-o", "name"],
-    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 10000 },
-  );
-  if (podsResult.status !== 0 || !podsResult.stdout) return null;
-
-  const podOutput =
-    typeof podsResult.stdout === "string" ? podsResult.stdout : podsResult.stdout.toString();
-  const pod = podOutput
-    .split(/\r?\n/)
-    .map((line: string) => line.trim())
-    .find((line: string) => line.startsWith("pod/") && line.includes(sandboxName));
-  if (!pod) return null;
-
-  return dockerSpawnSync(
-    [
-      "exec",
-      GATEWAY_CLUSTER_CONTAINER,
-      "kubectl",
-      "exec",
-      "-n",
-      "openshell",
-      "-c",
-      "agent",
-      pod,
-      "--",
-      "sh",
-      "-lc",
-      GATEWAY_STOP_SCRIPT,
-    ],
-    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 20000 },
-  );
-}
-
-function reportStopResult(result: StopAttemptResult | null): boolean {
-  if (!result) return false;
-
-  if (result.status === 0) {
-    info("OpenClaw gateway stopped inside sandbox.");
-    return true;
-  }
-  if (result.status === 1) {
-    info("OpenClaw gateway was not running inside sandbox.");
-    return true;
-  }
-
-  const details = [result.stderr, result.stdout]
-    .map((text) => (typeof text === "string" ? text : text?.toString()))
-    .filter((text): text is string => Boolean(text?.trim()))
-    .map((text) => text.trim())
-    .join(" ");
-  warn(
-    `Could not stop in-sandbox gateway (exit ${String(result.status ?? "unknown")}).` +
-      " The sandbox may be unreachable or the gateway may still be running." +
-      (details ? ` Details: ${details}` : ""),
-  );
-  return true;
-}
-
 export function stopAll(opts: ServiceOptions = {}): void {
-  // Stop the in-sandbox OpenClaw gateway (and its messaging channels).
+  // Resolve the target sandbox once and reuse it for in-sandbox and host-side cleanup.
   const rawSandboxName =
     opts.sandboxName ??
     process.env.NEMOCLAW_SANDBOX_NAME ??
@@ -598,11 +506,15 @@ export function stopAll(opts: ServiceOptions = {}): void {
   // Resolve host-side service state from the same effective sandbox selected
   // for in-sandbox shutdown, so pid cleanup cannot drift to a lower-priority
   // env var or the default sandbox.
-  const pidDir = resolvePidDir(sandboxName ? { ...opts, sandboxName } : opts);
-  ensurePidDir(pidDir);
+  const pidDir =
+    opts.pidDir ??
+    (rawSandboxName && !sandboxName
+      ? undefined
+      : resolvePidDir({ ...opts, sandboxName: sandboxName ?? "default" }));
+  if (pidDir) ensurePidDir(pidDir);
 
   if (sandboxName) {
-    stopSandboxChannels(sandboxName);
+    sandboxGatewayStop.stopSandboxChannels(sandboxName, { info, warn });
   } else if (rawSandboxName) {
     warn(`Invalid sandbox name: ${JSON.stringify(rawSandboxName)} — skipping in-sandbox stop.`);
   } else {
@@ -611,15 +523,90 @@ export function stopAll(opts: ServiceOptions = {}): void {
   }
 
   try {
-    const { unloadOllamaModels } = require("../inference/ollama/proxy");
+    const unloadOllamaModels = opts.unloadOllamaModels ?? unloadDefaultOllamaModels;
     unloadOllamaModels();
   } catch {
     /* best-effort */
   }
 
-  // Stop host-side services.
-  stopService(pidDir, "cloudflared");
+  // Stop host-side services only when their state directory is explicit or
+  // derived from a trusted sandbox name. An invalid requested sandbox must not
+  // fall through to the default sandbox's PID directory.
+  if (pidDir) {
+    stopService(pidDir, "cloudflared", opts.processControl ?? REAL_PROCESS_CONTROL);
+  } else {
+    warn("Invalid sandbox name without an explicit PID directory; skipping host service stop.");
+  }
+
+  let gatewayOutcome: gatewayStop.GatewayStopOutcome | undefined;
+  if (opts.releaseGatewayPort) {
+    if (sandboxName) {
+      agentForwardStop.stopAgentForwardPortsForStop(sandboxName, { info, warn });
+      gatewayOutcome = gatewayStop.releaseGatewayPortForStop(sandboxName, { info, warn });
+    } else if (!rawSandboxName) {
+      // #8952: no registry name — release only when NEMOCLAW_GATEWAY_PORT is
+      // explicit. A requested-but-malformed name stays out: scope is unknown, not absent.
+      gatewayOutcome = gatewayStop.releaseGatewayPortForStop(undefined, { info, warn });
+    }
+  }
+
+  // When nothing scoped the gateway, or a scoped release was not confirmed, do
+  // not claim every service stopped.
+  if (gatewayOutcome === "not-scoped") {
+    warn(
+      "No sandbox name and no explicit NEMOCLAW_GATEWAY_PORT — the managed OpenShell gateway was not released.",
+    );
+    warn(
+      "Hint: rerun with NEMOCLAW_GATEWAY_PORT=<port> to release that gateway, or 'openshell gateway list' to find it.",
+    );
+    info("Host services stopped; managed gateway not released.");
+    return;
+  }
+
+  if (gatewayOutcome === "unconfirmed") {
+    info("Host services stopped; managed gateway release was not confirmed.");
+    return;
+  }
+
   info("All services stopped.");
+}
+
+/**
+ * Resolve the PID directory for host-side services without starting or stopping
+ * anything. Callers can derive an adjacent purpose-specific state directory
+ * while preserving the same validated sandbox-name and environment precedence
+ * used by `start`, `stop`, and `status`.
+ */
+export function resolveServicePidDir(opts: ServiceOptions = {}): string {
+  return resolvePidDir(opts);
+}
+
+/**
+ * Stop only the host-side cloudflared tunnel, leaving the in-sandbox gateway and
+ * Ollama untouched. `stopAll` is intentionally broader (it also stops the gateway
+ * and unloads Ollama); enrollment that auto-started a tunnel needs a tunnel-only
+ * stop to clean up without tearing down other services.
+ */
+export function stopCloudflared(opts: ServiceOptions = {}): void {
+  const pidDir = resolvePidDir(opts);
+  ensurePidDir(pidDir);
+  stopService(pidDir, "cloudflared");
+}
+
+/**
+ * Sandbox name for tunnel-origin registration: same option/env precedence as
+ * the other service commands, gated on the safe-name rules, but without the
+ * registry default-sandbox fallback (registration is skipped rather than
+ * guessed when no name is explicitly available).
+ */
+function resolveTunnelOriginSandboxName(opts: ServiceOptions): string | null {
+  const raw =
+    opts.sandboxName ??
+    process.env.NEMOCLAW_SANDBOX_NAME ??
+    process.env.NEMOCLAW_SANDBOX ??
+    process.env.SANDBOX_NAME;
+  if (!raw || !SAFE_NAME_RE.test(raw) || raw.includes("..")) return null;
+  return raw;
 }
 
 export async function startAll(opts: ServiceOptions = {}): Promise<void> {
@@ -673,6 +660,21 @@ export async function startAll(opts: ServiceOptions = {}): Promise<void> {
   let tunnelUrl = "";
   if (isRunning(pidDir, "cloudflared")) {
     tunnelUrl = getTunnelUrl(pidDir, dashboardPort);
+  }
+
+  if (tunnelUrl) {
+    const sandboxName = resolveTunnelOriginSandboxName(opts);
+    if (sandboxName) {
+      try {
+        registerTunnelOrigin(sandboxName, tunnelUrl, { info, warn });
+      } catch (err) {
+        warn(`Could not register tunnel origin (${err instanceof Error ? err.message : err}).`);
+      }
+    } else {
+      warn(
+        "No sandbox name available — skipping tunnel-origin registration in gateway allowedOrigins.",
+      );
+    }
   }
 
   const bannerLines = [

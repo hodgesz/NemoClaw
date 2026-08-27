@@ -18,8 +18,11 @@ filesystem_policy:
     - /proc
     - /dev/urandom
     - /app
+    - /run/nemoclaw/managed-startup-ca-bundle.pem
+    - /run/nemoclaw/managed-startup-runtime.env
     - /etc
     - /var/log
+    - /var/lib/dpkg                  # Allow package-version inspection without package mutation.
   read_write:
     - /tmp
     - /dev/null
@@ -74,6 +77,9 @@ network_policies:
         port: 443
         protocol: rest
         enforcement: enforce
+        # TODO(#4104): Remove if ClawHub stops encoding scope separators or
+        # OpenShell can preserve this route without an endpoint-level opt-in.
+        allow_encoded_slash: true
         access: full
     binaries:
       - { path: "/**" }
@@ -314,6 +320,20 @@ network_policies:
         port: 443
         protocol: rest
         enforcement: enforce
+        access: full
+    binaries:
+      - { path: "/**" }
+
+  # Shields-down policies intentionally keep full host and binary scope. The
+  # maintained Tavily preset and provider profiles constrain normal access.
+  tavily:
+    name: tavily
+    endpoints:
+      - host: api.tavily.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        request_body_credential_rewrite: true
         access: full
     binaries:
       - { path: "/**" }

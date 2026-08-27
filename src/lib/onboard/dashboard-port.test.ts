@@ -2,16 +2,59 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import fsPromises from "node:fs/promises";
+import { createServer, type Server } from "node:net";
+import os from "node:os";
+import path from "node:path";
 
-import { describe, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import { withGatewayRouteMutationLock } from "../inference/gateway-route-mutation-lock";
 import {
+  createDashboardPortScopedSandboxEntryPoints,
+  type DashboardPortReservationScope,
   findAvailableDashboardPort,
   findDashboardForwardOwner,
   getRegistryOccupiedDashboardPorts,
   preflightDashboardPortRangeAvailability,
+  reserveCreateSandboxDashboardPort,
+  reserveDashboardPort,
   resolveCreateSandboxDashboardPort,
-} from "../../../dist/lib/onboard/dashboard-port";
+  withDashboardPortReservationLock,
+  withDashboardPortReservationScope,
+} from "./dashboard-port";
+
+async function listenOnLoopback(port: number): Promise<Server> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
+  return server;
+}
+
+async function closeServer(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+}
+
+async function listenAndCloseOnLoopback(port: number): Promise<void> {
+  const server = await listenOnLoopback(port);
+  await closeServer(server);
+}
+
+async function unusedLoopbackPort(): Promise<number> {
+  const server = await listenOnLoopback(0);
+  const address = server.address();
+  assert.ok(
+    address && typeof address !== "string",
+    "loopback listener did not report a TCP address",
+  );
+  await closeServer(server);
+  return address.port;
+}
 
 describe("findDashboardForwardOwner", () => {
   it("parses openshell forward list column format (#2169)", () => {
@@ -217,6 +260,190 @@ describe("resolveCreateSandboxDashboardPort", () => {
   });
 });
 
+describe("dashboard port reservation", () => {
+  it("scopes sandbox creation and distinguishes the temporary runtime path", async () => {
+    const events: string[] = [];
+    const createSandboxWithBaseImageResolution = vi.fn(
+      async (
+        baseImageResolutionContext: { fresh: boolean },
+        portableRuntimeAuthority: { socketPath: string } | null,
+        computePlan: { sequence: number },
+        managedWorkloadRebuild: null,
+        temporaryManagedRuntime: boolean,
+        temporaryManagedRuntimeCatalog: null,
+        dashboardPortReservationScope: DashboardPortReservationScope,
+        sandboxName: string,
+      ) => {
+        events.push("create sandbox");
+        return {
+          baseImageResolutionContext,
+          portableRuntimeAuthority,
+          computePlan,
+          managedWorkloadRebuild,
+          temporaryManagedRuntime,
+          temporaryManagedRuntimeCatalog,
+          dashboardPortReservationScope,
+          sandboxName,
+        };
+      },
+    );
+    let sequence = 0;
+    const entryPoints = createDashboardPortScopedSandboxEntryPoints({
+      createBaseImageResolutionContext: () => {
+        events.push("create base-image context");
+        return { fresh: false };
+      },
+      createSandboxWithBaseImageResolution,
+      resolvePortableRuntimeContext: () => ({ socketPath: "/run/user/1001/podman.sock" }),
+      resolveComputePlan: () => {
+        events.push("resolve compute plan");
+        return { sequence: ++sequence };
+      },
+    });
+
+    await expect(entryPoints.createSandbox("standard")).resolves.toMatchObject({
+      baseImageResolutionContext: { fresh: false },
+      portableRuntimeAuthority: { socketPath: "/run/user/1001/podman.sock" },
+      computePlan: { sequence: 1 },
+      managedWorkloadRebuild: null,
+      temporaryManagedRuntime: false,
+      temporaryManagedRuntimeCatalog: null,
+      dashboardPortReservationScope: { current: null, release: expect.any(Function) },
+      sandboxName: "standard",
+    });
+    await expect(
+      entryPoints.createSandboxWithTemporaryManagedRuntime("temporary"),
+    ).resolves.toMatchObject({
+      baseImageResolutionContext: { fresh: false },
+      portableRuntimeAuthority: { socketPath: "/run/user/1001/podman.sock" },
+      computePlan: { sequence: 2 },
+      managedWorkloadRebuild: null,
+      temporaryManagedRuntime: true,
+      temporaryManagedRuntimeCatalog: null,
+      dashboardPortReservationScope: { current: null, release: expect.any(Function) },
+      sandboxName: "temporary",
+    });
+    expect(createSandboxWithBaseImageResolution).toHaveBeenCalledTimes(2);
+    expect(createSandboxWithBaseImageResolution.mock.calls[0]?.[6]).not.toBe(
+      createSandboxWithBaseImageResolution.mock.calls[1]?.[6],
+    );
+    expect(events).toEqual([
+      "resolve compute plan",
+      "create base-image context",
+      "create sandbox",
+      "resolve compute plan",
+      "create base-image context",
+      "create sandbox",
+    ]);
+  });
+
+  it("rejects both entry-point promises when synchronous setup fails", async () => {
+    const setupFailure = new Error("compute plan unavailable");
+    const entryPoints = createDashboardPortScopedSandboxEntryPoints<
+      [string],
+      string,
+      { fresh: boolean },
+      null,
+      { sequence: number }
+    >({
+      createBaseImageResolutionContext: () => ({ fresh: false }),
+      createSandboxWithBaseImageResolution: async () => "unreachable",
+      resolvePortableRuntimeContext: () => null,
+      resolveComputePlan: () => {
+        throw setupFailure;
+      },
+    });
+
+    const standard = entryPoints.createSandbox("standard");
+    const temporary = entryPoints.createSandboxWithTemporaryManagedRuntime("temporary");
+
+    await expect(standard).rejects.toBe(setupFailure);
+    await expect(temporary).rejects.toBe(setupFailure);
+  });
+
+  it("holds the selected port during creation and releases it after failure (#8798)", async () => {
+    const port = await unusedLoopbackPort();
+
+    await assert.rejects(
+      withDashboardPortReservationScope(async (scope) => {
+        scope.current = await reserveDashboardPort(port);
+        await assert.rejects(
+          listenAndCloseOnLoopback(port),
+          (error: NodeJS.ErrnoException) => error.code === "EADDRINUSE",
+        );
+        throw new Error("sandbox build failed");
+      }),
+      /sandbox build failed/,
+    );
+
+    const listener = await listenOnLoopback(port);
+    await closeServer(listener);
+  });
+
+  it("releases the selected port when finalization calls the extracted scope callback (#9568)", async () => {
+    const port = await unusedLoopbackPort();
+
+    await withDashboardPortReservationScope(async (scope) => {
+      scope.current = await reserveDashboardPort(port);
+      await assert.rejects(
+        listenAndCloseOnLoopback(port),
+        (error: NodeJS.ErrnoException) => error.code === "EADDRINUSE",
+      );
+
+      const finalizationDashboard = { releasePort: scope.release };
+      await finalizationDashboard.releasePort();
+
+      assert.equal(scope.current, null);
+      const listener = await listenOnLoopback(port);
+      try {
+        assert.equal(listener.listening, true);
+      } finally {
+        await closeServer(listener);
+      }
+    });
+  });
+
+  it("reselects before sandbox creation when a listener wins the allocation race (#8798)", async () => {
+    const attempts: number[] = [];
+    const warnings: string[] = [];
+    const released: number[] = [];
+    const result = await reserveCreateSandboxDashboardPort(
+      {
+        sandboxName: "cursor",
+        controlUiPort: null,
+        chatUiUrlEnv: null,
+        persistedPort: null,
+        agentForwardPort: null,
+        defaultPort: 18789,
+        forwardListOutput: "",
+        registryOccupiedPorts: new Map(),
+        findAvailablePort: (_sandboxName, preferredPort, _forwardList, _bound, occupied) =>
+          occupied?.has(String(preferredPort)) ? 18790 : preferredPort,
+        warn: (message) => warnings.push(message),
+      },
+      async (port) => {
+        const attempt = attempts.length;
+        attempts.push(port);
+        return attempt === 0
+          ? Promise.reject(Object.assign(new Error("address in use"), { code: "EADDRINUSE" }))
+          : Promise.resolve({
+              port,
+              release: async () => {
+                released.push(port);
+              },
+            });
+      },
+    );
+
+    assert.deepEqual(attempts, [18789, 18790]);
+    assert.equal(result.effectivePort, 18790);
+    assert.equal(result.chatUiUrl, "http://127.0.0.1:18790");
+    assert.deepEqual(warnings, ["  ! Port 18789 is taken. Using port 18790 instead."]);
+    await result.reservation?.release();
+    assert.deepEqual(released, [18790]);
+  });
+});
+
 describe("findAvailableDashboardPort multi-gateway registry occupancy", () => {
   const stubBound = (...bound: number[]) => {
     const set = new Set(bound);
@@ -282,6 +509,54 @@ describe("findAvailableDashboardPort multi-gateway registry occupancy", () => {
 });
 
 describe("getRegistryOccupiedDashboardPorts", () => {
+  it("aggregates a sibling gateway registry when host bind probes report the port free", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-dashboard-host-index-"));
+    try {
+      vi.stubEnv("HOME", home);
+      const defaultRoot = path.join(home, ".nemoclaw");
+      const siblingRoot = path.join(defaultRoot, "gateways", "9123");
+      fs.mkdirSync(siblingRoot, { recursive: true });
+      fs.writeFileSync(
+        path.join(defaultRoot, "sandboxes.json"),
+        JSON.stringify({
+          defaultSandbox: "instance-b",
+          sandboxes: {
+            "instance-b": {
+              name: "instance-b",
+              gatewayName: "nemoclaw",
+              gatewayPort: 8080,
+              dashboardPort: 18790,
+            },
+          },
+        }),
+      );
+      fs.writeFileSync(
+        path.join(siblingRoot, "sandboxes.json"),
+        JSON.stringify({
+          defaultSandbox: "instance-a",
+          sandboxes: {
+            "instance-a": {
+              name: "instance-a",
+              gatewayName: "nemoclaw-9123",
+              gatewayPort: 9123,
+              dashboardPort: 18789,
+            },
+          },
+        }),
+      );
+
+      const occupied = getRegistryOccupiedDashboardPorts("instance-b");
+      assert.equal(occupied.get("18789"), "instance-a (gateway 9123)");
+      assert.equal(
+        findAvailableDashboardPort("instance-b", 18789, "", () => false, occupied),
+        18790,
+      );
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("returns a port→sandbox map for every sibling sandbox with a persisted dashboard port", () => {
     const occupied = getRegistryOccupiedDashboardPorts("current", () => ({
       sandboxes: [
@@ -319,6 +594,87 @@ describe("getRegistryOccupiedDashboardPorts", () => {
         }),
       /registry locked/,
     );
+  });
+});
+
+describe("dashboard port reservation lock", () => {
+  it("serializes onboard and restore ownership across different gateways", async () => {
+    const stateDir = await fsPromises.mkdtemp(
+      path.join(os.tmpdir(), "nemoclaw-dashboard-port-lock-"),
+    );
+    let releaseOnboard!: () => void;
+    const onboardReleased = new Promise<void>((resolve) => {
+      releaseOnboard = resolve;
+    });
+    let reportOnboardEntered!: () => void;
+    const onboardEntered = new Promise<void>((resolve) => {
+      reportOnboardEntered = resolve;
+    });
+    const events: string[] = [];
+    const options = { stateDir, pollIntervalMs: 1, timeoutMs: 5_000 };
+    try {
+      const onboard = withDashboardPortReservationLock(
+        () =>
+          withGatewayRouteMutationLock(
+            "gateway-a",
+            async () => {
+              events.push("onboard-gateway-a-select");
+              reportOnboardEntered();
+              await onboardReleased;
+              events.push("onboard-gateway-a-register");
+            },
+            options,
+          ),
+        options,
+      );
+      await onboardEntered;
+      const restore = withDashboardPortReservationLock(
+        () =>
+          withGatewayRouteMutationLock(
+            "gateway-b",
+            () => {
+              events.push("restore-gateway-b-select");
+              events.push("restore-gateway-b-register");
+            },
+            options,
+          ),
+        options,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(events, ["onboard-gateway-a-select"]);
+      releaseOnboard();
+      await Promise.all([onboard, restore]);
+      assert.deepEqual(events, [
+        "onboard-gateway-a-select",
+        "onboard-gateway-a-register",
+        "restore-gateway-b-select",
+        "restore-gateway-b-register",
+      ]);
+    } finally {
+      releaseOnboard();
+      await fsPromises.rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("releases a failed reservation so the next allocator can proceed", async () => {
+    const stateDir = await fsPromises.mkdtemp(
+      path.join(os.tmpdir(), "nemoclaw-dashboard-port-lock-"),
+    );
+    const options = { stateDir, pollIntervalMs: 1, timeoutMs: 5_000 };
+    try {
+      await assert.rejects(
+        withDashboardPortReservationLock(() => {
+          throw new Error("onboard allocation failed");
+        }, options),
+        /onboard allocation failed/,
+      );
+      assert.equal(
+        await withDashboardPortReservationLock(() => "restore acquired", options),
+        "restore acquired",
+      );
+    } finally {
+      await fsPromises.rm(stateDir, { recursive: true, force: true });
+    }
   });
 });
 

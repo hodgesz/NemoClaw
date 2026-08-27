@@ -12,20 +12,29 @@ import {
   DASHBOARD_PORT_RANGE_END,
   DASHBOARD_PORT_RANGE_START,
   GATEWAY_PORT,
+  HTTPS_PIN_RUNTIME_ADAPTER_PORT,
   OLLAMA_PORT,
   OLLAMA_PROXY_PORT,
-  validateGatewayPort,
+  OPENROUTER_RUNTIME_ADAPTER_PORT,
   VLLM_PORT,
+  validateGatewayPort,
 } from "../core/ports";
-import { sleepSeconds } from "../core/wait";
+import { sleepSeconds, waitUntilAsync } from "../core/wait";
+import { gatewayStartGuidance } from "../gateway-start-guidance";
 import { shouldPatchCoredns } from "../platform";
 import { run, SCRIPTS } from "../runner";
 import { isGatewayHealthy } from "../state/gateway";
+import { isLinuxDockerDriverGatewayEnabled } from "./docker-driver-platform";
 import { envInt } from "./env";
 import { resolveGatewayName, resolveGatewayPortFromName } from "./gateway-binding";
+import { formatGatewayHealthWaitLimit } from "./gateway-health-wait";
 import { isGatewayHttpReady } from "./gateway-http-readiness";
 import { getContainerRuntime } from "./local-inference-topology";
-import { isLinuxDockerDriverGatewayEnabled } from "./docker-driver-platform";
+import {
+  createReadinessWaitOptions,
+  formatReadinessDeadline,
+  getLegacyPollDeadlineBudgetMs,
+} from "./readiness-wait";
 
 export type StartGatewayForRecoveryOptions = {
   gatewayName?: string;
@@ -47,12 +56,33 @@ type GatewayStartResult = {
 };
 
 export type GatewayRecoveryDeps = {
+  /**
+   * Fail closed before any recovery branch starts a gateway process an external
+   * supervisor owns (#6576).
+   */
+  assertGatewayStartAllowed(
+    exitOnFailure: boolean,
+    target: { gatewayName: string; gatewayPort: number },
+  ): void;
   getGatewayClusterContainerState?(gatewayName: string): string;
-  getGatewayStartEnv(): Record<string, string>;
   runCaptureOpenshell(args: string[], opts?: RunCaptureOpenshellOptions): string;
   runOpenshell(args: string[], opts?: RunOpenshellOptions): GatewayStartResult;
   startGatewayWithOptions(gpu: never, options: { exitOnFailure: false }): Promise<void>;
   isLinuxDockerDriverGatewayEnabled?(): boolean;
+  sleepSeconds?(seconds: number): void;
+  // Injected so caller-level tests can exercise the success + retry-success
+  // paths at unit-test speed without standing up a real gateway. Defaults
+  // to the production implementations.
+  isGatewayHealthy?: typeof isGatewayHealthy;
+  isGatewayHttpReady?: typeof isGatewayHttpReady;
+  getContainerRuntime?: typeof getContainerRuntime;
+  shouldPatchCoredns?: typeof shouldPatchCoredns;
+  runCorednsPatch?(gatewayName: string): void;
+  // Injected clock reader for deadline-driven tests. Defaults to Date.now.
+  // A test can pair a virtual sleeper (that advances a captured value) with
+  // this reader to drive deterministic deadline expiration without real
+  // wall-clock waits or global fake-timer state.
+  now?(): number;
 };
 
 function isValidGatewayRecoveryPort(port: number | null | undefined): port is number {
@@ -88,19 +118,10 @@ function resolveGatewayRecoveryTarget(options: StartGatewayForRecoveryOptions = 
     ollamaPort: OLLAMA_PORT,
     ollamaProxyPort: OLLAMA_PROXY_PORT,
     bedrockRuntimeAdapterPort: BEDROCK_RUNTIME_ADAPTER_PORT,
+    openrouterRuntimeAdapterPort: OPENROUTER_RUNTIME_ADAPTER_PORT,
+    httpsPinRuntimeAdapterPort: HTTPS_PIN_RUNTIME_ADAPTER_PORT,
   });
   return { gatewayName, gatewayPort };
-}
-
-function getGatewayStartEnvForPort(
-  gatewayPort: number,
-  getGatewayStartEnv: GatewayRecoveryDeps["getGatewayStartEnv"],
-): Record<string, string> {
-  return {
-    ...getGatewayStartEnv(),
-    OPENSHELL_SERVER_PORT: String(gatewayPort),
-    OPENSHELL_SSH_GATEWAY_PORT: String(gatewayPort),
-  };
 }
 
 function getDefaultGatewayClusterContainerState(gatewayName: string): string {
@@ -134,23 +155,18 @@ function getGatewayHealthWaitConfig(_startStatus = 0, containerState = "") {
   };
 }
 
+function getGatewayRecoveryWaitBudgetMs(pollCount: number, pollIntervalSeconds: number): number {
+  return getLegacyPollDeadlineBudgetMs(pollCount, pollIntervalSeconds);
+}
+
 async function startTargetGatewayForRecovery(
   { gatewayName, gatewayPort }: { gatewayName: string; gatewayPort: number },
   deps: GatewayRecoveryDeps,
 ): Promise<void> {
-  const gatewayPortArg = String(gatewayPort);
-  const startResult = deps.runOpenshell(
-    ["gateway", "start", "--name", gatewayName, "--port", gatewayPortArg],
-    {
-      ignoreError: true,
-      env: getGatewayStartEnvForPort(gatewayPort, deps.getGatewayStartEnv),
-      suppressOutput: true,
-    },
-  );
   deps.runOpenshell(["gateway", "select", gatewayName], { ignoreError: true });
 
   const recoveryWait = getGatewayHealthWaitConfig(
-    startResult.status ?? 0,
+    0,
     (deps.getGatewayClusterContainerState ?? getDefaultGatewayClusterContainerState)(gatewayName),
   );
   const recoveryPollCount = recoveryWait.extended
@@ -160,30 +176,55 @@ async function startTargetGatewayForRecovery(
     ? recoveryWait.interval
     : envInt("NEMOCLAW_HEALTH_POLL_INTERVAL", 2);
   const targetGatewayUrl = `${getGatewayHttpEndpoint(gatewayPort)}/`;
-  for (let i = 0; i < recoveryPollCount; i++) {
-    const status = deps.runCaptureOpenshell(["status"], { ignoreError: true });
-    const namedInfo = deps.runCaptureOpenshell(["gateway", "info", "-g", gatewayName], {
-      ignoreError: true,
-    });
-    const currentInfo = deps.runCaptureOpenshell(["gateway", "info"], { ignoreError: true });
-    if (
-      status.includes("Connected") &&
-      isGatewayHealthy(status, namedInfo, currentInfo, gatewayName) &&
-      (await isGatewayHttpReady(undefined, targetGatewayUrl))
-    ) {
-      process.env.OPENSHELL_GATEWAY = gatewayName;
-      const runtime = getContainerRuntime();
-      if (shouldPatchCoredns(runtime)) {
-        run(["bash", path.join(SCRIPTS, "fix-coredns.sh"), gatewayName], {
-          ignoreError: true,
-        });
-      }
-      return;
+  const waitBudgetMs = getGatewayRecoveryWaitBudgetMs(recoveryPollCount, recoveryPollInterval);
+  const sleeper = deps.sleepSeconds ?? sleepSeconds;
+  const gatewayHealthyImpl = deps.isGatewayHealthy ?? isGatewayHealthy;
+  const gatewayHttpReadyImpl = deps.isGatewayHttpReady ?? isGatewayHttpReady;
+  const nowImpl = deps.now ?? Date.now;
+  const waitOptions = createReadinessWaitOptions({
+    budgetMs: waitBudgetMs,
+    maxIntervalMs: Math.max(0, recoveryPollInterval * 1000),
+    zeroBudgetAttempts: recoveryPollCount,
+    now: nowImpl,
+    sleep: (ms) => sleeper(ms / 1000),
+  });
+  const healthy =
+    waitOptions !== null &&
+    (await waitUntilAsync(async () => {
+      const status = deps.runCaptureOpenshell(["status"], { ignoreError: true });
+      const namedInfo = deps.runCaptureOpenshell(["gateway", "info", "-g", gatewayName], {
+        ignoreError: true,
+      });
+      const currentInfo = deps.runCaptureOpenshell(["gateway", "info"], { ignoreError: true });
+      return (
+        status.includes("Connected") &&
+        gatewayHealthyImpl(status, namedInfo, currentInfo, gatewayName) &&
+        (await gatewayHttpReadyImpl(undefined, targetGatewayUrl))
+      );
+    }, waitOptions));
+
+  if (healthy) {
+    process.env.OPENSHELL_GATEWAY = gatewayName;
+    const runtime = (deps.getContainerRuntime ?? getContainerRuntime)();
+    if ((deps.shouldPatchCoredns ?? shouldPatchCoredns)(runtime)) {
+      const runCorednsPatch =
+        deps.runCorednsPatch ??
+        ((targetGatewayName: string) =>
+          run(["bash", path.join(SCRIPTS, "fix-coredns.sh"), targetGatewayName], {
+            ignoreError: true,
+          }));
+      runCorednsPatch(gatewayName);
     }
-    if (i < recoveryPollCount - 1) sleepSeconds(recoveryPollInterval);
+    return;
   }
 
-  throw new Error(`Gateway '${gatewayName}' failed to start`);
+  const waitLimit =
+    recoveryPollInterval === 0 && recoveryPollCount > 0
+      ? formatGatewayHealthWaitLimit(recoveryPollCount, recoveryPollInterval)
+      : `${formatReadinessDeadline(waitBudgetMs)} recovery deadline (${recoveryPollInterval}s poll interval)`;
+  throw new Error(
+    `Gateway '${gatewayName}' did not become ready within the configured ${waitLimit}. ${gatewayStartGuidance(gatewayName)}`,
+  );
 }
 
 export async function startGatewayForRecovery(
@@ -191,13 +232,19 @@ export async function startGatewayForRecovery(
   deps: GatewayRecoveryDeps,
 ): Promise<void> {
   const target = resolveGatewayRecoveryTarget(options);
+  // Guard every recovery branch. The cross-port / non-default-name path below
+  // bypasses startGatewayWithOptions. It reselects an already-running gateway
+  // and waits for health instead of starting a gateway process. Resolve and
+  // bind the requested target first, because the process-global gateway can
+  // name a different port during sandbox recovery.
+  deps.assertGatewayStartAllowed(false, target);
   const linuxDockerDriverEnabled = (
     deps.isLinuxDockerDriverGatewayEnabled ?? isLinuxDockerDriverGatewayEnabled
   )();
   // The Docker-driver Linux startup path (startGatewayWithOptions →
   // startDockerDriverGateway) restores the runtime-marker, package-managed
-  // registration, and sandbox-bridge reachability — none of which a plain
-  // `openshell gateway start` produces. Route through it whenever the
+  // registration, and sandbox-bridge reachability, and it is the only path
+  // that starts a gateway process at all. Route through it whenever the
   // recovery target matches the current process's GATEWAY_PORT (the common
   // case where the user re-runs with the same NEMOCLAW_GATEWAY_PORT).
   if (target.gatewayPort === GATEWAY_PORT) {
@@ -207,11 +254,11 @@ export async function startGatewayForRecovery(
   }
   // Cross-port recovery on a Linux Docker-driver gateway cannot share this
   // process's module-globals: startDockerDriverGateway captures the port at
-  // load time, so a plain `openshell gateway start` would skip the
-  // runtime-marker / package registration / sandbox-bridge setup and leave
-  // the host in a half-recovered state. Fail closed instead and direct the
-  // operator to re-run with the matching NEMOCLAW_GATEWAY_PORT so the
-  // docker-driver path re-stamps the per-port artefacts.
+  // load time, so the reselect path below would skip the runtime-marker /
+  // package registration / sandbox-bridge setup and leave the host in a
+  // half-recovered state. Fail closed instead and direct the operator to
+  // re-run with the matching NEMOCLAW_GATEWAY_PORT so the docker-driver path
+  // re-stamps the per-port artefacts.
   if (linuxDockerDriverEnabled && target.gatewayPort !== GATEWAY_PORT) {
     throw new Error(
       `Cross-port recovery for Linux Docker-driver gateway '${target.gatewayName}' is not safe from a process bound to port ${GATEWAY_PORT}. ` +

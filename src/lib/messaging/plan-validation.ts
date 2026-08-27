@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { isObjectRecord } from "../core/json-types";
 import type { MessagingChannelConfig } from "../messaging-channel-config";
 import type {
   MessagingAgentId,
@@ -12,11 +13,14 @@ import {
   type MaybeCompactMessagingPlan,
   normalizePersistedSandboxMessagingPlanShape,
 } from "./persistence";
+import { normalizeMessagingChannelId } from "./post-agent-install-selection";
 
 export interface SandboxMessagingPlanParseOptions {
   sandboxName?: string | null;
   agent?: MessagingAgentId | string | null;
   supportedChannelIds?: readonly MessagingChannelId[] | readonly string[] | null;
+  /** Explicit environment seam for deterministic rehydration without ambient credentials. */
+  environment?: Readonly<Record<string, string | undefined>>;
 }
 
 export function parseSandboxMessagingPlan(
@@ -24,7 +28,7 @@ export function parseSandboxMessagingPlan(
   options: SandboxMessagingPlanParseOptions = {},
 ): SandboxMessagingPlan | null {
   if (
-    !isObject(value) ||
+    !isObjectRecord(value) ||
     value.schemaVersion !== 1 ||
     typeof value.sandboxName !== "string" ||
     typeof value.agent !== "string" ||
@@ -32,7 +36,7 @@ export function parseSandboxMessagingPlan(
     !Array.isArray(value.channels) ||
     !Array.isArray(value.disabledChannels) ||
     !isOptionalObjectArray(value, "credentialBindings") ||
-    (Object.hasOwn(value, "networkPolicy") && !isObject(value.networkPolicy)) ||
+    (Object.hasOwn(value, "networkPolicy") && !isObjectRecord(value.networkPolicy)) ||
     !isOptionalObjectArray(value, "agentRender") ||
     !isOptionalObjectArray(value, "buildSteps") ||
     !isRuntimeSetup(value.runtimeSetup) ||
@@ -48,8 +52,17 @@ export function parseSandboxMessagingPlan(
   const supported = Array.isArray(options.supportedChannelIds)
     ? new Set(options.supportedChannelIds)
     : null;
-  for (const [index, channel] of value.channels.entries()) {
-    if (!isObject(channel) || typeof channel.channelId !== "string") return null;
+  const normalizedChannelIds = new Set<string>();
+  for (const channel of value.channels) {
+    if (!isObjectRecord(channel) || typeof channel.channelId !== "string") return null;
+    const normalizedChannelId = normalizeMessagingChannelId(channel.channelId);
+    if (
+      !normalizedChannelId ||
+      normalizedChannelId !== channel.channelId ||
+      normalizedChannelIds.has(normalizedChannelId)
+    ) {
+      return null;
+    }
     if (Object.hasOwn(channel, "configured") && typeof channel.configured !== "boolean") {
       return null;
     }
@@ -60,26 +73,73 @@ export function parseSandboxMessagingPlan(
     if (Object.hasOwn(channel, "hooks") && !Array.isArray(channel.hooks)) return null;
     if (
       Array.isArray(channel.inputs) &&
-      channel.inputs.some((input) => !isObject(input) || typeof input.inputId !== "string")
+      channel.inputs.some(
+        (input) =>
+          !isObjectRecord(input) ||
+          typeof input.inputId !== "string" ||
+          (Object.hasOwn(input, "channelId") && input.channelId !== normalizedChannelId),
+      )
     ) {
       return null;
     }
-    if (Array.isArray(channel.hooks) && channel.hooks.some((hook) => !isObject(hook))) {
+    if (
+      Array.isArray(channel.hooks) &&
+      channel.hooks.some(
+        (hook) =>
+          !isObjectRecord(hook) ||
+          (Object.hasOwn(hook, "channelId") && hook.channelId !== normalizedChannelId),
+      )
+    ) {
+      return null;
+    }
+    if (
+      Object.hasOwn(channel, "hostForward") &&
+      isObjectRecord(channel.hostForward) &&
+      channel.hostForward.channelId !== normalizedChannelId
+    ) {
       return null;
     }
     if (supported && !supported.has(channel.channelId)) return null;
-    if (
-      value.channels.findIndex(
-        (candidate) => isObject(candidate) && candidate.channelId === channel.channelId,
-      ) !== index
-    ) {
-      return null;
-    }
+    normalizedChannelIds.add(normalizedChannelId);
   }
-  if (!value.disabledChannels.every((channelId) => typeof channelId === "string")) return null;
+  if (!value.disabledChannels.every(isCanonicalMessagingChannelId)) return null;
+  const disabledChannelIds = new Set(value.disabledChannels as string[]);
+  if (
+    disabledChannelIds.size !== value.disabledChannels.length ||
+    [...disabledChannelIds].some((channelId) => !normalizedChannelIds.has(channelId)) ||
+    value.channels.some(
+      (channel) =>
+        isObjectRecord(channel) &&
+        (channel.disabled === true) !== disabledChannelIds.has(String(channel.channelId)),
+    )
+  ) {
+    return null;
+  }
+  if (
+    !hasCanonicalChannelReferences(value.credentialBindings) ||
+    !hasMatchingAgentRenderEntries(value.agentRender, value.agent) ||
+    !hasCanonicalChannelReferences(value.agentRender) ||
+    !hasCanonicalChannelReferences(value.buildSteps) ||
+    !hasCanonicalChannelReferences(value.stateUpdates) ||
+    !hasCanonicalChannelReferences(value.healthChecks) ||
+    !hasCanonicalNetworkPolicyReferences(value.networkPolicy) ||
+    !hasCanonicalRuntimeSetupReferences(value.runtimeSetup)
+  ) {
+    return null;
+  }
 
   return cloneSandboxMessagingPlan(
-    normalizePersistedSandboxMessagingPlanShape(value as MaybeCompactMessagingPlan),
+    normalizePersistedSandboxMessagingPlanShape(
+      value as MaybeCompactMessagingPlan,
+      options.environment,
+    ),
+  );
+}
+
+function hasMatchingAgentRenderEntries(value: unknown, agent: string): boolean {
+  return (
+    !Array.isArray(value) ||
+    value.every((render) => isObjectRecord(render) && render.agent === agent)
   );
 }
 
@@ -161,19 +221,15 @@ function stringifyPlanStateValue(value: MessagingSerializableValue | undefined):
   return text.length > 0 ? text : null;
 }
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function isOptionalObjectArray(value: Record<string, unknown>, key: string): boolean {
   if (!Object.hasOwn(value, key)) return true;
   const entries = value[key];
-  return Array.isArray(entries) && entries.every(isObject);
+  return Array.isArray(entries) && entries.every(isObjectRecord);
 }
 
 function isHostForward(value: unknown): boolean {
   return (
-    isObject(value) &&
+    isObjectRecord(value) &&
     typeof value.channelId === "string" &&
     typeof value.port === "number" &&
     Number.isInteger(value.port) &&
@@ -186,12 +242,41 @@ function isHostForward(value: unknown): boolean {
 function isRuntimeSetup(value: unknown): boolean {
   if (value === undefined) return true;
   return (
-    isObject(value) &&
+    isObjectRecord(value) &&
     Array.isArray(value.nodePreloads) &&
     Array.isArray(value.envAliases) &&
     Array.isArray(value.secretScans) &&
-    value.nodePreloads.every(isObject) &&
-    value.envAliases.every(isObject) &&
-    value.secretScans.every(isObject)
+    value.nodePreloads.every(isObjectRecord) &&
+    value.envAliases.every(isObjectRecord) &&
+    value.secretScans.every(isObjectRecord)
+  );
+}
+
+function isCanonicalMessagingChannelId(value: unknown): value is string {
+  return (
+    typeof value === "string" && value.length > 0 && normalizeMessagingChannelId(value) === value
+  );
+}
+
+function hasCanonicalChannelReferences(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (Array.isArray(value) &&
+      value.every(
+        (entry) => isObjectRecord(entry) && isCanonicalMessagingChannelId(entry.channelId),
+      ))
+  );
+}
+
+function hasCanonicalNetworkPolicyReferences(value: unknown): boolean {
+  if (!isObjectRecord(value) || !Object.hasOwn(value, "entries")) return true;
+  return hasCanonicalChannelReferences(value.entries);
+}
+
+function hasCanonicalRuntimeSetupReferences(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!isObjectRecord(value)) return false;
+  return ["nodePreloads", "envAliases", "secretScans"].every((field) =>
+    hasCanonicalChannelReferences(value[field]),
   );
 }

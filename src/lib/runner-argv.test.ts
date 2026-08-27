@@ -1,11 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { createRequire } from "module";
 import { describe, expect, it } from "vitest";
 
-const require = createRequire(import.meta.url);
-const runner = require("../../dist/lib/runner");
+import * as runner from "./runner";
 
 describe("run with argv array", () => {
   it("executes a simple command and returns result", () => {
@@ -52,6 +50,7 @@ describe("run with argv array", () => {
   });
 
   it("rejects string commands", () => {
+    // @ts-expect-error Exercise the runtime guard for legacy string input.
     expect(() => runner.run("echo hello", { suppressOutput: true })).toThrow(/argv array instead/);
   });
 
@@ -62,7 +61,7 @@ describe("run with argv array", () => {
     });
     // spawnSync sets result.error for missing executables
     expect(result.error).toBeDefined();
-    expect(result.error.code).toBe("ENOENT");
+    expect((result.error as NodeJS.ErrnoException).code).toBe("ENOENT");
   });
 });
 
@@ -80,6 +79,7 @@ describe("runInteractive with argv array", () => {
   });
 
   it("rejects string commands", () => {
+    // @ts-expect-error Exercise the runtime guard for legacy string input.
     expect(() => runner.runInteractive("echo hello", { suppressOutput: true })).toThrow(
       /argv array instead/,
     );
@@ -128,6 +128,34 @@ describe("runCapture with argv array", () => {
     expect(output).toBe("");
   });
 
+  it("keeps stderr out of ignored failures unless requested", () => {
+    const output = runner.runCapture(
+      [process.execPath, "-e", 'process.stderr.write("stderr-only\\n"); process.exit(2)'],
+      { ignoreError: true },
+    );
+    expect(output).toBe("");
+  });
+
+  it("keeps stdout out of ignored failures unless combined output is requested", () => {
+    const output = runner.runCapture(
+      [process.execPath, "-e", 'process.stdout.write("stdout-only\\n"); process.exit(2)'],
+      { ignoreError: true },
+    );
+    expect(output).toBe("");
+  });
+
+  it("captures stderr from ignored failures when requested", () => {
+    const output = runner.runCapture(
+      [
+        process.execPath,
+        "-e",
+        'process.stdout.write("stdout-line\\n"); process.stderr.write("stderr-line\\n"); process.exit(2)',
+      ],
+      { ignoreError: true, includeStderr: true },
+    );
+    expect(output).toBe(["stdout-line", "stderr-line"].join("\n"));
+  });
+
   it("throws on failure without ignoreError", () => {
     expect(() => runner.runCapture(["false"])).toThrow();
   });
@@ -169,6 +197,7 @@ describe("runCapture with argv array", () => {
   });
 
   it("rejects string commands", () => {
+    // @ts-expect-error Exercise the runtime guard for legacy string input.
     expect(() => runner.runCapture("echo hello")).toThrow(/argv array instead/);
   });
 
@@ -183,22 +212,19 @@ describe("runCapture with argv array", () => {
 });
 
 describe("shell injection regression tests", () => {
-  it("sandbox names with shell metacharacters are safe with argv arrays", () => {
+  it.each([
+    "my-sandbox; rm -rf /",
+    "test$(whoami)",
+    "sandbox`id`",
+    "sandbox' || echo pwned",
+    'sandbox" && echo pwned',
+    "sandbox\necho pwned",
+  ])("sandbox names with shell metacharacters are safe with argv arrays [%s]", (name) => {
     // These names would cause injection if passed through bash -c
-    const dangerousNames = [
-      "my-sandbox; rm -rf /",
-      "test$(whoami)",
-      "sandbox`id`",
-      "sandbox' || echo pwned",
-      'sandbox" && echo pwned',
-      "sandbox\necho pwned",
-    ];
 
-    for (const name of dangerousNames) {
-      const output = runner.runCapture(["echo", name], { ignoreError: true });
-      // Each name should be passed literally, not interpreted
-      expect(output).toContain(name.split("\n")[0]);
-    }
+    const output = runner.runCapture(["echo", name], { ignoreError: true });
+    // Each name should be passed literally, not interpreted
+    expect(output).toContain(name.split("\n")[0]);
   });
 
   it("model names with shell metacharacters are safe with argv arrays", () => {

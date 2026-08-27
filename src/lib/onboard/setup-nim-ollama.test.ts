@@ -3,8 +3,9 @@
 
 import assert from "node:assert/strict";
 
-import { describe, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { MIN_HERMES_OLLAMA_CONTEXT_WINDOW } from "../inference/ollama-runtime-context";
 import { createSetupNimOllamaHandlers } from "./setup-nim-ollama";
 import type { SetupNimSelectionState } from "./setup-nim-selection";
 
@@ -25,6 +26,10 @@ function makeState(): SetupNimSelectionState {
 
 type Deps = Parameters<typeof createSetupNimOllamaHandlers>[0];
 
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
 function makeDeps(overrides: Partial<Deps> = {}): Deps {
   return {
     OLLAMA_PORT: 11434,
@@ -36,7 +41,6 @@ function makeDeps(overrides: Partial<Deps> = {}): Deps {
     ensureOllamaLoopbackSystemdOverride: () => "unchanged",
     runOllamaStartupOrGate: () => ({ kind: "ready" }),
     shouldFrontOllamaWithProxy: () => false,
-    startOllamaAuthProxy: () => true,
     getLocalProviderBaseUrl: () => "http://127.0.0.1:11434/v1",
     selectAndValidateOllamaModel: async () => ({
       outcome: "selected",
@@ -61,6 +65,261 @@ function makeDeps(overrides: Partial<Deps> = {}): Deps {
 }
 
 describe("createSetupNimOllamaHandlers", () => {
+  it("guards the selected route before systemd recovery and model preparation (#6315)", async () => {
+    const events: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const state = makeState();
+    state.assertRouteCompatible = () => {
+      events.push(`guard:${String(state.model)}`);
+      return {
+        requiredModel: "required/model",
+        requiredEndpointUrl: null,
+        requiredInferenceApi: null,
+      };
+    };
+    const { handleRunningOllamaSelection } = createSetupNimOllamaHandlers(
+      makeDeps({
+        isNonInteractive: () => false,
+        ensureOllamaLoopbackSystemdOverride: () => {
+          events.push("systemd");
+          return "unchanged";
+        },
+        selectAndValidateOllamaModel: async (_gpu, _provider, args, onModelSelected) => {
+          expect(args.lockedModel).toBe("required/model");
+          expect(args.promptDefaultModel).toBeNull();
+          events.push("prepare-model");
+          onModelSelected?.("required/model");
+          return { outcome: "selected", model: "required/model", allowToolsIncompatible: false };
+        },
+      }),
+    );
+
+    await handleRunningOllamaSelection(null, "required/model", null, true, state);
+
+    expect(events).toEqual([
+      "guard:required/model",
+      "systemd",
+      "prepare-model",
+      "guard:required/model",
+    ]);
+    expect(log.mock.calls.map(([message]) => message)).toContain(
+      "  Shared gateway route requires Ollama model 'required/model'.",
+    );
+    expect(log.mock.calls.map(([message]) => message)).toContain(
+      "  To use a different model for this agent, rerun with an unused NEMOCLAW_GATEWAY_PORT.",
+    );
+    log.mockRestore();
+  });
+
+  it("keeps shared-route guidance silent in non-interactive mode (#6758)", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const selectModel = vi.fn<Deps["selectAndValidateOllamaModel"]>(async () => ({
+      outcome: "selected" as const,
+      model: "required/model",
+      allowToolsIncompatible: false,
+    }));
+    const state = makeState();
+    state.assertRouteCompatible = () => ({
+      requiredModel: "required/model",
+      requiredEndpointUrl: null,
+      requiredInferenceApi: null,
+    });
+    const { handleRunningOllamaSelection } = createSetupNimOllamaHandlers(
+      makeDeps({ selectAndValidateOllamaModel: selectModel }),
+    );
+
+    await handleRunningOllamaSelection(null, "required/model", null, true, state);
+
+    expect(selectModel.mock.calls[0]?.[2].lockedModel).toBe("required/model");
+    expect(log).not.toHaveBeenCalledWith(
+      "  Shared gateway route requires Ollama model 'required/model'.",
+    );
+    expect(log).not.toHaveBeenCalledWith(
+      "  To use a different model for this agent, rerun with an unused NEMOCLAW_GATEWAY_PORT.",
+    );
+    log.mockRestore();
+  });
+
+  it("passes NEMOCLAW_MODEL as the interactive Ollama prompt default", async () => {
+    const state = makeState();
+    const selectModel = vi.fn(async (_gpu, _provider, args) => {
+      expect(args.requestedModel).toBeNull();
+      expect(args.lockedModel).toBeNull();
+      expect(args.promptDefaultModel).toBe("qwen3.6:35b");
+      return { outcome: "selected" as const, model: "qwen3.6:35b", allowToolsIncompatible: false };
+    });
+    const { handleRunningOllamaSelection } = createSetupNimOllamaHandlers(
+      makeDeps({
+        isNonInteractive: () => false,
+        process: {
+          ...process,
+          env: { ...process.env, NEMOCLAW_MODEL: "qwen3.6:35b" },
+        } as NodeJS.Process,
+        selectAndValidateOllamaModel: selectModel,
+      }),
+    );
+
+    const result = await handleRunningOllamaSelection(null, null, null, true, state);
+
+    expect(result).toBe("selected");
+    expect(selectModel).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes NEMOCLAW_PROVIDER_MODEL as the interactive Ollama prompt default fallback", async () => {
+    const state = makeState();
+    const selectModel = vi.fn(async (_gpu, _provider, args) => {
+      expect(args.requestedModel).toBeNull();
+      expect(args.lockedModel).toBeNull();
+      expect(args.promptDefaultModel).toBe("qwen3.6:35b");
+      return { outcome: "selected" as const, model: "qwen3.6:35b", allowToolsIncompatible: false };
+    });
+    const { handleRunningOllamaSelection } = createSetupNimOllamaHandlers(
+      makeDeps({
+        isNonInteractive: () => false,
+        process: {
+          ...process,
+          env: {
+            ...process.env,
+            NEMOCLAW_MODEL: undefined,
+            NEMOCLAW_PROVIDER_MODEL: "qwen3.6:35b",
+          },
+        } as NodeJS.Process,
+        selectAndValidateOllamaModel: selectModel,
+      }),
+    );
+
+    const result = await handleRunningOllamaSelection(null, null, null, true, state);
+
+    expect(result).toBe("selected");
+    expect(selectModel).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not install Ollama when shared-gateway preflight rejects", async () => {
+    const state = makeState();
+    state.assertRouteCompatible = () => {
+      throw new Error("route conflict");
+    };
+    const install = vi.fn(() => ({ ok: true }));
+    const { handleInstallOllamaSelection } = createSetupNimOllamaHandlers(
+      makeDeps({ installOllamaOnLinux: install, installOllamaOnMacOS: install }),
+    );
+
+    await expect(
+      handleInstallOllamaSelection(null, "conflict/model", null, state, {
+        hasUpgradableOllama: false,
+        binaryNeedsUpgrade: false,
+      }),
+    ).rejects.toThrow("route conflict");
+    expect(install).not.toHaveBeenCalled();
+  });
+
+  it("stops before local Ollama install effects when policy authority changes (#9833)", async () => {
+    const selection = makeState();
+    selection.revalidatePolicyRequirements = () => {
+      throw new Error("external policy authority must supply local inference");
+    };
+    const install = vi.fn(() => ({ ok: true }));
+    const start = vi.fn(() => ({ kind: "ready" as const }));
+    const { handleInstallOllamaSelection } = createSetupNimOllamaHandlers(
+      makeDeps({
+        process: { ...process, platform: "linux" } as NodeJS.Process,
+        installOllamaOnLinux: install,
+        runOllamaStartupOrGate: start,
+      }),
+    );
+
+    await expect(
+      handleInstallOllamaSelection(null, "qwen3:8b", null, selection, {
+        hasUpgradableOllama: false,
+        binaryNeedsUpgrade: false,
+      }),
+    ).rejects.toThrow(/external policy authority must supply/u);
+
+    expect(install).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("installs a missing binary while recovering a stale daemon", async () => {
+    const install = vi.fn(() => ({ ok: true }));
+    const { handleInstallOllamaSelection } = createSetupNimOllamaHandlers(
+      makeDeps({
+        process: { ...process, platform: "linux" } as NodeJS.Process,
+        installOllamaOnLinux: install,
+      }),
+    );
+
+    await handleInstallOllamaSelection(null, "qwen3:8b", null, makeState(), {
+      hasUpgradableOllama: true,
+      binaryNeedsUpgrade: true,
+    });
+
+    expect(install).toHaveBeenCalledWith(
+      expect.objectContaining({ isUpgrade: true, restartOnly: false }),
+    );
+  });
+
+  it("does not switch, install, or restart Windows Ollama when preflight rejects", async () => {
+    const state = makeState();
+    state.assertRouteCompatible = () => {
+      throw new Error("route conflict");
+    };
+    const switchHost = vi.fn();
+    const install = vi.fn(async () => ({ ok: true }));
+    const restart = vi.fn(() => true);
+    const { handleWindowsHostOllamaSelection } = createSetupNimOllamaHandlers(
+      makeDeps({
+        switchToWindowsOllamaHost: switchHost,
+        installOllamaOnWindowsHost: install,
+        setupWindowsOllamaWith0000Binding: restart,
+      }),
+    );
+
+    await expect(
+      handleWindowsHostOllamaSelection(
+        null,
+        "start-windows-ollama",
+        "conflict/model",
+        true,
+        false,
+        null,
+        state,
+      ),
+    ).rejects.toThrow("route conflict");
+    expect(switchHost).not.toHaveBeenCalled();
+    expect(install).not.toHaveBeenCalled();
+    expect(restart).not.toHaveBeenCalled();
+  });
+
+  it("stops before Windows Ollama install effects when policy authority changes (#9833)", async () => {
+    const selection = makeState();
+    selection.revalidatePolicyRequirements = () => {
+      throw new Error("external policy authority must supply local inference");
+    };
+    const install = vi.fn(async () => ({ ok: true, path: "C:/Ollama/ollama.exe" }));
+    const start = vi.fn(() => true);
+    const { handleWindowsHostOllamaSelection } = createSetupNimOllamaHandlers(
+      makeDeps({
+        installOllamaOnWindowsHost: install,
+        setupWindowsOllamaWith0000Binding: start,
+      }),
+    );
+
+    await expect(
+      handleWindowsHostOllamaSelection(
+        null,
+        "install-windows-ollama",
+        "qwen3:8b",
+        false,
+        false,
+        null,
+        selection,
+      ),
+    ).rejects.toThrow(/external policy authority must supply/u);
+
+    expect(install).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
   it("preserves accepted tools-incompatible state for running Ollama", async () => {
     const state = makeState();
     const { handleRunningOllamaSelection } = createSetupNimOllamaHandlers(makeDeps());
@@ -71,6 +330,78 @@ describe("createSetupNimOllamaHandlers", () => {
     assert.equal(state.model, "llama3.1:8b");
     assert.equal(state.provider, "ollama-local");
     assert.equal(state.allowToolsIncompatible, true);
+  });
+
+  it("uses the reachable Windows-host endpoint for running Ollama (#7472)", async () => {
+    const state = makeState();
+    const { handleRunningOllamaSelection } = createSetupNimOllamaHandlers(
+      makeDeps({
+        getLocalProviderBaseUrl: () => "http://host.docker.internal:11434/v1",
+      }),
+    );
+
+    const result = await handleRunningOllamaSelection(null, "qwen3.6:35b", null, true, state, true);
+
+    expect(result).toBe("selected");
+    expect(state).toMatchObject({
+      model: "llama3.1:8b",
+      provider: "ollama-local",
+      endpointUrl: "http://host.docker.internal:11434/v1",
+    });
+  });
+
+  it("skips the Linux systemd loopback override for a Windows-host Ollama daemon (#8596)", async () => {
+    const state = makeState();
+    const ensureOverride = vi.fn<Deps["ensureOllamaLoopbackSystemdOverride"]>(() => "unchanged");
+    const runStartup = vi.fn<Deps["runOllamaStartupOrGate"]>(() => ({ kind: "ready" }));
+    const { handleRunningOllamaSelection } = createSetupNimOllamaHandlers(
+      makeDeps({
+        ensureOllamaLoopbackSystemdOverride: ensureOverride,
+        runOllamaStartupOrGate: runStartup,
+        getLocalProviderBaseUrl: () => "http://host.docker.internal:11434/v1",
+      }),
+    );
+
+    const result = await handleRunningOllamaSelection(null, "qwen3.6:35b", null, true, state, true);
+
+    expect(result).toBe("selected");
+    expect(ensureOverride).not.toHaveBeenCalled();
+    expect(runStartup).toHaveBeenCalledWith(expect.objectContaining({ ollamaReady: true }));
+    expect(state.endpointUrl).toBe("http://host.docker.internal:11434/v1");
+  });
+
+  it("passes the Hermes Ollama context floor to systemd repair and model validation", async () => {
+    const state = makeState();
+    state.ollamaContextWindowFloor = MIN_HERMES_OLLAMA_CONTEXT_WINDOW;
+    const ensureOverride = vi.fn(() => "unchanged");
+    const runStartup = vi.fn(() => ({ kind: "ready" as const }));
+    const selectModel = vi.fn(async (_gpu, _provider, args) => {
+      expect(args.contextWindowFloor).toBe(MIN_HERMES_OLLAMA_CONTEXT_WINDOW);
+      return { outcome: "selected" as const, model: "llama3.2:1b", allowToolsIncompatible: false };
+    });
+    const { handleRunningOllamaSelection } = createSetupNimOllamaHandlers(
+      makeDeps({
+        ensureOllamaLoopbackSystemdOverride: ensureOverride,
+        runOllamaStartupOrGate: runStartup,
+        selectAndValidateOllamaModel: selectModel,
+      }),
+    );
+
+    const result = await handleRunningOllamaSelection(null, "llama3.2:1b", null, true, state);
+
+    expect(result).toBe("selected");
+    expect(ensureOverride).toHaveBeenCalledWith({
+      isNonInteractive: expect.any(Function),
+      contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+    });
+    expect(runStartup).toHaveBeenCalledWith({
+      ollamaReady: true,
+      ollamaPort: 11434,
+      getLocalProviderBaseUrl: expect.any(Function),
+      isNonInteractive: expect.any(Function),
+      contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+    });
+    expect(selectModel).toHaveBeenCalledTimes(1);
   });
 
   it("preserves accepted tools-incompatible state for Windows-host Ollama", async () => {
@@ -98,11 +429,50 @@ describe("createSetupNimOllamaHandlers", () => {
 
     const result = await handleInstallOllamaSelection(null, "requested", "recovered", state, {
       hasUpgradableOllama: false,
+      binaryNeedsUpgrade: false,
     });
 
     assert.equal(result, "selected");
     assert.equal(state.provider, "ollama-local");
     assert.equal(state.allowToolsIncompatible, true);
+  });
+
+  it("selects the proxy route without starting it before configuration review (#7318)", async () => {
+    const state = makeState();
+    const install = vi.fn(() => ({ ok: true }));
+    const selectModel = vi.fn<Deps["selectAndValidateOllamaModel"]>(async () => ({
+      outcome: "selected",
+      model: "qwen3:0.6b",
+      allowToolsIncompatible: false,
+    }));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { handleInstallOllamaSelection } = createSetupNimOllamaHandlers(
+      makeDeps({
+        process: { ...process, platform: "linux" } as NodeJS.Process,
+        installOllamaOnLinux: install,
+        shouldFrontOllamaWithProxy: () => true,
+        getLocalProviderBaseUrl: () => "http://host.openshell.internal:11435/v1",
+        selectAndValidateOllamaModel: selectModel,
+      }),
+    );
+
+    const result = await handleInstallOllamaSelection(null, null, null, state, {
+      hasUpgradableOllama: false,
+      binaryNeedsUpgrade: false,
+    });
+
+    expect(result).toBe("selected");
+    expect(install).toHaveBeenCalledTimes(1);
+    expect(state).toMatchObject({
+      provider: "ollama-local",
+      endpointUrl: "http://host.openshell.internal:11435/v1",
+      model: "qwen3:0.6b",
+      credentialEnv: null,
+      preferredInferenceApi: "openai-completions",
+    });
+    expect(state.endpointUrl).not.toContain("127.0.0.1");
+    expect(log).toHaveBeenCalledWith("  ✓ Using Ollama on localhost:11434 (proxy on :11435)");
+    log.mockRestore();
   });
 
   it("fails closed on unknown Ollama startup outcomes without mutating state", async () => {
@@ -111,7 +481,6 @@ describe("createSetupNimOllamaHandlers", () => {
     const exit = vi.fn((code?: number) => {
       throw new Error(`exit ${code}`);
     });
-    const startProxy = vi.fn(() => true);
     const selectModel = vi.fn(async () => ({
       outcome: "selected" as const,
       model: "should-not-run",
@@ -121,7 +490,6 @@ describe("createSetupNimOllamaHandlers", () => {
       makeDeps({
         process: { ...process, exit: exit as never },
         runOllamaStartupOrGate: () => ({ kind: "mystery" }) as never,
-        startOllamaAuthProxy: startProxy,
         selectAndValidateOllamaModel: selectModel,
       }),
     );
@@ -133,7 +501,6 @@ describe("createSetupNimOllamaHandlers", () => {
 
     assert.deepEqual(state, before);
     assert.equal(exit.mock.calls[0]?.[0], 1);
-    assert.equal(startProxy.mock.calls.length, 0);
     assert.equal(selectModel.mock.calls.length, 0);
   });
 
@@ -146,7 +513,6 @@ describe("createSetupNimOllamaHandlers", () => {
     state.preferredInferenceApi = "responses";
     state.nimContainer = "stale-nim";
     state.allowToolsIncompatible = true;
-    const startProxy = vi.fn(() => true);
     const selectModel = vi.fn(async () => ({
       outcome: "selected" as const,
       model: "should-not-run",
@@ -164,7 +530,6 @@ describe("createSetupNimOllamaHandlers", () => {
             preferredInferenceApi: "openai-completions",
           },
         }),
-        startOllamaAuthProxy: startProxy,
         selectAndValidateOllamaModel: selectModel,
       }),
     );
@@ -184,7 +549,6 @@ describe("createSetupNimOllamaHandlers", () => {
       allowToolsIncompatible: false,
       skipHostInferenceSmoke: false,
     });
-    assert.equal(startProxy.mock.calls.length, 0);
     assert.equal(selectModel.mock.calls.length, 0);
   });
 });

@@ -3,12 +3,12 @@
 
 import { runOnboardAction } from "../lib/actions/global";
 import { NemoClawCommand } from "../lib/cli/nemoclaw-oclif-command";
+import { createOnboardActionRuntimeDeps } from "../lib/cli/onboard-runtime-deps";
 import {
   buildOnboardFlags,
   type OnboardFlags,
   onboardExamples,
   onboardUsage,
-  toLegacyOnboardArgs,
 } from "../lib/onboard/command-support";
 
 export default class OnboardCliCommand extends NemoClawCommand {
@@ -18,10 +18,18 @@ export default class OnboardCliCommand extends NemoClawCommand {
   static description = "Configure inference, credentials, and sandbox settings.";
   static usage = onboardUsage;
   static examples = onboardExamples;
-  static flags = buildOnboardFlags();
+  static flags = buildOnboardFlags({ includeEvents: true });
 
   public async run(): Promise<void> {
     const { flags } = await this.parse(OnboardCliCommand);
-    await runOnboardAction(toLegacyOnboardArgs(flags as OnboardFlags));
+    const onboardFlags = flags as OnboardFlags;
+    if (onboardFlags.events === "jsonl") {
+      const { withOnboardJsonlEventStream } = await import("../lib/onboard/machine/jsonl-events");
+      await withOnboardJsonlEventStream(() =>
+        runOnboardAction(onboardFlags, createOnboardActionRuntimeDeps()),
+      );
+      return;
+    }
+    await runOnboardAction(onboardFlags, createOnboardActionRuntimeDeps());
   }
 }
