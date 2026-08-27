@@ -85,6 +85,7 @@ export const HERMES_PORTABLE_BUILD_CONTEXT_FILES = [
   { path: "nemoclaw-blueprint/policies/presets/brave.yaml", mode: "100644" },
   { path: "nemoclaw-blueprint/policies/presets/brew.yaml", mode: "100644" },
   { path: "nemoclaw-blueprint/policies/presets/claude-code.yaml", mode: "100644" },
+  { path: "nemoclaw-blueprint/policies/presets/gemini-search.yaml", mode: "100644" },
   { path: "nemoclaw-blueprint/policies/presets/github.yaml", mode: "100644" },
   { path: "nemoclaw-blueprint/policies/presets/gmail.yaml", mode: "100644" },
   { path: "nemoclaw-blueprint/policies/presets/huggingface.yaml", mode: "100644" },
