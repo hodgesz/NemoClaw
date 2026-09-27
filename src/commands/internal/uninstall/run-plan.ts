@@ -6,11 +6,16 @@ import {
   allGatewayPortsRequested,
   runUninstallAllGatewayPorts,
 } from "../../../lib/actions/uninstall/all-gateway-ports";
-import { runUninstallPlanProduction } from "../../../lib/actions/uninstall/run-plan";
+import { backupAllUnderPortableHostFence } from "../../../lib/actions/maintenance";
+import {
+  preflightForceFreshUserLocalOpenShellOwnership,
+  runUninstallPlanProduction,
+} from "../../../lib/actions/uninstall/run-plan";
 import { CLI_DISPLAY_NAME, CLI_NAME } from "../../../lib/cli/branding";
 import { NemoClawCommand } from "../../../lib/cli/nemoclaw-oclif-command";
 import { GATEWAY_PORT } from "../../../lib/core/ports";
 import { resolveGatewayName } from "../../../lib/onboard/gateway-binding";
+import { withSandboxMutationLock } from "../../../lib/state/mcp-lifecycle-lock";
 
 export default class InternalUninstallRunPlanCommand extends NemoClawCommand {
   static hidden = true;
@@ -28,6 +33,8 @@ export default class InternalUninstallRunPlanCommand extends NemoClawCommand {
         "Uninstall every gateway port on this host, not only the port NEMOCLAW_GATEWAY_PORT selects",
     }),
     "all-gateway-ports-child": Flags.boolean({ hidden: true }),
+    "force-fresh-ownership-preflight": Flags.boolean({ hidden: true }),
+    "force-fresh-reset": Flags.boolean({ hidden: true }),
     "keep-openshell": Flags.boolean({ description: "Leave the openshell binary installed" }),
     "delete-models": Flags.boolean({
       description:
@@ -35,7 +42,7 @@ export default class InternalUninstallRunPlanCommand extends NemoClawCommand {
     }),
     "destroy-user-data": Flags.boolean({
       description:
-        "Also remove preserved user data under ~/.nemoclaw/ (rebuild-backups/, backups/, sandboxes.json)",
+        "Skip eligible fresh sandbox backups and remove preserved data from the selected gateway state root",
     }),
     gateway: Flags.string({
       description: "Gateway name",
@@ -45,20 +52,41 @@ export default class InternalUninstallRunPlanCommand extends NemoClawCommand {
 
   public async run(): Promise<void> {
     const { flags } = await this.parse(InternalUninstallRunPlanCommand);
+    if (flags["force-fresh-ownership-preflight"]) {
+      this.applyExitResult({
+        exitCode: preflightForceFreshUserLocalOpenShellOwnership() ? 0 : 1,
+      });
+      return;
+    }
     const options = {
       assumeYes: flags.yes ?? false,
       deleteModels: flags["delete-models"] ?? false,
       destroyUserData: flags["destroy-user-data"] ?? false,
+      forceFreshReset: flags["force-fresh-reset"] ?? false,
       gatewayName: flags.gateway,
       keepOpenShell: flags["keep-openshell"] ?? false,
     };
+    const backupAllBeforeUninstall = (sandboxNames: readonly string[]) =>
+      backupAllUnderPortableHostFence({
+        purpose: "pre-uninstall",
+        requireAll: true,
+        sandboxNames,
+        skipUnreachable: false,
+      });
     if (allGatewayPortsRequested(flags["all-gateway-ports"], process.env)) {
-      this.applyExitResult(await runUninstallAllGatewayPorts(options));
+      this.applyExitResult(
+        await runUninstallAllGatewayPorts(options, {
+          backupAllBeforeUninstall,
+          withSandboxMutationLock,
+        }),
+      );
       return;
     }
     this.applyExitResult(
       await runUninstallPlanProduction(options, {
+        backupAllBeforeUninstall,
         requireCompleteGatewayProcessCleanup: flags["all-gateway-ports-child"] ?? false,
+        withSandboxMutationLock,
       }),
     );
   }

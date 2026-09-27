@@ -52,7 +52,7 @@ describe("OpenShell exact-main credential generation-window proof", () => {
     expect(script).toContain(JSON.stringify(CREDENTIAL_WINDOW_STEPS.fallbackAfterEviction));
     expect(script).toContain(JSON.stringify(CREDENTIAL_WINDOW_STEPS.deniedAfterKeyRemoval));
     expect(script).toContain(JSON.stringify(CREDENTIAL_WINDOW_STEPS.deniedAfterDetach));
-    expect(script).toContain(JSON.stringify(CREDENTIAL_WINDOW_STEPS.fallbackAfterRestart));
+    expect(script).toContain(JSON.stringify(CREDENTIAL_WINDOW_STEPS.deniedAfterReadd));
     expect(script).toContain(JSON.stringify(CREDENTIAL_WINDOW_STEPS.stop));
     expect(script).not.toContain(MCP_BRIDGE_TEST_CREDENTIALS.generationWindow);
   });
@@ -104,9 +104,18 @@ describe("OpenShell exact-main credential generation-window proof", () => {
     expect(liveTarget).toContain('["nemoclaw-start", "node", "-e"');
     expect(liveTarget).toContain("CREDENTIAL_WINDOW_STEPS.deniedAfterExpiry");
     expect(liveTarget).toContain("CREDENTIAL_WINDOW_STEPS.deniedAfterKeyRemoval");
-    expect(liveTarget).toContain('["sandbox", "provider", "detach"');
+    expect(liveTarget).toContain('[SANDBOX_NAME, "mcp", "remove", SERVER_NAME]');
+    expect(liveTarget).toMatch(/\[\s*SANDBOX_NAME,\s*"mcp",\s*"add",\s*SERVER_NAME,/u);
+    expect(liveTarget).not.toContain('["sandbox", "provider", "detach"');
     expect(liveTarget).toContain('[SANDBOX_NAME, "mcp", "restart", SERVER_NAME]');
     expect(liveTarget).toContain('[SANDBOX_NAME, "rebuild", "--yes"]');
+    expect(liveTarget).toContain('[SANDBOX_NAME, "rebuild", "--yes", "--force"]');
+    expect(liveTarget).toContain("HOSTED_INFERENCE_PROVIDER_NAME");
+    expect(liveTarget).toContain("HOSTED_INFERENCE_CREDENTIAL_ENV");
+    expect(liveTarget).toContain("credential-window-source-sandbox-after-expired-rebuild");
+    expect(liveTarget).toContain("parseOpenShellSandboxId");
+    expect(liveTarget).toContain("Backing up sandbox state|Deleting old sandbox");
+    expect(liveTarget).toContain('expect(providerName).toBe("e2e-cred-window-mcp-fake")');
     expect(liveTarget).toContain('!request.auth.includes("openshell:resolve:env")');
   });
 });

@@ -1,27 +1,25 @@
-#!/usr/bin/env -S node --experimental-strip-types
+#!/usr/bin/env node
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import {
-  closeSync,
-  existsSync,
-  fstatSync,
-  lstatSync,
-  openSync,
-  readdirSync,
-  readFileSync,
-} from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
+  LOCKED_NPM_CACHE_SEED_MANIFEST_NAME,
   lockedArchives,
   type NpmPlatformTarget,
 } from "../checks/materialize-locked-npm-cache-seed.mts";
-import { verifyReviewedNpmLockPackages } from "./reviewed-npm-archive.mts";
+import { REVIEWED_NPM_VERSION } from "./reviewed-npm-identity.mts";
+import {
+  readReviewedNpmArchiveFile,
+  type ReviewedNpmArchiveRequest,
+  type ReviewedNpmPackageWithoutIntegrity,
+  verifyReviewedNpmLockPackages,
+} from "./reviewed-npm-archive.mts";
 
 export type CachePut = (
   cachePath: string,
@@ -31,18 +29,25 @@ export type CachePut = (
 ) => Promise<unknown>;
 
 export type ReviewedNpmCacheSeedRequest = Readonly<{
+  allowedNestedShrinkwrapPackages?: readonly string[];
+  allowNestedShrinkwrap?: boolean;
   archives: ReadonlyMap<string, string>;
   cacheDirectory: string;
   lockfilePath: string;
+  maximumArchiveBytes?: number;
   packumentsOnly?: boolean;
+  reviewedPackagesWithoutIntegrity?: readonly ReviewedNpmPackageWithoutIntegrity[];
+  reviewedRegistryPackages?: readonly ReviewedNpmArchiveRequest[];
   registryOrigin: string;
   selectedPackageSpecs?: ReadonlySet<string>;
+  tarballsOnly?: boolean;
 }>;
 
 type LockedPackage = Readonly<{
   bundleDependencies?: readonly string[];
   dependencies?: Readonly<Record<string, unknown>>;
   hasShrinkwrap?: true;
+  inBundle?: true;
   integrity: string;
   name: string;
   optionalDependencies?: Readonly<Record<string, unknown>>;
@@ -53,6 +58,7 @@ type LockedPackage = Readonly<{
 }>;
 
 const INSTALL_ACCEPT = "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
+const REVIEWED_CI_NPM_VERSIONS = new Set([REVIEWED_NPM_VERSION]);
 
 function packageNameFromLockLocation(location: string): string {
   const marker = "node_modules/";
@@ -72,11 +78,21 @@ function requireObject(value: unknown, label: string): Record<string, unknown> {
 function readLockedPackages(
   lockfilePath: string,
   registryOrigin: string,
+  request: Pick<
+    ReviewedNpmCacheSeedRequest,
+    | "allowedNestedShrinkwrapPackages"
+    | "allowNestedShrinkwrap"
+    | "reviewedPackagesWithoutIntegrity"
+    | "reviewedRegistryPackages"
+  > = {},
 ): readonly LockedPackage[] {
   const expectedSpecs = new Set(
     verifyReviewedNpmLockPackages({
-      allowNestedShrinkwrap: true,
+      allowedNestedShrinkwrapPackages: request.allowedNestedShrinkwrapPackages,
+      allowNestedShrinkwrap: request.allowNestedShrinkwrap ?? true,
       lockfilePath,
+      reviewedPackagesWithoutIntegrity: request.reviewedPackagesWithoutIntegrity,
+      reviewedRegistryPackages: request.reviewedRegistryPackages,
       registryOrigin,
     }),
   );
@@ -89,13 +105,18 @@ function readLockedPackages(
   for (const [location, unknownRecord] of Object.entries(packages)) {
     if (location === "") continue;
     const record = requireObject(unknownRecord, `reviewed npm cache seed package ${location}`);
+    // The shared lock verifier already proved that every inBundle entry is
+    // owned by an integrity-pinned parent archive. npm does not fetch a
+    // separate archive for these records, but npm ci can still request their
+    // packuments while validating bundled dependency ranges.
+    const inBundle = record.inBundle === true;
     const name =
       typeof record.name === "string" ? record.name : packageNameFromLockLocation(location);
     const version = typeof record.version === "string" ? record.version : "";
     const integrity = typeof record.integrity === "string" ? record.integrity : "";
     const resolved = typeof record.resolved === "string" ? record.resolved : "";
     const packageSpec = `${name}@${version}`;
-    if (!expectedSpecs.has(packageSpec)) continue;
+    if (!inBundle && !expectedSpecs.has(packageSpec)) continue;
     if (record.hasShrinkwrap !== undefined && record.hasShrinkwrap !== true) {
       throw new Error(`reviewed npm cache seed ${packageSpec} has invalid shrinkwrap metadata`);
     }
@@ -117,6 +138,7 @@ function readLockedPackages(
       ...(bundleDependencies ? { bundleDependencies: bundleDependencies as string[] } : {}),
       dependencies: optionalRecord("dependencies"),
       ...(record.hasShrinkwrap === true ? { hasShrinkwrap: true as const } : {}),
+      ...(inBundle ? { inBundle: true as const } : {}),
       integrity,
       name,
       optionalDependencies: optionalRecord("optionalDependencies"),
@@ -125,7 +147,7 @@ function readLockedPackages(
       resolved,
       version,
     });
-    expectedSpecs.delete(packageSpec);
+    if (!inBundle) expectedSpecs.delete(packageSpec);
   }
   if (expectedSpecs.size > 0) {
     throw new Error(
@@ -133,35 +155,6 @@ function readLockedPackages(
     );
   }
   return locked;
-}
-
-function readArchive(archivePath: string, packageSpec: string): Buffer {
-  if (!isAbsolute(archivePath)) {
-    throw new Error(`reviewed npm cache seed archive must be absolute: ${packageSpec}`);
-  }
-  const resolvedPath = resolve(archivePath);
-  let descriptor: number | undefined;
-  try {
-    descriptor = openSync(resolvedPath, "r");
-    const opened = fstatSync(descriptor);
-    const pathEntry = lstatSync(resolvedPath);
-    if (
-      !opened.isFile() ||
-      !pathEntry.isFile() ||
-      pathEntry.isSymbolicLink() ||
-      opened.dev !== pathEntry.dev ||
-      opened.ino !== pathEntry.ino
-    ) {
-      throw new Error("archive must be a non-symlink regular file");
-    }
-    return readFileSync(descriptor);
-  } catch (error) {
-    throw new Error(
-      `reviewed npm cache seed archive is unreadable: ${packageSpec}: ${String(error)}`,
-    );
-  } finally {
-    if (descriptor !== undefined) closeSync(descriptor);
-  }
 }
 
 export function lockedArchivesFromDirectory(
@@ -205,6 +198,18 @@ export function lockedArchivesFromDirectory(
 
   const actualNames = readdirSync(directory).sort();
   const expected = selectedArchives.map(({ archive }) => archive).sort();
+  const manifestIndex = actualNames.indexOf(LOCKED_NPM_CACHE_SEED_MANIFEST_NAME);
+  if (manifestIndex >= 0) {
+    // Export mode carries this inert handoff manifest alongside the archives.
+    // Archive identities still come from the reviewed lock above, not its bytes.
+    const manifestEntry = lstatSync(join(directory, LOCKED_NPM_CACHE_SEED_MANIFEST_NAME));
+    if (!manifestEntry.isFile() || manifestEntry.isSymbolicLink()) {
+      throw new Error(
+        "reviewed npm cache seed archive directory contains an invalid seed manifest",
+      );
+    }
+    actualNames.splice(manifestIndex, 1);
+  }
   if (JSON.stringify(actualNames) !== JSON.stringify(expected)) {
     throw new Error("reviewed npm cache seed archive directory is incomplete or contains extras");
   }
@@ -221,7 +226,17 @@ function packumentUrl(registryOrigin: string, packageName: string): string {
 }
 
 function loadCachePut(): CachePut {
-  const npmRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
+  const npmVersion = execFileSync("npm", ["--version"], {
+    encoding: "utf8",
+  }).trim();
+  if (!REVIEWED_CI_NPM_VERSIONS.has(npmVersion)) {
+    throw new Error(
+      `reviewed npm cache seed does not support npm@${npmVersion}; expected npm@${REVIEWED_NPM_VERSION}`,
+    );
+  }
+  const npmRoot = execFileSync("npm", ["root", "-g"], {
+    encoding: "utf8",
+  }).trim();
   const require = createRequire(import.meta.url);
   const cacachePath = require.resolve("cacache", {
     paths: [join(npmRoot, "npm", "node_modules")],
@@ -257,33 +272,43 @@ export async function seedReviewedNpmCache(
     );
   }
   const registryOrigin = parsedRegistry.origin;
-  const locked = readLockedPackages(request.lockfilePath, registryOrigin);
+  if (request.packumentsOnly && request.tarballsOnly) {
+    throw new Error("reviewed npm cache seed cannot select both packuments-only and tarballs-only");
+  }
+  const locked = readLockedPackages(request.lockfilePath, registryOrigin, request);
   const selectedPackageSpecs =
     request.selectedPackageSpecs ??
     new Set(locked.map(({ name, version }) => `${name}@${version}`));
   const expectedArchives = request.packumentsOnly
     ? new Set<string>()
-    : new Set(selectedPackageSpecs);
+    : new Set(
+        locked
+          .filter(({ inBundle, name, version }) => {
+            return !inBundle && selectedPackageSpecs.has(`${name}@${version}`);
+          })
+          .map(({ name, version }) => `${name}@${version}`),
+      );
   const unexpectedArchives = new Set(request.archives.keys());
   const cachePath = join(cacheDirectory, "_cacache");
   const packumentVersions = new Map<string, Record<string, unknown>>();
   const seeded: string[] = [];
   for (const entry of locked) {
     const packageSpec = `${entry.name}@${entry.version}`;
-    if (!selectedPackageSpecs.has(packageSpec)) continue;
-    if (!request.packumentsOnly) {
+    const selectedArchive = !entry.inBundle && selectedPackageSpecs.has(packageSpec);
+    const selectedPackument = Boolean(entry.inBundle) || selectedPackageSpecs.has(packageSpec);
+    if (!selectedArchive && (request.tarballsOnly || !selectedPackument)) continue;
+    if (!request.packumentsOnly && selectedArchive) {
       const archivePath = request.archives.get(packageSpec);
       if (!archivePath)
         throw new Error(`reviewed npm cache seed archive is missing: ${packageSpec}`);
       expectedArchives.delete(packageSpec);
       unexpectedArchives.delete(packageSpec);
-      const archive = readArchive(archivePath, packageSpec);
-      const actualIntegrity = `sha512-${createHash("sha512").update(archive).digest("base64")}`;
-      if (actualIntegrity !== entry.integrity) {
-        throw new Error(
-          `reviewed npm cache seed integrity mismatch for ${packageSpec}\nExpected: ${entry.integrity}\nActual:   ${actualIntegrity}`,
-        );
-      }
+      const archive = readReviewedNpmArchiveFile({
+        archivePath,
+        expectedIntegrity: entry.integrity,
+        label: `reviewed npm cache seed ${packageSpec}`,
+        maximumBytes: request.maximumArchiveBytes,
+      });
       await put(cachePath, `make-fetch-happen:request-cache:${entry.resolved}`, archive, {
         metadata: {
           options: { compress: true },
@@ -299,20 +324,27 @@ export async function seedReviewedNpmCache(
       await put(cachePath, `pacote:tarball:${packageSpec}`, archive);
     }
 
-    const version = {
-      ...(entry.bundleDependencies ? { bundleDependencies: entry.bundleDependencies } : {}),
-      ...(entry.dependencies ? { dependencies: entry.dependencies } : {}),
-      dist: { integrity: entry.integrity, tarball: entry.resolved },
-      ...(entry.hasShrinkwrap ? { hasShrinkwrap: true } : {}),
-      name: entry.name,
-      ...(entry.optionalDependencies ? { optionalDependencies: entry.optionalDependencies } : {}),
-      ...(entry.peerDependencies ? { peerDependencies: entry.peerDependencies } : {}),
-      ...(entry.peerDependenciesMeta ? { peerDependenciesMeta: entry.peerDependenciesMeta } : {}),
-      version: entry.version,
-    };
-    const versions = packumentVersions.get(entry.name) ?? {};
-    versions[entry.version] = version;
-    packumentVersions.set(entry.name, versions);
+    if (!request.tarballsOnly && selectedPackument) {
+      const version = {
+        ...(entry.bundleDependencies ? { bundleDependencies: entry.bundleDependencies } : {}),
+        ...(entry.dependencies ? { dependencies: entry.dependencies } : {}),
+        ...(entry.inBundle
+          ? {}
+          : { dist: { integrity: entry.integrity, tarball: entry.resolved } }),
+        ...(entry.hasShrinkwrap ? { hasShrinkwrap: true } : {}),
+        name: entry.name,
+        ...(entry.optionalDependencies ? { optionalDependencies: entry.optionalDependencies } : {}),
+        ...(entry.peerDependencies ? { peerDependencies: entry.peerDependencies } : {}),
+        ...(entry.peerDependenciesMeta ? { peerDependenciesMeta: entry.peerDependenciesMeta } : {}),
+        version: entry.version,
+      };
+      const versions = packumentVersions.get(entry.name) ?? {};
+      const existing = versions[entry.version] as
+        | Readonly<{ dist?: Readonly<Record<string, unknown>> }>
+        | undefined;
+      if (!existing?.dist || !entry.inBundle) versions[entry.version] = version;
+      packumentVersions.set(entry.name, versions);
+    }
     seeded.push(packageSpec);
   }
   for (const [packageName, versions] of [...packumentVersions].sort(([left], [right]) =>
@@ -327,6 +359,10 @@ export async function seedReviewedNpmCache(
       }),
     );
     const url = packumentUrl(registryOrigin, packageName);
+    // npm view requests full metadata while npm ci and npm pack request the
+    // compact install representation. Keep both Accept variants bound to the
+    // same lock-derived bytes. Consumers that run `npm cache verify` must seed
+    // these variant records afterward because verification keeps one URL entry.
     for (const accept of [INSTALL_ACCEPT, "application/json"]) {
       await put(cachePath, `make-fetch-happen:request-cache:${url}`, packument, {
         metadata: {

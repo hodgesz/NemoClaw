@@ -7,7 +7,9 @@ import type {
   TrustedShellCommand,
 } from "../shell-probe.ts";
 
-export { shellQuote } from "../../../../src/lib/core/shell-quote.ts";
+export function shellQuote(value: unknown): string {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
 
 export interface CommandRunner {
   run(command: TrustedShellCommand, options?: ShellProbeRunOptions): Promise<ShellProbeResult>;
@@ -57,6 +59,21 @@ export function assertExitZero(result: CommandExitResult, label: string): void {
     : `exit=${result.exitCode ?? "unknown"}`;
   const detail = resultText(result).trim() || fallback;
   throw new Error(`${label} failed: ${detail}`);
+}
+
+export function assertExitCode(
+  result: CommandExitResult,
+  expectedExitCode: number,
+  label: string,
+): void {
+  if (result.exitCode === expectedExitCode) return;
+  const observed = result.signal
+    ? `signal=${result.signal}`
+    : `exit=${result.exitCode ?? "unknown"}`;
+  const output = resultText(result).trim();
+  throw new Error(
+    `${label} expected exit=${expectedExitCode}, got ${observed}${output ? `: ${output}` : ""}`,
+  );
 }
 
 export function artifactLabel(raw: string): string {

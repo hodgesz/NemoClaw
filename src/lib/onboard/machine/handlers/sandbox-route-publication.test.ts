@@ -14,6 +14,34 @@ vi.mock("../../messaging-channel-setup", () => ({
 }));
 
 describe("sandbox route publication", () => {
+  it("reuses an already-published route without finalizing a stale session reservation", async () => {
+    const session = createSession({ sandboxName: "saved" });
+    session.steps.sandbox.status = "complete";
+    const registryEntry: SandboxEntry = {
+      name: "saved",
+      provider: "provider",
+      model: "model",
+      gatewayName: "nemoclaw",
+    };
+    const finalizeSandboxRouteReservation = vi.fn(() => false);
+    const { deps } = createDeps(
+      {
+        finalizeSandboxRouteReservation,
+        getSandboxReuseState: () => "ready",
+        getSandboxRegistryEntry: () => registryEntry,
+      },
+      session,
+    );
+
+    await handleSandboxState({
+      ...baseOptions(deps, session),
+      resume: true,
+      sandboxName: "saved",
+    });
+
+    expect(finalizeSandboxRouteReservation).not.toHaveBeenCalled();
+  });
+
   it("publishes the current inference reservation after completing Ready sandbox reuse", async () => {
     const session = createSession({ sandboxName: "saved" });
     session.steps.sandbox.status = "complete";
@@ -67,6 +95,92 @@ describe("sandbox route publication", () => {
     expect(registryEntry.reservationSessionId).toBe(session.sessionId);
   });
 
+  it("reserves the session route from the published row before a resumed recreate", async () => {
+    const session = createSession({ sandboxName: "saved" });
+    session.steps.sandbox.status = "complete";
+    const registryEntry: SandboxEntry = {
+      name: "saved",
+      provider: "provider",
+      model: "model",
+      endpointUrl: null,
+      preferredInferenceApi: "openai-completions",
+      gatewayName: "nemoclaw",
+      createdAt: "2026-09-16T00:00:00.000Z",
+    };
+    const reserveSandboxInferenceRoute = vi.fn(() => {
+      registryEntry.pendingRouteReservation = true;
+      registryEntry.reservationSessionId = session.sessionId;
+      return true;
+    });
+    const createSandbox = vi.fn(async () => {
+      expect(registryEntry).toMatchObject({
+        pendingRouteReservation: true,
+        reservationSessionId: session.sessionId,
+      });
+      return "saved";
+    });
+    const { deps } = createDeps(
+      {
+        createSandbox,
+        reserveSandboxInferenceRoute,
+        getSandboxReuseState: () => "ready",
+        getSandboxRegistryEntry: () => registryEntry,
+      },
+      session,
+    );
+
+    await handleSandboxState({
+      ...baseOptions(deps, session),
+      resume: true,
+      sandboxName: "saved",
+    });
+
+    expect(reserveSandboxInferenceRoute).toHaveBeenCalledExactlyOnceWith("saved", {
+      provider: "provider",
+      model: "model",
+      endpointUrl: null,
+      endpointSource: null,
+      credentialEnv: null,
+      preferredInferenceApi: "openai-completions",
+      gatewayName: "nemoclaw",
+      reservationSessionId: session.sessionId,
+    });
+    expect(createSandbox).toHaveBeenCalledOnce();
+    expect(reserveSandboxInferenceRoute.mock.invocationCallOrder[0]).toBeLessThan(
+      createSandbox.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("does not reserve again when the session already owns the pending create reservation", async () => {
+    const session = createSession({ sandboxName: "saved" });
+    session.steps.sandbox.status = "complete";
+    const registryEntry: SandboxEntry = {
+      name: "saved",
+      provider: "provider",
+      model: "model",
+      pendingRouteReservation: true,
+      reservationSessionId: session.sessionId,
+    };
+    const createSandbox = vi.fn(async () => "saved");
+    const { deps, calls } = createDeps(
+      {
+        createSandbox,
+        getSandboxReuseState: () => "ready",
+        getSandboxRegistryEntry: () => registryEntry,
+      },
+      session,
+    );
+
+    await handleSandboxState({
+      ...baseOptions(deps, session),
+      resume: true,
+      sandboxName: "saved",
+    });
+
+    expect(createSandbox).toHaveBeenCalledOnce();
+    expect(calls.reserveRoute).not.toHaveBeenCalled();
+  });
+
   it("keeps a created registration pending when post-create metadata fails", async () => {
     const session = createSession();
     const registryEntry: SandboxEntry = {
@@ -114,7 +228,20 @@ describe("sandbox route publication", () => {
       (_name: string, sessionId: string) => sessionId === registryEntry.reservationSessionId,
     );
     const createSandbox = vi.fn(async (...args: unknown[]) => {
-      expect(args[14]).toEqual({ sessionId: session.sessionId });
+      expect(args[14]).toEqual({
+        sessionId: session.sessionId,
+        selection: {
+          provider: "provider",
+          model: "model",
+          endpointUrl: null,
+          endpointSource: null,
+          credentialEnv: null,
+          preferredInferenceApi: "openai-completions",
+          compatibleEndpointReasoning: null,
+          compatibleEndpointReasoningEffort: null,
+          nimContainer: null,
+        },
+      });
       throw new Error("route reservation changed at the verified create boundary");
     });
     const { deps, calls } = createDeps(
@@ -136,6 +263,7 @@ describe("sandbox route publication", () => {
     ).rejects.toThrow("route reservation changed at the verified create boundary");
 
     expect(createSandbox).toHaveBeenCalledOnce();
+    expect(calls.reserveRoute).not.toHaveBeenCalled();
     expect(finalizeSandboxRouteReservation).not.toHaveBeenCalled();
     expect(calls.updateSandbox).not.toHaveBeenCalled();
     expect(registryEntry).toMatchObject({

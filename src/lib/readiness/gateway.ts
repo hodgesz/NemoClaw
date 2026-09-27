@@ -99,6 +99,12 @@ function safeOwnerFailureText(value: string, owner: GatewayOwner): string {
   return safeReportText(withoutPrivateState);
 }
 
+function caughtFailureText(prefix: string, error: unknown, owner?: GatewayOwner): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const detail = owner ? safeOwnerFailureText(raw, owner) : safeReportText(raw);
+  return detail ? `${prefix}: ${detail}` : prefix;
+}
+
 function conflictFromAttachmentFailure(
   code: GatewayOwnershipFailureCode,
 ): GatewayPortConflictState {
@@ -140,10 +146,13 @@ async function observeGateway(
   let owner: GatewayOwner;
   try {
     owner = deps.resolveOwner();
-  } catch {
+  } catch (error) {
     return {
       observedAt,
-      failure: "Gateway lifecycle authority could not be resolved before lifecycle effects.",
+      failure: caughtFailureText(
+        "Gateway lifecycle authority could not be resolved before lifecycle effects",
+        error,
+      ),
       authorityFailure: true,
     };
   }
@@ -183,7 +192,11 @@ async function observeGateway(
           driftState: "not-applicable",
           portConflictState: "unknown",
         },
-        failure: "The externally supervised gateway attachment probe failed safely.",
+        failure: caughtFailureText(
+          "The externally supervised gateway attachment probe failed safely",
+          error,
+          owner,
+        ),
       };
     }
   }
@@ -203,7 +216,7 @@ async function observeGateway(
           : undefined,
       },
     };
-  } catch {
+  } catch (error) {
     return {
       observedAt,
       observations: {
@@ -213,7 +226,11 @@ async function observeGateway(
         driftState: "unknown",
         portConflictState: "unknown",
       },
-      failure: "Managed gateway observations could not be collected safely.",
+      failure: caughtFailureText(
+        "Managed gateway observations could not be collected safely",
+        error,
+        owner,
+      ),
     };
   }
 }

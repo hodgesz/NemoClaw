@@ -30,8 +30,13 @@ export interface SandboxMessagingPreflightDeps {
   resolveDisabledChannels(sandboxName: string): string[];
   gatewayName(): string;
   registry: MessagingConflictGuardDeps["registry"];
-  providerExistsInGateway(name: string): boolean;
-  providerMatchesGatewayCredential(name: string, type: string, credentialEnv: string): boolean;
+  readonly preEnableHookRegistry?: MessagingConflictGuardDeps["preEnableHookRegistry"];
+  providerExistsInGateway(name: string): boolean | Promise<boolean>;
+  providerMatchesGatewayCredential(
+    name: string,
+    type: string,
+    credentialEnv: string,
+  ): boolean | Promise<boolean>;
   isNonInteractive(): boolean;
   promptYesNoOrDefault(
     message: string,
@@ -49,13 +54,12 @@ export interface SandboxMessagingPreflightDeps {
   getCredential(envKey: string): string | null;
   normalizeCredentialValue(value: unknown): string;
   registerExtraPlaceholderProviders(
-    sandboxName: string,
     messagingTokenDefs: CreateSandboxMessagingPrepResult["messagingTokenDefs"],
   ): string[];
   getMessagingChannelForEnvKey(envKey: string): string | null;
   prepareCreateSandboxMessaging?: (
     input: CreateSandboxMessagingPrepInput,
-  ) => CreateSandboxMessagingPrepResult;
+  ) => CreateSandboxMessagingPrepResult | Promise<CreateSandboxMessagingPrepResult>;
   enforceMessagingChannelConflicts?: (deps: MessagingConflictGuardDeps) => Promise<void>;
 }
 
@@ -70,23 +74,25 @@ export async function prepareSandboxMessagingPreflight(
   const disabledChannels = deps.resolveDisabledChannels(input.sandboxName);
   await checkMessagingPlanConflicts(input.sandboxName, disabledChannels, deps);
 
-  const result = (deps.prepareCreateSandboxMessaging ?? defaultPrepareCreateSandboxMessaging)({
-    sandboxName: input.sandboxName,
-    agentName: input.agentName,
-    requireExactProviderBinding: input.requireExactProviderBinding,
-    channels: input.channels,
-    enabledChannels: input.enabledChannels,
-    disabledChannels,
-    webSearchConfig: input.webSearchConfig,
-    env: input.env,
-    getValidatedMessagingTokenByEnvKey: deps.getValidatedMessagingTokenByEnvKey,
-    getCredential: deps.getCredential,
-    normalizeCredentialValue: deps.normalizeCredentialValue,
-    registerExtraPlaceholderProviders: deps.registerExtraPlaceholderProviders,
-    getMessagingChannelForEnvKey: deps.getMessagingChannelForEnvKey,
-    providerExistsInGateway: deps.providerExistsInGateway,
-    providerMatchesGatewayCredential: deps.providerMatchesGatewayCredential,
-  });
+  const result = await (deps.prepareCreateSandboxMessaging ?? defaultPrepareCreateSandboxMessaging)(
+    {
+      sandboxName: input.sandboxName,
+      agentName: input.agentName,
+      requireExactProviderBinding: input.requireExactProviderBinding,
+      channels: input.channels,
+      enabledChannels: input.enabledChannels,
+      disabledChannels,
+      webSearchConfig: input.webSearchConfig,
+      env: input.env,
+      getValidatedMessagingTokenByEnvKey: deps.getValidatedMessagingTokenByEnvKey,
+      getCredential: deps.getCredential,
+      normalizeCredentialValue: deps.normalizeCredentialValue,
+      registerExtraPlaceholderProviders: deps.registerExtraPlaceholderProviders,
+      getMessagingChannelForEnvKey: deps.getMessagingChannelForEnvKey,
+      providerExistsInGateway: deps.providerExistsInGateway,
+      providerMatchesGatewayCredential: deps.providerMatchesGatewayCredential,
+    },
+  );
 
   // Fail before the caller can act on this intent: onboard may delete and
   // recreate the sandbox, and a selected channel that resolved to nothing would
@@ -133,6 +139,7 @@ async function checkMessagingPlanConflicts(
     cliName: deps.cliName,
     log: deps.log,
     error: deps.error,
+    preEnableHookRegistry: deps.preEnableHookRegistry,
     exit: deps.exitProcess,
   });
 }

@@ -68,6 +68,7 @@ export function uninstallChildArgs(options: UninstallRunOptions): string[] {
   const args = ["internal", "uninstall", "run-plan", "--yes", "--all-gateway-ports-child"];
   if (options.deleteModels) args.push("--delete-models");
   if (options.destroyUserData) args.push("--destroy-user-data");
+  if (options.forceFreshReset) args.push("--force-fresh-reset");
   if (options.keepOpenShell) args.push("--keep-openshell");
   return args;
 }
@@ -79,6 +80,7 @@ export function uninstallChildArgs(options: UninstallRunOptions): string[] {
 export function uninstallChildEnv(env: NodeJS.ProcessEnv, port: number): NodeJS.ProcessEnv {
   const next: NodeJS.ProcessEnv = { ...env, NEMOCLAW_GATEWAY_PORT: String(port) };
   delete next[ALL_GATEWAY_PORTS_ENV];
+  if (port !== GATEWAY_PORT) delete next.NEMOCLAW_OPENSHELL_GATEWAY_STATE_DIR;
   return next;
 }
 

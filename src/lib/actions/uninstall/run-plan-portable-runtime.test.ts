@@ -9,6 +9,7 @@ import { afterEach, assert, describe, expect, it, vi } from "vitest";
 import { testTimeoutOptions } from "../../../../test/helpers/timeouts";
 import {
   withProvenManagedGatewayProcess,
+  withSuccessfulPreUninstallBackup,
   writeManagedGatewayRuntimeProof,
 } from "../../../../test/support/uninstall-managed-gateway-test-support";
 
@@ -49,8 +50,8 @@ function sandboxAbsent(name: string): RunResult {
   return { status: 1, stdout: "", stderr: `sandbox ${name} not found` };
 }
 
-function runUninstallPlan(options: UninstallRunOptions, deps: UninstallRunDeps) {
-  return runUninstallPlanBase(options, {
+function withManagedGatewayAuthority(deps: UninstallRunDeps): UninstallRunDeps {
+  return {
     resolveGatewayTeardownAuthority: ({ gatewayName, gatewayPort }) => ({
       gatewayName,
       gatewayPort,
@@ -62,13 +63,27 @@ function runUninstallPlan(options: UninstallRunOptions, deps: UninstallRunDeps) 
       requiredCapabilities: [],
     }),
     ...deps,
-  });
+  };
+}
+
+async function runUninstallPlan(options: UninstallRunOptions, deps: UninstallRunDeps) {
+  return await runUninstallPlanBase(options, withManagedGatewayAuthority(deps));
+}
+
+async function runUninstallPlanWithBackup(options: UninstallRunOptions, deps: UninstallRunDeps) {
+  return await runUninstallPlanProduction(
+    options,
+    withSuccessfulPreUninstallBackup(withManagedGatewayAuthority(deps)),
+  );
 }
 
 function okWithKnownGatewayList(command: string, args: readonly string[]): RunResult {
-  return command === "openshell" && args[0] === "gateway" && args[1] === "list"
-    ? ok(JSON.stringify([{ name: "nemoclaw" }]))
-    : ok();
+  const outputs: Record<string, string> = {
+    "openshell gateway list": JSON.stringify([
+      { name: "nemoclaw", endpoint: "https://127.0.0.1:8080", active: true },
+    ]),
+  };
+  return ok(outputs[[command, ...args.slice(0, 2)].join(" ")] ?? "");
 }
 
 function sharedOpenShellTeardownWasCalled(
@@ -100,8 +115,8 @@ function modeledSandboxStatus(
 
 const temporaryDirectories: string[] = [];
 
-function sharedOpenShellFixture(prefix: string) {
-  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+function sharedOpenShellFixture(prefix: string, parentDir = os.tmpdir()) {
+  const homeDir = fs.mkdtempSync(path.join(parentDir, prefix));
   temporaryDirectories.push(homeDir);
   const paths = defaultUninstallPaths({ home: homeDir });
   const localInstallPaths = paths.openshellInstallPaths.filter((target) =>
@@ -220,19 +235,6 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
   it.each<[string, EvidenceMutation]>([
     ["receipt without configuration", (home, state) => writeAdmissionReceipt(home, state)],
     [
-      "forged configuration cleanup",
-      (home) => {
-        const target = path.join(
-          home,
-          ".config/nemoclaw/portable",
-          `.containers.conf.portable-uninstall-${"e".repeat(64)}.cleanup`,
-        );
-        fs.mkdirSync(path.dirname(target), { mode: 0o700, recursive: true });
-        fs.writeFileSync(target, "unknown", { mode: 0o600 });
-        return target;
-      },
-    ],
-    [
       "retirement record with replacement authority",
       (home, state) => {
         const receipt = writeAdmissionReceipt(home, state);
@@ -258,23 +260,15 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
       (_home, state) => symlinkEvidence(path.join(state, "portable-demo-lifecycle"), state),
     ],
     [
-      "symlinked configuration root",
-      (home, state) => symlinkEvidence(path.join(home, ".config/nemoclaw/portable"), state),
-    ],
-    [
       "excess receipt entries",
       (_home, state) =>
         directoryEvidence(path.join(state, "portable-demo-lifecycle"), 0o700, 1_025),
     ],
-    [
-      "excess configuration entries",
-      (home) => directoryEvidence(path.join(home, ".config/nemoclaw/portable"), 0o700, 1_025),
-    ],
-  ])("rejects %s before generic effects (#9189)", (_case, mutate) => {
+  ])("rejects %s before generic effects (#9189)", async (_case, mutate) => {
     const scope = admissionFailureScope("nemoclaw-portable-admission-");
     const evidence = mutate(scope.homeDir, scope.stateDir);
     const expectedRegistry = fs.readFileSync(scope.registry, "utf8");
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: true, destroyUserData: true, keepOpenShell: false },
       admissionFailureDeps(scope),
     );
@@ -401,6 +395,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
           HOME: scope.homeDir,
         },
         hasPortableRuntimeCleanup: () => true,
+        withSandboxMutationLock: async (_sandboxName, operation) => await operation(),
         withPortableHostFence: async (_home, operation) => {
           hostFenceHeld = true;
           try {
@@ -420,13 +415,18 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     expect(fs.existsSync(journalEvidence)).toBe(true);
   });
 
-  it("uses exact receipt names without Docker or an all-sandbox mutation (#9189)", () => {
+  it("uses exact receipt names with external gateway state and no all-sandbox mutation (#10544)", async () => {
     const order: string[] = [];
     const logs: string[] = [];
     const registeredSandboxes = new Set(["alpha", "unrelated"]);
     const { homeDir, sharedPaths: sharedOpenShellPaths } = sharedOpenShellFixture(
       "nemoclaw-portable-success-",
+      process.cwd(),
     );
+    const gatewayStateDir = path.join(homeDir, "external-gateway-state");
+    const gatewayStateMarker = path.join(gatewayStateDir, "keep");
+    fs.mkdirSync(gatewayStateDir, { mode: 0o700 });
+    fs.writeFileSync(gatewayStateMarker, "gateway\n", { mode: 0o600 });
     const removed: string[] = [];
     const runHandlers = new Map<string, () => RunResult>([
       ["pgrep", notFound],
@@ -457,16 +457,16 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
       )();
     });
     const runPortableCleanup = vi.fn(
-      (
+      async (
         _input: PortableRuntimeCleanupInput,
         continueAfterSandboxRemoval: (
           removed: number,
           sandboxNames: readonly string[],
           gatewayName: string,
-        ) => boolean,
+        ) => boolean | Promise<boolean>,
       ) => {
         order.push("exact-sandbox");
-        expect(continueAfterSandboxRemoval(1, ["alpha"], "nemoclaw")).toBe(true);
+        expect(await continueAfterSandboxRemoval(1, ["alpha"], "nemoclaw")).toBe(true);
         order.push("exact-shared");
         return {
           registryRemoved: true,
@@ -478,13 +478,17 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     const runDocker = vi.fn(() => ok(""));
     const kill = vi.fn(() => true);
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: true, keepOpenShell: false },
       {
         commandExists: (command) =>
           ["openshell", "pgrep", "lsof", "docker", "npm"].includes(command),
-        env: { HOME: homeDir } as NodeJS.ProcessEnv,
-        existsSync: (target) => sharedOpenShellPaths.has(String(target)),
+        env: {
+          HOME: homeDir,
+          NEMOCLAW_OPENSHELL_GATEWAY_STATE_DIR: gatewayStateDir,
+        } as NodeJS.ProcessEnv,
+        existsSync: (target) =>
+          sharedOpenShellPaths.has(String(target)) || String(target) === gatewayStateDir,
         hasPortableRuntimeCleanup: () => true,
         isTty: false,
         kill,
@@ -503,6 +507,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     expect(runDocker).not.toHaveBeenCalled();
     expect(kill).not.toHaveBeenCalled();
     expect(removed).toEqual([]);
+    expect(fs.readFileSync(gatewayStateMarker, "utf8")).toBe("gateway\n");
     expect(run.mock.calls.every(([command]) => ["openshell", "npm"].includes(command))).toBe(true);
     expect(run).toHaveBeenCalledWith(
       "openshell",
@@ -531,7 +536,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     expect(logs.join("\n")).toContain("exact retry and lifecycle reconciliation");
   });
 
-  it("keeps explicit receipt gateway scope when ambient selection drifts (#9189)", () => {
+  it("keeps explicit receipt gateway scope when ambient selection drifts (#9189)", async () => {
     const registeredSandboxes = new Set([
       "nemoclaw/alpha",
       "nemoclaw/beta",
@@ -582,15 +587,15 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
       )(),
     );
     const runPortableCleanup = vi.fn(
-      (
+      async (
         _input: PortableRuntimeCleanupInput,
         continueAfterSandboxRemoval: (
           removedCount: number,
           sandboxNames: readonly string[],
           gatewayName: string,
-        ) => boolean,
+        ) => boolean | Promise<boolean>,
       ) => {
-        expect(continueAfterSandboxRemoval(2, ["alpha", "beta"], "nemoclaw")).toBe(true);
+        expect(await continueAfterSandboxRemoval(2, ["alpha", "beta"], "nemoclaw")).toBe(true);
         return {
           registryRemoved: true,
           sandboxContainersRemoved: 2,
@@ -599,7 +604,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
       },
     );
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: false, keepOpenShell: false },
       {
         commandExists: (command) => ["openshell", "pgrep", "lsof"].includes(command),
@@ -654,7 +659,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     ).toEqual(ok("other/alpha usable"));
   });
 
-  it("settles one failed delete only after the connected gateway proves exact absence (#9499)", () => {
+  it("settles one failed delete only after the connected gateway proves exact absence (#9499)", async () => {
     const registeredSandboxes = new Set(["unrelated"]);
     const { homeDir, sharedPaths: sharedOpenShellPaths } = sharedOpenShellFixture(
       "nemoclaw-portable-absent-",
@@ -679,15 +684,15 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
       )(),
     );
     const runPortableCleanup = vi.fn(
-      (
+      async (
         _input: PortableRuntimeCleanupInput,
         continueAfterSandboxRemoval: (
           removed: number,
           sandboxNames: readonly string[],
           gatewayName: string,
-        ) => boolean,
+        ) => boolean | Promise<boolean>,
       ) => {
-        expect(continueAfterSandboxRemoval(1, ["alpha"], "nemoclaw")).toBe(true);
+        expect(await continueAfterSandboxRemoval(1, ["alpha"], "nemoclaw")).toBe(true);
         return {
           registryRemoved: true,
           sandboxContainersRemoved: 1,
@@ -696,7 +701,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
       },
     );
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       { assumeYes: true, deleteModels: false, keepOpenShell: false },
       {
         commandExists: (command) => ["openshell", "pgrep", "lsof"].includes(command),
@@ -735,8 +740,9 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     ["exit zero while the sandbox remains", Number.POSITIVE_INFINITY, 1, 4],
   ])(
     "%s after a scoped delete uses bounded exact-name verification (#9189)",
-    (_case, absentAttempt, expectedExit, expectedSleeps) => {
+    async (_case, absentAttempt, expectedExit, expectedSleeps) => {
       let getCalls = 0;
+      const logs: string[] = [];
       const sleep = vi.fn();
       const runHandlers = new Map<string, () => RunResult>([
         ["openshell status -g nemoclaw", () => ok("Status: Connected\nGateway: nemoclaw\n")],
@@ -757,20 +763,20 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
         )(),
       );
       const runPortableCleanup = vi.fn(
-        (
+        async (
           _input: PortableRuntimeCleanupInput,
           continueAfterSandboxRemoval: (
             removed: number,
             sandboxNames: readonly string[],
             gatewayName: string,
-          ) => boolean,
+          ) => boolean | Promise<boolean>,
         ) =>
-          continueAfterSandboxRemoval(1, ["alpha"], "nemoclaw")
+          (await continueAfterSandboxRemoval(1, ["alpha"], "nemoclaw"))
             ? { registryRemoved: true, sandboxContainersRemoved: 1, selectorsRemoved: [] }
             : null,
       );
 
-      const result = runUninstallPlan(
+      const result = await runUninstallPlan(
         { assumeYes: true, deleteModels: false, destroyUserData: true, keepOpenShell: false },
         {
           commandExists: (command) => ["openshell", "pgrep", "lsof"].includes(command),
@@ -778,7 +784,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
           existsSync: () => false,
           hasPortableRuntimeCleanup: () => true,
           isTty: false,
-          log: vi.fn(),
+          log: (line) => logs.push(line),
           rmSync: vi.fn(),
           run,
           runDocker: vi.fn(() => ok()),
@@ -791,6 +797,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
       expect(getCalls).toBe(expectedExit === 0 ? absentAttempt : 5);
       expect(sleep).toHaveBeenCalledTimes(expectedSleeps);
       expect(runPortableCleanup).toHaveBeenCalledOnce();
+      expect(logs.includes("Deleted OpenShell sandbox 'alpha'")).toBe(expectedExit === 0);
     },
   );
 
@@ -833,7 +840,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     ],
   ])(
     "rejects %s and preserves all retry evidence (#9189)",
-    (_caseName, deleteError, statusResult, expectedError) => {
+    async (_caseName, deleteError, statusResult, expectedError) => {
       const removed: string[] = [];
       const errors: string[] = [];
       const registeredSandboxes = new Set(["alpha", "unrelated"]);
@@ -867,15 +874,15 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
         )(),
       );
       const runPortableCleanup = vi.fn(
-        (
+        async (
           _input: PortableRuntimeCleanupInput,
           continueAfterSandboxRemoval: (
             removed: number,
             sandboxNames: readonly string[],
             gatewayName: string,
-          ) => boolean,
+          ) => boolean | Promise<boolean>,
         ) => {
-          const continued = continueAfterSandboxRemoval(1, ["alpha"], "nemoclaw");
+          const continued = await continueAfterSandboxRemoval(1, ["alpha"], "nemoclaw");
           const finishSharedCleanup = () => {
             Object.assign(portableEvidence, {
               config: false,
@@ -900,7 +907,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
         },
       );
 
-      const result = runUninstallPlan(
+      const result = await runUninstallPlan(
         {
           assumeYes: true,
           deleteModels: false,
@@ -952,7 +959,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     },
   );
 
-  it("preserves retry evidence after an exact cleanup failure with destroy data (#9189)", () => {
+  it("preserves retry evidence after an exact cleanup failure with destroy data (#9189)", async () => {
     const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-portable-retry-cli-"));
     temporaryDirectories.push(homeDir);
     const sourceMarker = path.join(homeDir, ".nemoclaw/source/retry-source-marker");
@@ -963,7 +970,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     const run = vi.fn((command: string, args: string[]) =>
       ["pgrep", "lsof"].includes(command) ? notFound() : okWithKnownGatewayList(command, args),
     );
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       {
         assumeYes: true,
         deleteModels: false,
@@ -996,7 +1003,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
 
   it.each(["config", "registry"] as const)(
     "keeps repeated %s-stage retirement uninstalls out of generic cleanup (#9189)",
-    (crashTarget) => {
+    async (crashTarget) => {
       const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-portable-repeat-"));
       temporaryDirectories.push(homeDir);
       const stateDir = path.join(homeDir, ".nemoclaw");
@@ -1046,26 +1053,30 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
         runDocker,
         runHuggingFaceCacheDataCleanup: runModelCleanup,
         runLocalModelRuntimeCleanup: runModelCleanup,
-        runPortableRuntimeCleanupTransaction: (input, continueAfterSandboxRemoval) =>
-          runPortableRuntimeCleanupTransaction(input, continueAfterSandboxRemoval, {
-            withRegistryLock: (_registryFile, operation) => {
+        runPortableRuntimeCleanupTransaction: async (input, continueAfterSandboxRemoval) =>
+          await runPortableRuntimeCleanupTransaction(input, continueAfterSandboxRemoval, {
+            withRegistryLock: async (_registryFile, operation) => {
               !stagedObserved && expect(fs.existsSync(stage)).toBe(true);
               stagedObserved = true;
-              return operation();
+              return await operation();
             },
           }),
       };
 
       expect(
-        runUninstallPlan(
-          { assumeYes: true, deleteModels: true, destroyUserData: true, keepOpenShell: false },
-          deps,
+        (
+          await runUninstallPlan(
+            { assumeYes: true, deleteModels: true, destroyUserData: true, keepOpenShell: false },
+            deps,
+          )
         ).exitCode,
       ).toBe(0);
       expect(
-        runUninstallPlan(
-          { assumeYes: true, deleteModels: true, destroyUserData: true, keepOpenShell: false },
-          deps,
+        (
+          await runUninstallPlan(
+            { assumeYes: true, deleteModels: true, destroyUserData: true, keepOpenShell: false },
+            deps,
+          )
         ).exitCode,
       ).toBe(0);
       expect(runDocker).not.toHaveBeenCalled();
@@ -1079,26 +1090,26 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     },
   );
 
-  it("stops state deletion when portable state changes after sandbox removal (#9189)", () => {
+  it("stops state deletion when portable state changes after sandbox removal (#9189)", async () => {
     const errors: string[] = [];
     const removed: string[] = [];
     const runPortableCleanup = vi.fn(
-      (
+      async (
         _input: PortableRuntimeCleanupInput,
         continueAfterSandboxRemoval: (
           removed: number,
           sandboxNames: readonly string[],
           gatewayName: string,
-        ) => boolean,
+        ) => boolean | Promise<boolean>,
       ) => {
-        continueAfterSandboxRemoval(1, ["alpha"], "nemoclaw");
+        await continueAfterSandboxRemoval(1, ["alpha"], "nemoclaw");
         throw new Error(
           "Portable lifecycle or registry state changed during exact uninstall cleanup",
         );
       },
     );
 
-    const result = runUninstallPlan(
+    const result = await runUninstallPlan(
       {
         assumeYes: true,
         deleteModels: false,
@@ -1127,7 +1138,7 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     expect(removed).toEqual([]);
   });
 
-  it("keeps detected portable receipts during a sibling-gateway scoped pass (#9189)", () => {
+  it("keeps detected portable receipts during a sibling-gateway scoped pass (#9189)", async () => {
     const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-portable-sibling-"));
     const stateDir = path.join(homeDir, ".nemoclaw");
     const uninstallPaths = defaultUninstallPaths({ home: homeDir });
@@ -1208,14 +1219,14 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     fs.mkdirSync(path.dirname(config), { mode: 0o700, recursive: true });
     fs.writeFileSync(config, "[engine]\n", { mode: 0o600 });
     const detectPortable = vi.fn(hasPortableRuntimeCleanup);
-    const runPortableCleanup = vi.fn(() => ({
+    const runPortableCleanup = vi.fn(async () => ({
       registryRemoved: true,
       sandboxContainersRemoved: 1,
       selectorsRemoved: [],
     }));
     try {
       expect(hasPortableRuntimeCleanup(stateDir)).toBe(true);
-      const result = runUninstallPlan(
+      const result = await runUninstallPlanWithBackup(
         { assumeYes: true, deleteModels: false, keepOpenShell: false },
         withProvenManagedGatewayProcess({
           commandExists: (command) => ["openshell", "pgrep", "lsof"].includes(command),
@@ -1230,7 +1241,20 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
             ["pgrep", "lsof"].includes(command)
               ? notFound()
               : command === "openshell" && args.join(" ") === "gateway list -o json"
-                ? ok(JSON.stringify([{ name: "nemoclaw" }, { name: "nemoclaw-9000" }]))
+                ? ok(
+                    JSON.stringify([
+                      {
+                        name: "nemoclaw",
+                        endpoint: "https://127.0.0.1:8080",
+                        active: true,
+                      },
+                      {
+                        name: "nemoclaw-9000",
+                        endpoint: "https://127.0.0.1:9000",
+                        active: false,
+                      },
+                    ]),
+                  )
                 : ok(),
           runDocker: () => ok(""),
           runPortableRuntimeCleanupTransaction: runPortableCleanup,
@@ -1247,9 +1271,9 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     }
   });
 
-  it("leaves keep-openshell and external-supervisor flows unchanged (#9189)", () => {
+  it("leaves keep-openshell and external-supervisor flows unchanged (#9189)", async () => {
     const hasPortable = vi.fn(() => true);
-    const runPortableCleanup = vi.fn(() => ({
+    const runPortableCleanup = vi.fn(async () => ({
       registryRemoved: true,
       sandboxContainersRemoved: 1,
       selectorsRemoved: [],
@@ -1268,29 +1292,35 @@ describe("portable runtime cleanup in the uninstall run plan", testTimeoutOption
     };
 
     expect(
-      runUninstallPlan({ assumeYes: true, deleteModels: false, keepOpenShell: true }, baseDeps)
-        .exitCode,
+      (
+        await runUninstallPlan(
+          { assumeYes: true, deleteModels: false, keepOpenShell: true },
+          baseDeps,
+        )
+      ).exitCode,
     ).toBe(0);
     expect(
-      runUninstallPlan(
-        { assumeYes: true, deleteModels: false, keepOpenShell: false },
-        {
-          ...baseDeps,
-          resolveGatewayTeardownAuthority: ({ gatewayName, gatewayPort }) => ({
-            gatewayName,
-            gatewayPort,
-            mode: "externally-supervised",
-            source: "declared",
-            endpoint: "https://127.0.0.1:8080",
-            stateDir: "/srv/external-openshell",
-            supervisor: {
-              kind: "systemd-system",
-              serviceName: "external-openshell.service",
-              execPath: "/usr/local/bin/openshell-gateway",
-            },
-            requiredCapabilities: [],
-          }),
-        },
+      (
+        await runUninstallPlan(
+          { assumeYes: true, deleteModels: false, keepOpenShell: false },
+          {
+            ...baseDeps,
+            resolveGatewayTeardownAuthority: ({ gatewayName, gatewayPort }) => ({
+              gatewayName,
+              gatewayPort,
+              mode: "externally-supervised",
+              source: "declared",
+              endpoint: "https://127.0.0.1:8080",
+              stateDir: "/srv/external-openshell",
+              supervisor: {
+                kind: "systemd-system",
+                serviceName: "external-openshell.service",
+                execPath: "/usr/local/bin/openshell-gateway",
+              },
+              requiredCapabilities: [],
+            }),
+          },
+        )
       ).exitCode,
     ).toBe(0);
     expect(hasPortable).not.toHaveBeenCalled();

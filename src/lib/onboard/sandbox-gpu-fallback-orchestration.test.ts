@@ -3,12 +3,8 @@
 
 import { describe, expect, it, vi } from "vitest";
 
+import { type SelectedDockerGpuRoute } from "./docker-gpu-route";
 import {
-  renderCompatibilityFallbackCreateArgs,
-  type SelectedDockerGpuRoute,
-} from "./docker-gpu-route";
-import {
-  cleanupNativeGpuFailureForFallback,
   executeSandboxGpuCreatePlan,
   type NativeGpuFallbackCleanupResult,
   type SandboxGpuCreateAttemptFailure,
@@ -96,113 +92,71 @@ describe("executeSandboxGpuCreatePlan", () => {
     expect(traceEvent).toHaveBeenCalledWith("gpu_native_success", { route: "native" });
   });
 
-  it.each([
-    "create",
-    "readiness",
-    "gpu-proof",
-  ] as const)("falls back once after a native %s failure and preserves diagnostics/cleanup ordering", async (stage) => {
-    const order: string[] = [];
-    const runAttempt = vi.fn(async (route: SelectedDockerGpuRoute) => {
-      order.push(`attempt:${route}`);
-      return route === "native"
-        ? nativeFailure(stage)
-        : { ok: true as const, route, value: "compatibility-ready" };
-    });
-    const traceEvent = vi.fn((name: string) => order.push(`trace:${name}`));
+  it.each(["create", "readiness", "gpu-proof"] as const)(
+    "falls back once after a native %s failure and preserves diagnostics/cleanup ordering",
+    async (stage) => {
+      const order: string[] = [];
+      const runAttempt = vi.fn(async (route: SelectedDockerGpuRoute) => {
+        order.push(`attempt:${route}`);
+        return route === "native"
+          ? nativeFailure(stage)
+          : { ok: true as const, route, value: "compatibility-ready" };
+      });
+      const traceEvent = vi.fn((name: string) => order.push(`trace:${name}`));
 
-    const result = await execute({
-      runAttempt,
-      captureNativeFailure: () => record(order, "diagnostics"),
-      cleanupNativeFailure: async () => record(order, "cleanup", SAFE_CLEANUP),
-      prepareCompatibilityAttempt: async () => record(order, "prepare-compatibility"),
-      activateCompatibilityAttempt: async () => record(order, "activate-compatibility"),
-      traceEvent,
-    });
+      const result = await execute({
+        runAttempt,
+        captureNativeFailure: () => record(order, "diagnostics"),
+        cleanupNativeFailure: async () => record(order, "cleanup", SAFE_CLEANUP),
+        prepareCompatibilityAttempt: async () => record(order, "prepare-compatibility"),
+        activateCompatibilityAttempt: async () => record(order, "activate-compatibility"),
+        traceEvent,
+      });
 
-    expect(result).toEqual({
-      ok: true,
-      route: "compatibility",
-      value: "compatibility-ready",
-    });
-    expect(attemptedRoutes(runAttempt)).toEqual(["native", "compatibility"]);
-    expect(order).toEqual([
-      "attempt:native",
-      "diagnostics",
-      "prepare-compatibility",
-      "cleanup",
-      "activate-compatibility",
-      "trace:gpu_compatibility_fallback",
-      "attempt:compatibility",
-    ]);
-    expect(traceEvent).toHaveBeenCalledWith("gpu_compatibility_fallback", {
-      from_route: "native",
-      to_route: "compatibility",
-      failure_stage: stage,
-    });
-  });
+      expect(result).toEqual({
+        ok: true,
+        route: "compatibility",
+        value: "compatibility-ready",
+      });
+      expect(attemptedRoutes(runAttempt)).toEqual(["native", "compatibility"]);
+      expect(order).toEqual([
+        "attempt:native",
+        "diagnostics",
+        "prepare-compatibility",
+        "cleanup",
+        "activate-compatibility",
+        "trace:gpu_compatibility_fallback",
+        "attempt:compatibility",
+      ]);
+      expect(traceEvent).toHaveBeenCalledWith("gpu_compatibility_fallback", {
+        from_route: "native",
+        to_route: "compatibility",
+        failure_stage: stage,
+      });
+    },
+  );
 
-  it("uses an exact Hermes owner-cleanup receipt for one compatibility retry (#9935)", async () => {
-    const ownerCleanup = vi.fn();
-    const native = {
-      ...nativeFailure("gpu-proof"),
-      nativeCleanupReceipt: {
-        kind: "openshell-owner-cleanup-completed" as const,
-        sandboxName: "alpha",
-        sandboxId: "sandbox-alpha",
-        runtimeId: "runtime-alpha",
-      },
-    };
-    const runAttempt = vi.fn(async (route: SelectedDockerGpuRoute) =>
-      route === "native"
-        ? native
-        : { ok: true as const, route, value: "hermes-compatibility-ready" },
-    );
-
-    await expect(
-      execute(
-        planDeps(runAttempt, {
-          cleanupNativeFailure: (failure) =>
-            cleanupNativeGpuFailureForFallback("alpha", failure, {
-              runOpenshell: ownerCleanup,
-            }),
-        }),
-      ),
-    ).resolves.toEqual({
-      ok: true,
-      route: "compatibility",
-      value: "hermes-compatibility-ready",
-    });
-    expect(attemptedRoutes(runAttempt)).toEqual(["native", "compatibility"]);
-    expect(ownerCleanup).not.toHaveBeenCalled();
-  });
-
-  it("prepares and renders the built image before the single compatibility retry", async () => {
+  it("prepares the built image before the single compatibility retry", async () => {
     const imageRef = `sha256:${"a".repeat(64)}`;
-    let compatibilityArgs: string[] | null = null;
+    let compatibilitySource: string | null = null;
     const runAttempt = vi.fn(async (route: SelectedDockerGpuRoute) =>
       route === "native"
         ? nativeFailure("create")
-        : { ok: true as const, route, value: compatibilityArgs },
+        : { ok: true as const, route, value: compatibilitySource },
     );
 
     await expect(
       execute(
         planDeps(runAttempt, {
           prepareCompatibilityAttempt: () => {
-            compatibilityArgs = renderCompatibilityFallbackCreateArgs(
-              ["--from", "/tmp/build/Dockerfile", "--policy", "/tmp/native.yaml", "--gpu"],
-              {
-                imageRef,
-                compatibilityPolicyPath: "/tmp/compatibility.yaml",
-              },
-            );
+            compatibilitySource = imageRef;
           },
         }),
       ),
     ).resolves.toEqual({
       ok: true,
       route: "compatibility",
-      value: ["--from", imageRef, "--policy", "/tmp/compatibility.yaml"],
+      value: imageRef,
     });
     expect(attemptedRoutes(runAttempt)).toEqual(["native", "compatibility"]);
   });

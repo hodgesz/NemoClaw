@@ -110,7 +110,9 @@ export function buildCompletionComment(
     );
   }
   return `${validateMarker(marker)}
-PR review advisory complete for commit \`${commitSha.slice(0, 7)}\`: [read the full review](${reviewUrl.href}). Read it before deciding whether to request changes, approve, or merge this PR.
+**PR Review Advisor finished for commit \`${commitSha.slice(0, 7)}\`.** Include the [Advisor findings](${reviewUrl.href}) in the complete PR feedback collection. Verify and group valid findings before repair.
+
+Request review only when **Require no Advisor blockers** is green.
 
 [All previous runs](${historyUrl.href})
 `;

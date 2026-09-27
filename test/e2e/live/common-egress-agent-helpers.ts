@@ -8,13 +8,12 @@
 // classification without gating on NEMOCLAW_RUN_LIVE_E2E=1.
 
 import type { ShellProbeResult } from "../fixtures/shell-probe.ts";
-export { parseOpenClawAgentText } from "../fixtures/openclaw-agent-output.ts";
 import {
   runBoundedRetry,
   type BoundedRetryResult,
   type RetryEvidence,
   type RetryFailureClass,
-} from "../fixtures/retry-policy.ts";
+} from "../../../tools/e2e/retry-evidence.mts";
 import { isTransientProviderValidationFailure } from "./network-policy-transient-provider.ts";
 
 export const COMMON_EGRESS_TEST_TIMEOUT_MS = 40 * 60_000;
@@ -682,13 +681,19 @@ export function buildOpenClawToolEvidenceReducerScript(
 ): string {
   return [
     '"use strict"',
-    'const fs = require("node:fs")',
+    'const { DatabaseSync } = require("node:sqlite")',
     `const reduce = ${reduceOpenClawToolEvidence.toString()}`,
     `const expectedFetch = ${JSON.stringify(expectedFetch)}`,
-    "const [sessionPath, trajectoryPath] = process.argv.slice(1)",
+    "const [databasePath, sessionId] = process.argv.slice(1)",
     "const readErrors = []",
-    'const read = (filePath, label) => { try { return fs.readFileSync(filePath, "utf8"); } catch (error) { readErrors.push(label + " read failed: " + String(error && error.code || "unknown")); return ""; } }',
-    'const evidence = reduce(read(sessionPath, "session"), read(trajectoryPath, "trajectory"), expectedFetch)',
+    "const database = new DatabaseSync(databasePath, { allowExtension: false, open: true, readOnly: true, timeout: 2000 })",
+    'database.exec("PRAGMA query_only = ON; BEGIN")',
+    'const readRows = (sql, label) => { try { return database.prepare(sql).all(sessionId).map((row) => String(row.eventJson)).join("\\n"); } catch (error) { readErrors.push(label + " read failed: " + String(error && error.code || "unknown")); return ""; } }',
+    'const sessionJsonLines = readRows("SELECT event_json AS eventJson FROM transcript_events WHERE session_id = ? ORDER BY seq", "session")',
+    'const trajectoryJsonLines = readRows("SELECT event_json AS eventJson FROM trajectory_runtime_events WHERE session_id = ? ORDER BY seq", "trajectory")',
+    'database.exec("COMMIT")',
+    "database.close()",
+    "const evidence = reduce(sessionJsonLines, trajectoryJsonLines, expectedFetch)",
     "evidence.errors.unshift(...readErrors)",
     `process.stdout.write(${JSON.stringify(OPENCLAW_TOOL_EVIDENCE_MARKER)} + JSON.stringify(evidence) + "\\n")`,
   ].join("; ");
@@ -969,6 +974,8 @@ const AUTHORIZATION_AGENT_FAILURE_RE = /authorization failed|forbidden|HTTP 403\
 const POLICY_AGENT_FAILURE_RE =
   /SsrFBlockedError|Blocked hostname|denied by network policy|network policy denied|policy (?:update |validation )?failed/iu;
 const MALFORMED_AGENT_FAILURE_RE = /malformed|invalid request/iu;
+const TOOL_APPROVAL_AGENT_REPLY_RE =
+  /(?:waiting for|requires?) (?:your )?approval|please approve(?: it)? to proceed/iu;
 const TERMINAL_PROVIDER_VALIDATION_RE =
   /invalid.*(api[_ -]?key|credential|configuration|request|json)|authentication failed|authorization failed|unauthorized|forbidden|HTTP 40[13]\b|\b40[13]\b|denied by network policy|network policy denied|policy .*failed|routing .*failed|route .*failed|proxy .*failed|hop-by-hop|header stripping|malformed/iu;
 const TRANSIENT_AGENT_FAILURE_RE =
@@ -1064,8 +1071,9 @@ export function classifyHermesAgentAssertion(
   };
 }
 
-/** Recognize transport/provider failures without retrying a successful product response. */
+/** Recognize retryable Hermes turn failures without accepting an incomplete product response. */
 export function isHermesTransientAgentFailure(httpStatus: string, output: string): boolean {
+  if (httpStatus === "200" && TOOL_APPROVAL_AGENT_REPLY_RE.test(output)) return true;
   if (
     httpStatus === "200" ||
     /^(401|403)$/u.test(httpStatus) ||

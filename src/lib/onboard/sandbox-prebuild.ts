@@ -1,48 +1,41 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { dockerImageInspectFormat } from "../adapters/docker";
 import {
-  dockerDesktopCredentialHelperResponds,
-  readDockerCredentialStore,
-} from "../adapters/docker/credential-store";
+  createCredentialFreeDockerConfig,
+  dockerBuildSubprocessEnv,
+  prepareDockerBuildEnvironment,
+  type PreparedDockerBuildEnvironment,
+  warnIfDockerBuildEnvironmentCleanupFailed,
+} from "../adapters/docker/client-isolation";
 import { dockerSpawn } from "../adapters/docker/exec";
+import { dockerImageInspectFormat } from "../adapters/docker/inspect";
 import { redirectInheritedChildStdoutToStderr } from "../cli/stdout-guard";
 import {
   LOCAL_SANDBOX_IMAGE_REPO,
   PORTABLE_LOCAL_SANDBOX_IMAGE_REPO,
 } from "../domain/sandbox/image-tag";
-import { DOCKER_DESKTOP_CREDENTIAL_STORE_NAMES } from "../domain/docker-host";
-import { isWsl } from "../platform";
 import {
   SANDBOX_BUILD_CONTEXT_PREFIX,
   type SandboxBuildContextOrigin,
 } from "../sandbox/build-context";
-import { buildSubprocessEnv } from "../subprocess-env";
 import { isPortableExperimentalProfile } from "./docker-driver-platform";
 import { isImmutableDockerImageId } from "./openshell-docker-sandbox-containers";
 
 const TRUTHY_FLAG_VALUES = new Set(["1", "true", "yes", "on"]);
 const FALSY_FLAG_VALUES = new Set(["0", "false", "no", "off"]);
-const DOCKER_ENV_NAMES = [
-  "CONTAINERS_CONF",
-  "DOCKER_API_VERSION",
-  "DOCKER_CERT_PATH",
-  "DOCKER_CONFIG",
-  "DOCKER_CONTEXT",
-  "DOCKER_HOST",
-  "DOCKER_TLS_VERIFY",
-] as const;
 
 export interface SandboxPrebuildInput {
   buildCtx: string;
   buildId: string;
-  createArgs: readonly string[];
+  /** Deferred Portable path only. Ordinary creation passes the typed source reference. */
+  createArgs?: readonly string[];
+  sourceReference?: string;
   sandboxName: string;
   dockerDriverGateway: boolean;
   origin: SandboxBuildContextOrigin;
@@ -59,46 +52,23 @@ export interface SandboxPrebuildInput {
   ) => Promise<number | null>;
   inspectImageId?: (imageRef: string) => string;
   credentialHelperResponds?: (credsStore: string) => boolean;
+  dockerContextIsDefault?: (env: NodeJS.ProcessEnv) => boolean;
   isWslHost?: boolean;
   log?: (message: string) => void;
 }
 
 export interface SandboxPrebuildResult {
   createArgs: string[];
+  /** Final source for callers that keep the ordinary create plan typed. */
+  sourceReference?: string;
   imageRef: string | null;
   /** Immutable local image identity; mutable tags never authorize fallback. */
   imageId: string | null;
 }
 
-export interface DockerBuildEnvironmentInput {
-  env?: NodeJS.ProcessEnv;
-  credentialHelperResponds?: (credsStore: string) => boolean;
-  isWslHost?: boolean;
-  allowCredentialIsolation?: boolean;
-}
-
-export interface PreparedDockerBuildEnvironment {
-  env: NodeJS.ProcessEnv;
-  isolatedCredentialConfig: boolean;
-  cleanup(): void;
-}
-
 interface TrustedStagedBuildContext {
   buildCtx: string;
   dockerfile: string;
-}
-
-function createCredentialFreeDockerConfig(purpose: "portable" | "wsl-buildkit"): string {
-  const directory = fs.mkdtempSync(
-    path.join(os.tmpdir(), `nemoclaw-${purpose}-docker-config-`),
-  );
-  fs.chmodSync(directory, 0o700);
-  fs.writeFileSync(path.join(directory, "config.json"), '{"auths":{}}\n', {
-    encoding: "utf-8",
-    flag: "wx",
-    mode: 0o600,
-  });
-  return directory;
 }
 
 function createHostImageCommand(
@@ -158,103 +128,6 @@ function resolveTrustedStagedBuildContext(buildCtx: string): TrustedStagedBuildC
   }
 }
 
-/** Restrict the host Docker build to environment values used by Docker itself. */
-export function dockerBuildSubprocessEnv(
-  sourceEnv: NodeJS.ProcessEnv = process.env,
-): Record<string, string> {
-  const env = buildSubprocessEnv();
-  for (const key of DOCKER_ENV_NAMES) {
-    const value = sourceEnv[key];
-    if (value !== undefined) env[key] = value;
-  }
-  for (const key of Object.keys(env)) {
-    if (
-      key === "KUBECONFIG" ||
-      key === "SSH_AUTH_SOCK" ||
-      key === "RUST_LOG" ||
-      key === "RUST_BACKTRACE" ||
-      key.startsWith("OPENSHELL_") ||
-      key.startsWith("GRPC_")
-    ) {
-      delete env[key];
-    }
-  }
-  // Match the runner and Docker probe contract: an explicitly selected host
-  // owns daemon authority, so an ambient context and its credentials must not
-  // redirect the build to another daemon.
-  if (env.DOCKER_HOST !== undefined) {
-    delete env.DOCKER_CONFIG;
-    delete env.DOCKER_CONTEXT;
-  }
-  return env;
-}
-
-function requiresCredentialFreeWslBuildConfig(
-  env: NodeJS.ProcessEnv,
-  helperResponds: (credsStore: string) => boolean,
-  isWslHost?: boolean,
-): boolean {
-  if (!isWsl({ env, isWsl: isWslHost })) return false;
-  const { credsStore } = readDockerCredentialStore(env, fs.readFileSync);
-  return (
-    credsStore !== undefined &&
-    DOCKER_DESKTOP_CREDENTIAL_STORE_NAMES.has(credsStore) &&
-    !helperResponds(credsStore)
-  );
-}
-
-function dockerDesktopCredentialHelperRespondsFromBuild(
-  credsStore: string,
-  env: NodeJS.ProcessEnv,
-): boolean {
-  return dockerDesktopCredentialHelperResponds(credsStore, (command, options) => {
-    const [executable, ...args] = command;
-    if (!executable) return null;
-    const result = spawnSync(executable, args, {
-      encoding: "utf-8",
-      env: dockerBuildSubprocessEnv(env),
-      shell: false,
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: options?.timeout,
-    });
-    return result.error || result.status !== 0 ? null : result.stdout;
-  });
-}
-
-/**
- * Prepare the Docker environment shared by normal creation and rebuild image
- * preflight. Docker Desktop can leave WSL pointing at a Windows credential
- * helper that is unavailable from the current session; generated image builds
- * do not need registry credentials, so isolate that case without modifying the
- * user's Docker config.
- */
-export function prepareDockerBuildEnvironment(
-  input: DockerBuildEnvironmentInput = {},
-): PreparedDockerBuildEnvironment {
-  const sourceEnv = input.env ?? process.env;
-  const helperResponds =
-    input.credentialHelperResponds ??
-    ((credsStore: string) => dockerDesktopCredentialHelperRespondsFromBuild(credsStore, sourceEnv));
-  const credentialFreeConfig =
-    input.allowCredentialIsolation !== false &&
-    requiresCredentialFreeWslBuildConfig(sourceEnv, helperResponds, input.isWslHost)
-    ? createCredentialFreeDockerConfig("wsl-buildkit")
-    : null;
-  return {
-    env: {
-      ...dockerBuildSubprocessEnv(sourceEnv),
-      DOCKER_BUILDKIT: "1",
-      ...(credentialFreeConfig ? { DOCKER_CONFIG: credentialFreeConfig } : {}),
-    },
-    isolatedCredentialConfig: credentialFreeConfig !== null,
-    cleanup: () => {
-      if (credentialFreeConfig !== null) {
-        fs.rmSync(credentialFreeConfig, { recursive: true, force: true });
-      }
-    },
-  };
-}
-
 export function resolveSandboxPrebuildEnabled(
   env: NodeJS.ProcessEnv,
   dockerDriverGateway: boolean,
@@ -303,7 +176,19 @@ export function sandboxLocalImageRef(
 export async function prebuildSandboxImageIfEligible(
   input: SandboxPrebuildInput,
 ): Promise<SandboxPrebuildResult> {
-  const createArgs = [...input.createArgs];
+  const createArgs = [...(input.createArgs ?? [])];
+  const fromIndex = createArgs.indexOf("--from");
+  const initialSourceReference = input.sourceReference ?? createArgs[fromIndex + 1];
+  const result = (
+    sourceReference: string | undefined,
+    imageRef: string | null,
+    imageId: string | null,
+  ): SandboxPrebuildResult => ({
+    createArgs,
+    ...(input.sourceReference !== undefined && sourceReference ? { sourceReference } : {}),
+    imageRef,
+    imageId,
+  });
   const env = input.env ?? process.env;
   const log = input.log ?? console.log;
   const portable = isPortableExperimentalProfile(env);
@@ -316,25 +201,23 @@ export async function prebuildSandboxImageIfEligible(
     if (requiresLocalBuildKit) {
       throw new Error("Local BuildKit is required for this generated sandbox image");
     }
-    return { createArgs, imageRef: null, imageId: null };
+    return result(initialSourceReference, null, null);
   }
   if (input.origin !== "generated") {
     log(
       "  Local BuildKit build skipped for a custom Dockerfile; using the gateway builder instead.",
     );
-    return { createArgs, imageRef: null, imageId: null };
+    return result(initialSourceReference, null, null);
   }
-  const fromIndex = createArgs.indexOf("--from");
-  const fromDockerfile = createArgs[fromIndex + 1];
+  const fromDockerfile = initialSourceReference;
   if (
-    fromIndex < 0 ||
     !fromDockerfile ||
     path.resolve(fromDockerfile) !== path.resolve(input.buildCtx, "Dockerfile")
   ) {
     if (requiresLocalBuildKit) {
       throw new Error("Local BuildKit requires the generated staged Dockerfile");
     }
-    return { createArgs, imageRef: null, imageId: null };
+    return result(initialSourceReference, null, null);
   }
   let trustedContext: TrustedStagedBuildContext | null;
   try {
@@ -349,7 +232,7 @@ export async function prebuildSandboxImageIfEligible(
     log(
       `  Local BuildKit build skipped: staged build context could not be inspected (${detail}); using the gateway builder instead.`,
     );
-    return { createArgs, imageRef: null, imageId: null };
+    return result(initialSourceReference, null, null);
   }
   if (!trustedContext) {
     if (requiresLocalBuildKit) {
@@ -358,7 +241,7 @@ export async function prebuildSandboxImageIfEligible(
     log(
       "  Local BuildKit build skipped: staged build context failed trust validation; using the gateway builder instead.",
     );
-    return { createArgs, imageRef: null, imageId: null };
+    return result(initialSourceReference, null, null);
   }
 
   const imageRef = sandboxLocalImageRef(input.sandboxName, input.buildId, env);
@@ -374,6 +257,7 @@ export async function prebuildSandboxImageIfEligible(
       : prepareDockerBuildEnvironment({
           env,
           credentialHelperResponds: input.credentialHelperResponds,
+          dockerContextIsDefault: input.dockerContextIsDefault,
           isWslHost: input.isWslHost,
         });
     const buildEnv = preparedDockerEnvironment?.env ?? dockerBuildSubprocessEnv(env);
@@ -397,9 +281,14 @@ export async function prebuildSandboxImageIfEligible(
     log(
       `  Local ${builderName} build could not start (${detail}); using the gateway builder instead.`,
     );
-    return { createArgs, imageRef: null, imageId: null };
+    return result(initialSourceReference, null, null);
   } finally {
-    preparedDockerEnvironment?.cleanup();
+    if (preparedDockerEnvironment) {
+      warnIfDockerBuildEnvironmentCleanupFailed(
+        preparedDockerEnvironment.cleanup(),
+        `generated sandbox image '${imageRef}'`,
+      );
+    }
   }
 
   if (status !== 0) {
@@ -408,7 +297,7 @@ export async function prebuildSandboxImageIfEligible(
       throw new Error(`Local BuildKit build failed${detail}`);
     }
     log(`  Local ${builderName} build failed${detail}; using the gateway builder instead.`);
-    return { createArgs, imageRef: null, imageId: null };
+    return result(initialSourceReference, null, null);
   }
 
   if (portable) {
@@ -438,7 +327,7 @@ export async function prebuildSandboxImageIfEligible(
     }
   }
 
-  createArgs[fromIndex + 1] = imageRef;
+  if (fromIndex >= 0) createArgs[fromIndex + 1] = imageRef;
   const inspectImageId =
     input.inspectImageId ??
     ((ref: string) =>
@@ -459,9 +348,5 @@ export async function prebuildSandboxImageIfEligible(
       "  Local image identity could not be proven; an operator-authorized GPU compatibility fallback may fail closed if no exact native container identity becomes available.",
     );
   }
-  return {
-    createArgs,
-    imageRef,
-    imageId,
-  };
+  return result(imageRef, imageRef, imageId);
 }

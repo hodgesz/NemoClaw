@@ -185,13 +185,18 @@ describe("onboard custom Dockerfile", () => {
       fs.writeFileSync(path.join(customBuildDir, "credentials.json"), "{}");
 
       fs.mkdirSync(fakeBin, { recursive: true });
-      writeOkOpenshell(fakeBin, { readySandboxGet: true });
+      writeOkOpenshell(fakeBin);
 
       const customDockerfilePath = JSON.stringify(path.join(customBuildDir, "Dockerfile"));
 
       const script = String.raw`
 const runner = require(${runnerPath});
 const fixtureMocks = require(${onboardScriptMocksPath});
+const createdSandbox = fixtureMocks.createCreatedSandboxFixture({
+  sandboxName: "my-assistant",
+});
+const forwardService = fixtureMocks.installForwardServiceReachabilityFixture();
+createdSandbox.installRuntimeObservation();
 const _n = (c) => (Array.isArray(c) ? c.join(" ") : String(c)).replace(/'/g, "");
 const registry = require(${registryPath});
 const preflight = require(${preflightPath});
@@ -233,29 +238,30 @@ runner.run = (command, opts = {}) => {
   commands.push({ command: normalized, env: opts.env || null });
   const profileResult = fixtureMocks.mockManagedEndpointlessProviderProfileRun(command);
   if (profileResult !== null) return profileResult;
-  if (normalized.includes("sandbox list")) return { status: 0, stdout: "No sandboxes found." };
-  return normalized.includes("sandbox get") && normalized.includes("my-assistant")
-    ? { status: 0, stdout: Buffer.from("Name: my-assistant\nId: sbx-4f2a91c0d7\n"), stderr: Buffer.alloc(0) }
-    : { status: 0 };
+  if (normalized.endsWith("provider get -g nemoclaw openai-api")) {
+    return {
+      status: 1,
+      stdout: "",
+      stderr: "provider 'openai-api' not found",
+    };
+  }
+  const sandboxResult = createdSandbox.run(command);
+  return sandboxResult ?? { status: 0 };
 };
-fixtureMocks.mockDockerSandboxLifecycleReleaseFromRunner();
 runner.runCapture = (command) => {
   const normalized = _n(command);
   if (normalized.includes("gateway info")) return "Gateway endpoint: http://127.0.0.1:8080";
   if (normalized.includes("policy get") && normalized.includes("--output json")) return JSON.stringify({ scope: "sandbox", sandbox: "my-assistant", status: "effective", policy_source: "sandbox", hash: "fixture-policy", active_version: 1, policy: {} });
-  const createdIdentity = fixtureMocks.mockCreatedSandboxIdentityList(command, {
-    sandboxName: "my-assistant",
-  });
-  if (createdIdentity !== null) return createdIdentity;
-  if (normalized.includes("sandbox get") && normalized.includes("my-assistant")) return "";
-  if (normalized.includes("sandbox list")) return "my-assistant Ready";
+  const sandboxCapture = createdSandbox.capture(command);
+  if (sandboxCapture !== null) return sandboxCapture;
   {
     const mockedCapture = fixtureMocks.mockOnboardRunCapture(command);
     if (mockedCapture !== null) return mockedCapture;
   }
-  if (normalized.includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running";
+  if (normalized.includes("forward list")) return "SANDBOX BIND PORT PID STATUS";
   return "";
 };
+fixtureMocks.mockDockerSandboxLifecycleReleaseFromRunner();
 const createFixture = fixtureMocks.installVerifiedSandboxCreateFixture(registry, {
   sandboxName: "my-assistant",
   provider: "openai-api",
@@ -265,6 +271,7 @@ preflight.checkPortAvailable = async () => ({ ok: true });
 credentials.prompt = async () => "";
 
 childProcess.spawn = (...args) => {
+  if (!forwardService.recordSpawn(args)) createdSandbox.create(args.flat());
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
@@ -391,6 +398,7 @@ const { createSandbox } = require(${onboardPath});
       const script = String.raw`
 const fs = require("node:fs");
 const runner = require(${runnerPath});
+require(${onboardScriptMocksPath}).installForwardServiceReachabilityFixture();
 const registry = require(${registryPath});
 const outcomePath = ${JSON.stringify(outcomePath)};
 const customDockerfile = ${JSON.stringify(customDockerfile)};
@@ -464,6 +472,7 @@ createSandbox(
           NEMOCLAW_RECREATE_SANDBOX: "1",
           SANDBOX_LIVE: sandboxLive,
         },
+        timeout: 30_000,
       });
 
       assert.equal(result.status, 1, result.stderr);
@@ -498,6 +507,7 @@ createSandbox(
 
     const script = String.raw`
 const runner = require(${runnerPath});
+require(${onboardScriptMocksPath}).installForwardServiceReachabilityFixture();
 const _n = (c) => (Array.isArray(c) ? c.join(" ") : String(c)).replace(/'/g, "");
 const registry = require(${registryPath});
 const preflight = require(${preflightPath});
@@ -533,6 +543,7 @@ const { createSandbox } = require(${onboardPath});
         PATH: `${fakeBin}:${process.env.PATH || ""}`,
         NEMOCLAW_NON_INTERACTIVE: "1",
       },
+      timeout: 30_000,
     });
 
     assert.equal(result.status, 1, "should exit 1 when fromDockerfile path is missing");
@@ -563,6 +574,7 @@ const { createSandbox } = require(${onboardPath});
 
     const script = String.raw`
 const runner = require(${runnerPath});
+require(${onboardScriptMocksPath}).installForwardServiceReachabilityFixture();
 const registry = require(${registryPath});
 const preflight = require(${preflightPath});
 const credentials = require(${credentialsPath});
@@ -597,6 +609,7 @@ const { createSandbox } = require(${onboardPath});
         PATH: `${fakeBin}:${process.env.PATH || ""}`,
         NEMOCLAW_NON_INTERACTIVE: "1",
       },
+      timeout: 30_000,
     });
 
     assert.equal(result.status, 1, "should exit 1 when fromDockerfile path is a directory");
@@ -629,14 +642,13 @@ const { createSandbox } = require(${onboardPath});
       ].join("\n"),
     );
     fs.mkdirSync(fakeBin, { recursive: true });
-    fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
-      mode: 0o755,
-    });
+    writeOkOpenshell(fakeBin);
 
     const customDockerfilePath = JSON.stringify(path.join(ignoredDir, "Dockerfile"));
 
     const script = String.raw`
 const runner = require(${runnerPath});
+require(${onboardScriptMocksPath}).installForwardServiceReachabilityFixture();
 const registry = require(${registryPath});
 const preflight = require(${preflightPath});
 const credentials = require(${credentialsPath});
@@ -671,6 +683,7 @@ const { createSandbox } = require(${onboardPath});
         PATH: `${fakeBin}:${process.env.PATH || ""}`,
         NEMOCLAW_NON_INTERACTIVE: "1",
       },
+      timeout: 30_000,
     });
 
     assert.equal(result.status, 1, "should exit 1 when fromDockerfile is ignored");
@@ -703,9 +716,7 @@ const { createSandbox } = require(${onboardPath});
       ].join("\n"),
     );
     fs.mkdirSync(fakeBin, { recursive: true });
-    fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
-      mode: 0o755,
-    });
+    writeOkOpenshell(fakeBin);
 
     const customDockerfilePath = JSON.stringify(path.join(customBuildDir, "Dockerfile"));
     const customBuildDirLiteral = JSON.stringify(customBuildDir);
@@ -714,6 +725,7 @@ const { createSandbox } = require(${onboardPath});
 const fs = require("node:fs");
 const path = require("node:path");
 const runner = require(${runnerPath});
+require(${onboardScriptMocksPath}).installForwardServiceReachabilityFixture();
 const registry = require(${registryPath});
 const preflight = require(${preflightPath});
 const credentials = require(${credentialsPath});
@@ -773,6 +785,7 @@ const { createSandbox } = require(${onboardPath});
         PATH: `${fakeBin}:${process.env.PATH || ""}`,
         NEMOCLAW_NON_INTERACTIVE: "1",
       },
+      timeout: 30_000,
     });
 
     assert.equal(result.status, 0, result.stderr);

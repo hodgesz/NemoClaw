@@ -62,9 +62,9 @@ function fixture(options: { canonicalSource?: boolean } = {}) {
     requireOpenshellSandboxAbi: process.platform === "linux",
     rootDir: ROOT,
     pinnedRemoteRef,
-    preferPinnedRemoteRef: true,
+    requirePinnedRemoteRef: true,
     validateImage: () => true,
-    validationDescription: "the required MCP Streamable HTTP and ACP runtimes",
+    validationDescription: `Hermes ${agent.expectedVersion} with the required MCP Streamable HTTP and ACP runtimes and the immutable security package inventory`,
   };
   const imageId = `sha256:${"a".repeat(64)}`;
   const canonicalRef = `nemoclaw-hermes-sandbox-base-local:image-${"a".repeat(64)}`;
@@ -130,6 +130,13 @@ describe("agent base-image local handoff authority", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     dockerMocks.infoFormat.mockReturnValue("linux/amd64\n");
+    const outputByEntrypoint = new Map([
+      ["/opt/hermes/.venv/bin/python", "nemoclaw-hermes-mcp-runtime-ok"],
+      ["/bin/sh", "nemoclaw-security-inventory-ok"],
+    ]);
+    dockerMocks.capture.mockImplementation(
+      (args: string[]) => outputByEntrypoint.get(args[args.indexOf("--entrypoint") + 1]) ?? "",
+    );
   });
 
   it.each([
