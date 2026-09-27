@@ -109,9 +109,9 @@ for i, r in enumerate(items, 1):
         lines.append(block)
 print("\n".join(lines) if lines else "(no web results)")
 PYEOF
-WEB_RESULTS=$(ssh -o ConnectTimeout=15 "openshell-${SANDBOX_NAME}" \
+WEB_RESULTS=$( (ssh -o ConnectTimeout=15 "openshell-${SANDBOX_NAME}" \
   "openclaw infer web search --query '${WEB_QUERY}' --limit 5 --json 2>/dev/null" \
-  | python3 "$_BRIEF_PY")
+  | python3 "$_BRIEF_PY") || echo "(no web results)")
 
 # Run agent in sandbox, feeding the gathered web results as context.
 # The agent turn composes the briefing from this context (it cannot search
@@ -135,28 +135,43 @@ EOF
 PROMPT_B64=$(printf '%s' "${AGENT_PROMPT}" | base64 | tr -d '\n')
 
 # ── Run the agent with retry-on-empty ─────────────────────────────
-# The OpenRouter free router (openrouter/free) load-balances across ~28
-# free models, and some return null/empty or ramble about the task instead
-# of following it (e.g. nemotron-3-ultra free narrates the instruction).
-# A 200 with empty content is a "successful" call that produced nothing
-# usable. Retry up to 3 times with backoff — each retry is routed to a different
-# free model, so a subsequent attempt usually lands on a model that actually
-# answers. Mirrors Hermes's own retry loop (agent_runtime_helpers).
-MAX_ATTEMPTS=3
-RETRY_DELAY=15
+# Retry up to 4 times with backoff on transient LLM load or empty responses.
+MAX_ATTEMPTS=4
 BRIEFING_STATUS="ok"
 RESPONSE=""
 for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-  RESPONSE=$(ssh -o ConnectTimeout=15 "openshell-${SANDBOX_NAME}" \
-    "export NVIDIA_API_KEY=unused && nemoclaw-start openclaw agent --agent main \
-     -m \"\$(echo ${PROMPT_B64} | base64 -d)\" --session-id ${SESSION_ID}" 2>&1 \
-    | grep -v -e '\[SECURITY\]' -e 'Setting up NemoClaw' -e '\[gateway\]' -e 'UNDICI' \
-      -e '(node:' -e 'Use .node' -e 'pairing required' -e 'CAP_SET' \
-      -e 'privilege separation' -e 'Gateway target:' -e 'Source: local loopback' \
-      -e 'Config: /sandbox' -e 'Bind: loopback' -e 'getaddrinfo' \
-      -e 'tools websearch' -e 'abnormal closure' \
-      -e 'tools cron failed' -e '\[config\]' -e '\[channels\]' \
-      -e '\[plugins\]' -e '\[proxy\]' -e 'routing process' || true)
+  RETRY_DELAY=$((attempt * 15))
+  RAW_AGENT_OUTPUT=$(ssh -o ConnectTimeout=30 "openshell-${SANDBOX_NAME}" \
+    "export NVIDIA_API_KEY=unused && openclaw agent --agent main \
+     -m \"\$(echo ${PROMPT_B64} | base64 -d)\" --session-id ${SESSION_ID} --json" 2>&1 || true)
+
+  RESPONSE=$(python3 -c '
+import json, sys
+raw = sys.stdin.read()
+start = raw.find("{")
+if start >= 0:
+    try:
+        data = json.loads(raw[start:])
+        meta = data.get("result", {}).get("meta", {})
+        if meta.get("finalAssistantVisibleText"):
+            print(meta["finalAssistantVisibleText"].strip())
+            sys.exit(0)
+        payloads = data.get("result", {}).get("payloads", [])
+        if payloads and payloads[0].get("text"):
+            print(payloads[0]["text"].strip())
+            sys.exit(0)
+    except Exception:
+        pass
+# Fallback: strip known headers, box drawing, warnings
+lines = []
+for line in raw.splitlines():
+    if any(m in line for m in ["[SECURITY", "Setting up", "[gateway", "UNDICI", "(node:", "Use .node", "Config warnings", "NemoClaw registered", "plugins.entries.", "[proxy]"]):
+        continue
+    if any(c in line for c in ["◇", "│", "╭", "╰", "─", "┌", "└", "┤", "├"]):
+        continue
+    lines.append(line)
+print("\n".join(lines).strip())
+' <<<"$RAW_AGENT_OUTPUT")
 
   # Detect error responses. The agent may return an error message instead
   # of a real briefing — flag known failure patterns so the health check

@@ -32,7 +32,8 @@ import {
   type SystemReadinessReport,
 } from "./types.js";
 
-const DEFAULT_MAX_AGE_MS = 30_000;
+const DEFAULT_MAX_AGE_MS =
+  Number.parseInt(process.env.NEMOCLAW_MAX_OBSERVATION_AGE_MS ?? "", 10) || 30_000;
 const MAX_REPORT_TEXT_LENGTH = 1024;
 
 export interface HostObservations {
@@ -157,12 +158,11 @@ function adaptHostAssessment(
       gpu?.totalMemoryMB === undefined ? undefined : gpu.totalMemoryMB * 1024 * 1024,
     nvidiaGpuMemoryAvailableBytes:
       gpu?.availableMemoryMB === undefined ? undefined : gpu.availableMemoryMB * 1024 * 1024,
-    nvidiaGpuMemoryPerDeviceBytes:
-      gpu?.gpus?.length
-        ? Math.min(...gpu.gpus.map(({ memoryMB }) => memoryMB)) * 1024 * 1024
-        : gpu?.perGpuMB === undefined
-          ? undefined
-          : gpu.perGpuMB * 1024 * 1024,
+    nvidiaGpuMemoryPerDeviceBytes: gpu?.gpus?.length
+      ? Math.min(...gpu.gpus.map(({ memoryMB }) => memoryMB)) * 1024 * 1024
+      : gpu?.perGpuMB === undefined
+        ? undefined
+        : gpu.perGpuMB * 1024 * 1024,
     nvidiaGpuUnifiedMemory: gpu?.unifiedMemory,
     nvidiaGpuComputeConstrained: gpu?.computeConstrained,
     hostGpuPlatform,

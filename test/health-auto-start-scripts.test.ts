@@ -129,4 +129,52 @@ describe("host health and auto-start scripts", () => {
       writeFileSync(statusFile, originalContent);
     }
   });
+
+  it("attempts auto-fix on briefing failure when --auto-fix is provided", () => {
+    const statusFile = "/tmp/nemoclaw-briefing-status.json";
+    const originalContent = readFileSync(statusFile, "utf8");
+    try {
+      writeFileSync(
+        statusFile,
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          status: "error:llm",
+          chat_id: "test",
+        }),
+      );
+
+      const dir = mkdtempSync(path.join(tmpdir(), "nemoclaw-briefing-fix-"));
+      const scripts = path.join(dir, "scripts");
+      mkdirSync(scripts);
+      cpSync(path.join(ROOT, "scripts/health-check.sh"), path.join(scripts, "health-check.sh"));
+      writeExecutable(
+        path.join(scripts, "morning-briefing.sh"),
+        `cat << 'EOF' > "${statusFile}"\n{"timestamp":"${new Date().toISOString()}","status":"ok","chat_id":"test"}\nEOF\nexit 0`,
+      );
+
+      const result = spawnSync(
+        "bash",
+        [
+          path.join(scripts, "health-check.sh"),
+          "--auto-fix",
+          "--json",
+          "--skip",
+          "docker,gateway,sandbox,ssh,inference,inference_live,dashboard,bridge,agent,rules",
+        ],
+        { encoding: "utf8" },
+      );
+
+      expect(result.status).toBe(0);
+      const output = JSON.parse(result.stdout);
+      expect(output.summary.failed).toBe(0);
+      expect(output.checks).toContainEqual(
+        expect.objectContaining({
+          name: "briefing",
+          status: "pass",
+        }),
+      );
+    } finally {
+      writeFileSync(statusFile, originalContent);
+    }
+  });
 });

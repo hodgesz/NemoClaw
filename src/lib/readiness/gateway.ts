@@ -23,7 +23,8 @@ import type {
   ReadinessState,
 } from "./types";
 
-const DEFAULT_MAX_AGE_MS = 30_000;
+const DEFAULT_MAX_AGE_MS =
+  Number.parseInt(process.env.NEMOCLAW_MAX_OBSERVATION_AGE_MS ?? "", 10) || 30_000;
 const MAX_REPORT_TEXT_LENGTH = 1024;
 
 export type GatewayAttachmentState = "verified" | "rejected" | "not-applicable" | "unknown";

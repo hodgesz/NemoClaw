@@ -24,6 +24,21 @@
 
 set -euo pipefail
 
+# ── Load exports from dotfiles ─────────────────────────────────
+_load_exports_from() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*export[[:space:]]+([A-Z_][A-Z0-9_]*)= ]]; then
+      eval "$line" 2>/dev/null || true
+    fi
+  done <"$file"
+}
+
+for rc in "$HOME/.zprofile" "$HOME/.zshrc" "$HOME/.bashrc"; do
+  _load_exports_from "$rc"
+done
+
 ALERT_METHOD=""
 STATUS_ONLY=0
 STATE_FILE="${HOME}/.nemoclaw/openrouter-usage.state"
@@ -58,7 +73,7 @@ RESPONSE=$(curl -s --max-time 15 https://openrouter.ai/api/v1/key \
 }
 
 # Parse fields with node (jq may not be installed).
-read -r USAGE_MONTHLY LIMIT LIMIT_REMAINING IS_FREE_TIER <<< "$(printf '%s' "$RESPONSE" | node -e "
+read -r USAGE_MONTHLY LIMIT LIMIT_REMAINING IS_FREE_TIER <<<"$(printf '%s' "$RESPONSE" | node -e "
   let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
     try {
       const j=JSON.parse(d).data;
@@ -75,10 +90,19 @@ fi
 
 # Save current as the new baseline.
 mkdir -p "$(dirname "$STATE_FILE")"
-echo "$USAGE_MONTHLY" > "$STATE_FILE"
+echo "$USAGE_MONTHLY" >"$STATE_FILE"
 
-# Compute delta (paid spend since last check).
-DELTA=$(( USAGE_MONTHLY - PREV_USAGE ))
+# Compute delta (paid spend since last check) using node for decimal precision.
+DELTA=$(node -e "
+  const curr = parseFloat('$USAGE_MONTHLY') || 0;
+  const prev = parseFloat('$PREV_USAGE') || 0;
+  const diff = curr - prev;
+  console.log(diff > 0.000001 ? diff.toFixed(6) : '0');
+")
+HAS_INCREASED=$(node -e "
+  const diff = parseFloat('$DELTA') || 0;
+  console.log(diff > 0.000001 ? '1' : '0');
+")
 
 # Print status.
 echo "OpenRouter usage:"
@@ -86,9 +110,9 @@ echo "  Free tier:     ${IS_FREE_TIER}"
 echo "  Paid usage:    \$${USAGE_MONTHLY} / \$${LIMIT} (monthly cap, resets monthly)"
 echo "  Remaining:     \$${LIMIT_REMAINING}"
 echo "  Since last:    \$${DELTA} paid spend"
-if [[ "$DELTA" -gt 0 ]]; then
+if [[ "$HAS_INCREASED" == "1" ]]; then
   echo "  ⚠ Free-tier RPD exhausted — paid fallback (GLM 5.2) is active."
-elif [[ "$USAGE_MONTHLY" -gt 0 ]]; then
+elif [[ "$(node -e "console.log(parseFloat('$USAGE_MONTHLY') > 0 ? '1' : '0')")" == "1" ]]; then
   echo "  Paid fallback was used earlier today; no new paid spend this check."
 else
   echo "  ✓ All inference on free tier; no paid fallback usage."
@@ -100,7 +124,7 @@ if [[ "$STATUS_ONLY" -eq 1 ]]; then
 fi
 
 # Alert only when paid usage increased (free tier exhausted → fallback active).
-if [[ "$DELTA" -gt 0 ]] && [[ "$ALERT_METHOD" == "telegram" ]]; then
+if [[ "$HAS_INCREASED" == "1" ]] && [[ "$ALERT_METHOD" == "telegram" ]]; then
   if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
     echo "Warning: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; cannot alert" >&2
     exit 0

@@ -126,6 +126,10 @@ json_escape() {
   printf '%s' "$s"
 }
 
+warn() {
+  echo "Warning: $*" >&2
+}
+
 record() {
   local name="$1" status="$2" detail="$3"
   RESULTS+=("${name}|${status}|${detail}")
@@ -535,6 +539,14 @@ fix_rules() {
   return 0
 }
 
+# shellcheck disable=SC2329
+fix_briefing() {
+  if [ -x "$SCRIPT_DIR/morning-briefing.sh" ]; then
+    "$SCRIPT_DIR/morning-briefing.sh" 2>/dev/null || true
+  fi
+  return 0
+}
+
 # Map check name → fix function (bash 3.2 compatible, no associative arrays)
 get_fix_func() {
   case "$1" in
@@ -546,6 +558,7 @@ get_fix_func() {
     agent) echo "fix_agent" ;;
     rules) echo "fix_rules" ;;
     inference_live) echo "fix_inference_live" ;;
+    briefing) echo "fix_briefing" ;;
     *) echo "" ;; # sandbox, ssh: not auto-fixable
   esac
 }

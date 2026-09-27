@@ -499,7 +499,8 @@ function validateImageLabels(
 }
 
 export function normalizeManagedImageRelease(version: string): string {
-  const release = version.startsWith("v") ? version : `v${version}`;
+  const clean = version.replace(/-[0-9]+-g[0-9a-f]+$/i, "");
+  const release = clean.startsWith("v") ? clean : `v${clean}`;
   if (!RELEASE_PATTERN.test(release)) {
     return invalid(`'${version}' is not a supported release version`);
   }

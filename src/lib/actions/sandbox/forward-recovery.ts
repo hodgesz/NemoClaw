@@ -121,7 +121,7 @@ export function resolveSandboxHealthProbeUrl(sandboxName: string): string {
       resolveSandboxHermesApiPort(registry.getSandbox(sandboxName) ?? {}),
     );
   }
-  return `http://127.0.0.1:${resolveSandboxDashboardPort(sandboxName)}/health`;
+  return agentRuntime.getHealthProbeUrl(null);
 }
 
 /**
@@ -160,10 +160,7 @@ export function teardownSandboxDashboardForward(
       timeout: OPENSHELL_OPERATION_TIMEOUT_MS,
     });
     if (result.status !== 0) return;
-    waitForStoppedForwardPortRelease(
-      port,
-      deps.isLocalForwardReachable ?? isLocalForwardReachable,
-    );
+    waitForStoppedForwardPortRelease(port, deps.isLocalForwardReachable ?? isLocalForwardReachable);
   } catch {
     // Defense in depth for injected or future runners: teardown is best-effort.
   }
@@ -321,18 +318,15 @@ export function ensureSandboxPortForwardForPort(
       health: forwardHealth,
       portReleased: false,
     };
-    waitForForwardRecoveryState(
-      () => {
-        stopState.health = isSandboxPortForwardHealthy(sandboxName, port, expectedBind);
-        stopState.portReleased = !isLocalForwardReachable(port);
-        return (
-          (!forceRestart && stopState.health === true) ||
-          stopState.health === "occupied" ||
-          stopState.portReleased
-        );
-      },
-      waitMs,
-    );
+    waitForForwardRecoveryState(() => {
+      stopState.health = isSandboxPortForwardHealthy(sandboxName, port, expectedBind);
+      stopState.portReleased = !isLocalForwardReachable(port);
+      return (
+        (!forceRestart && stopState.health === true) ||
+        stopState.health === "occupied" ||
+        stopState.portReleased
+      );
+    }, waitMs);
     if (stopState.health === true && !forceRestart) return acceptSuccessfulForward();
     if (stopState.health === "occupied") return false;
     if (!stopState.portReleased && (forceRestart || stopState.health === null)) {
@@ -370,17 +364,14 @@ export function ensureSandboxPortForwardForPort(
   if (waitMs === 0) return false;
 
   let occupied = false;
-  const settled = waitForForwardRecoveryState(
-    () => {
-      health = isSandboxPortForwardHealthy(sandboxName, port, expectedBind);
-      if (health === "occupied") {
-        occupied = true;
-        return true;
-      }
-      return health === true;
-    },
-    waitMs,
-  );
+  const settled = waitForForwardRecoveryState(() => {
+    health = isSandboxPortForwardHealthy(sandboxName, port, expectedBind);
+    if (health === "occupied") {
+      occupied = true;
+      return true;
+    }
+    return health === true;
+  }, waitMs);
   return settled && !occupied && acceptSuccessfulForward();
 }
 
