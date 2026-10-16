@@ -7,8 +7,8 @@ set -euo pipefail
 # Silence prek in throwaway worktrees that may lack hook configurations
 export PREK_ALLOW_NO_CONFIG=1
 
-# Gemini 3.8 Flash (High): much lighter on 5-hour/weekly usage than Claude models. See `agy models`.
-MODEL="${AGY_PR_REVIEW_MODEL:-gemini-3.8-flash-high}"
+# Default to Gemini 3.7 Flash (High) for generous quota limits and fast turnaround. See `agy models`.
+MODEL="${AGY_PR_REVIEW_MODEL:-gemini-3.7-flash-high}"
 
 usage() {
   cat <<EOF
@@ -236,13 +236,39 @@ fi
 PROMPT="Use the pr-review skill to review PR #$PR. The working directory is a checkout of the PR head; do not run git checkout. $TEST_PROMPT
 
 Finish with the complete review as your final message. $MODE"
-set +e
-(cd "$WT" && agy --model "$MODEL" ${EXTRA_AGY_FLAGS[@]+"${EXTRA_AGY_FLAGS[@]}"} -p "$PROMPT" 2>&1) | tee "$OUT"
-AGY_EXIT=${PIPESTATUS[0]}
-set -e
-if [[ $AGY_EXIT -ne 0 ]]; then
+MAX_ATTEMPTS=3
+ATTEMPT=1
+CURRENT_MODEL="$MODEL"
+
+while [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; do
+  set +e
+  (cd "$WT" && agy --model "$CURRENT_MODEL" ${EXTRA_AGY_FLAGS[@]+"${EXTRA_AGY_FLAGS[@]}"} -p "$PROMPT" 2>&1) | tee "$OUT"
+  AGY_EXIT=${PIPESTATUS[0]}
+  set -e
+
+  if [[ $AGY_EXIT -eq 0 ]]; then
+    break
+  fi
+
   if grep -q "jetski: no output produced" "$OUT"; then
     echo "error: agy was blocked by a permission prompt; add an allow-rule to permissions.allow in settings.json or pass AGY_DANGEROUSLY_SKIP_PERMISSIONS=1" >&2
+    exit "$AGY_EXIT"
   fi
+
+  if [[ $ATTEMPT -lt $MAX_ATTEMPTS ]]; then
+    if grep -qiE "(503|UNAVAILABLE|high demand|overloaded|\"retryable\":\s*true)" "$OUT"; then
+      WAIT_SEC=$((ATTEMPT * 15))
+      echo "warning: agy encountered transient model error on attempt $ATTEMPT/$MAX_ATTEMPTS; retrying in ${WAIT_SEC}s..." >&2
+      sleep "$WAIT_SEC"
+      ATTEMPT=$((ATTEMPT + 1))
+      continue
+    elif grep -qiE "(RESOURCE_EXHAUSTED|Quota exceeded)" "$OUT" && [[ "$CURRENT_MODEL" != "gemini-3.7-flash-high" ]]; then
+      echo "warning: $CURRENT_MODEL quota exhausted; falling back to gemini-3.7-flash-high..." >&2
+      CURRENT_MODEL="gemini-3.7-flash-high"
+      ATTEMPT=$((ATTEMPT + 1))
+      continue
+    fi
+  fi
+
   exit "$AGY_EXIT"
-fi
+done
