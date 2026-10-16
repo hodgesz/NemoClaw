@@ -4,6 +4,9 @@
 # Run the pr-review skill against a PR using the Antigravity CLI (agy) in headless mode.
 set -euo pipefail
 
+# Silence prek in throwaway worktrees that may lack hook configurations
+export PREK_ALLOW_NO_CONFIG=1
+
 # Gemini 3.8 Flash (High): much lighter on 5-hour/weekly usage than Claude models. See `agy models`.
 MODEL="${AGY_PR_REVIEW_MODEL:-gemini-3.8-flash-high}"
 
@@ -74,11 +77,42 @@ fi
 if [[ -z "${GEMINI_API_KEY:-}" && -n "${ANTIGRAVITY_API_KEY:-}" ]]; then
   export GEMINI_API_KEY="$ANTIGRAVITY_API_KEY"
 fi
+if [[ -z "${ANTIGRAVITY_API_KEY:-}" && -n "${GEMINI_API_KEY:-}" ]]; then
+  export ANTIGRAVITY_API_KEY="$GEMINI_API_KEY"
+fi
 
 # In CI, ensure GEMINI_API_KEY is configured in repository secrets.
 if [[ -n "${CI:-}" && -z "${GEMINI_API_KEY:-}" ]]; then
   echo "notice: GEMINI_API_KEY is not configured in repository secrets; skipping PR review." >&2
   exit 0
+fi
+
+# Ensure agy uses the Gemini model provider headlessly when GEMINI_API_KEY is configured.
+if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+  AGY_CONFIG_DIR="${AGY_CONFIG_DIR:-$HOME/.gemini/antigravity-cli}"
+  mkdir -p "$AGY_CONFIG_DIR"
+  SETTINGS_FILE="$AGY_CONFIG_DIR/settings.json"
+  if [[ ! -f "$SETTINGS_FILE" ]]; then
+    printf '{\n  "modelProvider": "gemini"\n}\n' >"$SETTINGS_FILE"
+  elif ! grep -q '"modelProvider"' "$SETTINGS_FILE"; then
+    if command -v node >/dev/null 2>&1; then
+      node -e '
+        const fs = require("fs");
+        const file = process.argv[1];
+        try {
+          const data = JSON.parse(fs.readFileSync(file, "utf8"));
+          data.modelProvider = "gemini";
+          fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+        } catch {
+          fs.writeFileSync(file, JSON.stringify({ modelProvider: "gemini" }, null, 2) + "\n");
+        }
+      ' "$SETTINGS_FILE"
+    else
+      CONTENT="$(cat "$SETTINGS_FILE")"
+      NL=$'\n'
+      printf '%s\n' "${CONTENT/{/{${NL}  \"modelProvider\": \"gemini\",}" >"$SETTINGS_FILE"
+    fi
+  fi
 fi
 
 for bin in git gh agy perl; do
@@ -95,12 +129,12 @@ gh auth status >/dev/null 2>&1 || {
 
 # Fork checkouts have several remotes; pin the repo so every gh call the agent makes agrees.
 if [[ -z "${GH_REPO:-}" ]]; then
-  GH_REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  GH_REPO="$(git remote get-url origin 2>/dev/null | sed -E 's#^.*github\.com[:/]([^/]+/[^/.]+)(\.git)?$#\1#' || true)"
   if [[ -z "$GH_REPO" ]]; then
-    GH_REPO="$(gh repo set-default --view 2>/dev/null || true)"
+    GH_REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
   fi
   if [[ -z "$GH_REPO" ]]; then
-    GH_REPO="$(git remote get-url origin 2>/dev/null | sed -E 's#^.*github\.com[:/]([^/]+/[^/.]+)(\.git)?$#\1#' || true)"
+    GH_REPO="$(gh repo set-default --view 2>/dev/null || true)"
   fi
   [[ -n "$GH_REPO" ]] && export GH_REPO
 fi
@@ -159,21 +193,27 @@ git -C "$TOP" worktree add -q --detach "$WT" FETCH_HEAD
 
 # Always enforce the trusted pr-review skill from the base repo so PR branches cannot tamper with it.
 BASE_REF="${GITHUB_BASE_REF:-$(gh pr view "$PR" "${GH_ARGS[@]}" --json baseRefName -q .baseRefName 2>/dev/null || echo main)}"
-rm -rf "$WT/.agent/skills/pr-review" "$WT/skills/pr-review" "$WT/.agents/skills/pr-review"
 if git -C "$TOP" cat-file -e "origin/${BASE_REF}:.agents/skills/pr-review/SKILL.md" 2>/dev/null; then
+  rm -rf "$WT/.agent/skills/pr-review" "$WT/skills/pr-review" "$WT/.agents/skills/pr-review"
   mkdir -p "$WT/.agents/skills"
   git -C "$TOP" archive "origin/${BASE_REF}" .agents/skills/pr-review | tar -x -C "$WT"
 elif git -C "$TOP" cat-file -e "${BASE_REF}:.agents/skills/pr-review/SKILL.md" 2>/dev/null; then
+  rm -rf "$WT/.agent/skills/pr-review" "$WT/skills/pr-review" "$WT/.agents/skills/pr-review"
   mkdir -p "$WT/.agents/skills"
   git -C "$TOP" archive "${BASE_REF}" .agents/skills/pr-review | tar -x -C "$WT"
 elif [[ -d "$TOP/.agents/skills/pr-review" ]]; then
+  rm -rf "$WT/.agent/skills/pr-review" "$WT/skills/pr-review" "$WT/.agents/skills/pr-review"
   mkdir -p "$WT/.agents/skills"
-  ln -sfn "$TOP/.agents/skills/pr-review" "$WT/.agents/skills/pr-review"
+  cp -a "$TOP/.agents/skills/pr-review" "$WT/.agents/skills/pr-review"
 fi
 
 TEST_FILES=()
+DIFF_OUTPUT=""
+if ! DIFF_OUTPUT="$(gh pr diff "$PR" "${GH_ARGS[@]}" --name-only 2>/dev/null)"; then
+  DIFF_OUTPUT="$(git -C "$WT" diff --name-only "origin/${BASE_REF}"...HEAD 2>/dev/null || git -C "$WT" diff --name-only "${BASE_REF}"...HEAD 2>/dev/null || true)"
+fi
 while IFS= read -r f; do [[ -f "$WT/$f" ]] && TEST_FILES+=("$f"); done \
-  < <(gh pr diff "$PR" "${GH_ARGS[@]}" --name-only | grep -E '^test/.*\.test\.(ts|mts|js)$|^nemoclaw/.*\.test\.ts$|^src/.*\.test\.ts$' || true)
+  < <(printf '%s\n' "$DIFF_OUTPUT" | grep -E '^test/.*\.test\.(ts|mts|js)$|^nemoclaw/.*\.test\.ts$|^src/.*\.test\.ts$' || true)
 
 if [[ ${#TEST_FILES[@]} -gt 0 ]]; then
   echo "Running ${#TEST_FILES[@]} changed test file(s)..." >&2

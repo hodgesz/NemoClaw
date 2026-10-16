@@ -76,6 +76,10 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           rm -f /tmp/install-agy.sh
 
+          # Seed headless model provider configuration for CI
+          mkdir -p "$HOME/.gemini/antigravity-cli"
+          echo '{"modelProvider": "gemini"}' > "$HOME/.gemini/antigravity-cli/settings.json"
+
       - name: Execute PR Review
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

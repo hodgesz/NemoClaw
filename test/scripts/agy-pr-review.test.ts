@@ -160,4 +160,32 @@ exit 0
     expect(res.status).toBe(1);
     expect(res.stderr).toContain("error: no PR number given and no open PR for the current branch");
   });
+
+  it("configures modelProvider gemini in settings.json when GEMINI_API_KEY is set", () => {
+    const configDir = path.join(tempDir, "config-new");
+    runScript(["123"], {
+      AGY_CONFIG_DIR: configDir,
+      GEMINI_API_KEY: "fake-key-for-test",
+      PATH: `${binDir}:/usr/bin:/bin`,
+    });
+    const settingsPath = path.join(configDir, "settings.json");
+    expect(fs.existsSync(settingsPath)).toBe(true);
+    const content = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    expect(content.modelProvider).toBe("gemini");
+  });
+
+  it("preserves existing settings while adding modelProvider gemini", () => {
+    const configDir = path.join(tempDir, "config-existing");
+    fs.mkdirSync(configDir, { recursive: true });
+    const settingsPath = path.join(configDir, "settings.json");
+    fs.writeFileSync(settingsPath, JSON.stringify({ existingOption: "value" }));
+    runScript(["123"], {
+      AGY_CONFIG_DIR: configDir,
+      GEMINI_API_KEY: "fake-key-for-test",
+      PATH: `${binDir}:/usr/bin:/bin`,
+    });
+    const content = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    expect(content.modelProvider).toBe("gemini");
+    expect(content.existingOption).toBe("value");
+  });
 });
