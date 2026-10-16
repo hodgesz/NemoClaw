@@ -7,8 +7,8 @@ set -euo pipefail
 # Silence prek in throwaway worktrees that may lack hook configurations
 export PREK_ALLOW_NO_CONFIG=1
 
-# Default to Gemini 3.7 Flash (High) for generous quota limits and fast turnaround. See `agy models`.
-MODEL="${AGY_PR_REVIEW_MODEL:-gemini-3.7-flash-high}"
+# Gemini 3.8 Flash (High): default model, with automatic fallback to 3.7 / 3.6 on quota limits. See `agy models`.
+MODEL="${AGY_PR_REVIEW_MODEL:-gemini-3.8-flash-high}"
 
 usage() {
   cat <<EOF
@@ -236,7 +236,7 @@ fi
 PROMPT="Use the pr-review skill to review PR #$PR. The working directory is a checkout of the PR head; do not run git checkout. $TEST_PROMPT
 
 Finish with the complete review as your final message. $MODE"
-MAX_ATTEMPTS=4
+MAX_ATTEMPTS=5
 ATTEMPT=1
 CURRENT_MODEL="$MODEL"
 
@@ -256,15 +256,20 @@ while [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; do
   fi
 
   if [[ $ATTEMPT -lt $MAX_ATTEMPTS ]]; then
-    if grep -qiE "(RESOURCE_EXHAUSTED|Quota exceeded)" "$OUT"; then
+    if grep -qiE "PerMinute" "$OUT"; then
+      WAIT_SEC=60
+      echo "warning: $CURRENT_MODEL reached per-minute request rate limit on attempt $ATTEMPT/$MAX_ATTEMPTS; waiting ${WAIT_SEC}s for window reset..." >&2
+      sleep "$WAIT_SEC"
+      ATTEMPT=$((ATTEMPT + 1))
+      continue
+    elif grep -qiE "(RESOURCE_EXHAUSTED|Quota exceeded)" "$OUT"; then
       NEXT_MODEL=""
       case "$CURRENT_MODEL" in
         gemini-3.8-flash*) NEXT_MODEL="gemini-3.7-flash-high" ;;
         gemini-3.7-flash*) NEXT_MODEL="gemini-3.6-flash-high" ;;
-        gemini-3.6-flash*) NEXT_MODEL="gemini-3.1-pro-high" ;;
       esac
       if [[ -n "$NEXT_MODEL" ]]; then
-        echo "warning: $CURRENT_MODEL quota exhausted; falling back to $NEXT_MODEL..." >&2
+        echo "warning: $CURRENT_MODEL daily quota exhausted; falling back to $NEXT_MODEL..." >&2
         CURRENT_MODEL="$NEXT_MODEL"
         ATTEMPT=$((ATTEMPT + 1))
         continue
