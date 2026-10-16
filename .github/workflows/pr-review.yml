@@ -1,0 +1,96 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: PR Review (Antigravity)
+
+# Automated pull request review powered by Antigravity CLI (agy) and the pr-review skill.
+#
+# Authentication:
+#   Requires `GEMINI_API_KEY` configured in repository secrets for headless execution in CI.
+#   Uses `GITHUB_TOKEN` to read PR metadata, checkout the PR head, and post the review comment.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull Request number to review"
+        required: true
+        type: string
+      model:
+        description: "Antigravity model ID"
+        required: false
+        default: "gemini-3.8-flash-high"
+        type: string
+      local_only:
+        description: "Dry-run mode: print to stdout without posting to GitHub"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Code review
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Run on manual dispatch or internal PRs (fork PRs cannot access repository secrets)
+    if: >-
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.1
+          cache: "npm"
+
+      - name: Install reviewed npm
+        uses: ./.github/actions/setup-reviewed-npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Install Antigravity CLI
+        run: |
+          set -euo pipefail
+          INSTALLER_SHA256="62966c07365423bd4dc209355060744058fb30d60f5323e2d360e39de64e5042"
+          curl -sSfL --retry 3 --retry-delay 5 https://antigravity.google/cli/install.sh -o /tmp/install-agy.sh
+          echo "${INSTALLER_SHA256}  /tmp/install-agy.sh" | sha256sum -c -
+          bash /tmp/install-agy.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          rm -f /tmp/install-agy.sh
+
+          # Seed headless model provider configuration for CI
+          mkdir -p "$HOME/.gemini/antigravity-cli"
+          echo '{"modelProvider": "gemini"}' > "$HOME/.gemini/antigravity-cli/settings.json"
+
+      - name: Execute PR Review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || secrets.ANTIGRAVITY_API_KEY }}
+          ANTIGRAVITY_API_KEY: ${{ secrets.ANTIGRAVITY_API_KEY || secrets.GEMINI_API_KEY }}
+          AGY_PR_REVIEW_MODEL: ${{ inputs.model || 'gemini-3.8-flash-high' }}
+          PR_NUM: ${{ github.event.pull_request.number || inputs.pr_number }}
+          LOCAL_ONLY: ${{ inputs.local_only }}
+        run: |
+          FLAGS=()
+          if [[ "$LOCAL_ONLY" == "true" ]]; then
+            FLAGS+=("--local-only")
+          fi
+          ./scripts/agy-pr-review.sh ${FLAGS[@]+"${FLAGS[@]}"} ${PR_NUM:+"$PR_NUM"}

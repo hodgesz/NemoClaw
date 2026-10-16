@@ -5,7 +5,12 @@ const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
-const { shellQuote } = require("../../dist/lib/runner");
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+/** @type {(specifier: string) => Promise<any>} */
+const importDynamic = (specifier) => Function("s", "return import(s)")(specifier);
 
 /**
  * Create a spawnClaudeCodeProcess function that executes the Claude Code CLI
@@ -14,7 +19,7 @@ const { shellQuote } = require("../../dist/lib/runner");
  * @param {string} sshConfigPath - Path to the SSH config file
  * @param {string} sandboxName - The OpenShell sandbox name
  * @param {Array<[string, string]>} authEnv - Auth env var pairs (e.g. [["CLAUDE_CODE_USE_BEDROCK","1"], ["AWS_REGION","us-east-1"]])
- * @returns {(options: import("@anthropic-ai/claude-agent-sdk").SpawnOptions) => import("child_process").ChildProcess}
+ * @returns {(options: any) => import("child_process").ChildProcess}
  */
 function createSandboxSpawner(sshConfigPath, sandboxName, authEnv) {
   return (options) => {
@@ -77,7 +82,7 @@ function createSandboxSpawner(sshConfigPath, sandboxName, authEnv) {
  */
 async function* querySandbox({ sandboxName, sshConfigContent, authEnv, prompt, sdkOptions = {} }) {
   // Lazy-load the SDK (it's ESM, so we need dynamic import)
-  const { query } = await import("@anthropic-ai/claude-agent-sdk");
+  const { query } = await importDynamic("@anthropic-ai/claude-agent-sdk");
 
   // Write SSH config to a temp file
   const tmpFile = path.join(os.tmpdir(), `nemoclaw-claude-sdk-${process.pid}-${Date.now()}.conf`);
@@ -158,7 +163,7 @@ async function execSandbox(params) {
  */
 async function listSandboxSessions(sandboxName, limit = 10) {
   try {
-    const { listSessions } = await import("@anthropic-ai/claude-agent-sdk");
+    const { listSessions } = await importDynamic("@anthropic-ai/claude-agent-sdk");
     const sessions = await listSessions({ dir: "/sandbox", limit });
     return sessions.map((s) => ({
       sessionId: s.sessionId,
