@@ -94,5 +94,9 @@
   {
     "name": "NEMOCLAW_VLLM_GPU_DEVICE",
     "reason": "Internal command-scoped handoff for the public --vllm-gpu-device flag. NemoClaw validates, persists, scopes, and restores it; users should set the CLI flag instead."
+  },
+  {
+    "name": "NEMOCLAW_MAX_OBSERVATION_AGE_MS",
+    "reason": "Internal readiness polling setting for gateway and host observation cache age. Not user-facing."
   }
 ]
