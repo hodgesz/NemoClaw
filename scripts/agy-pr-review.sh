@@ -236,7 +236,7 @@ fi
 PROMPT="Use the pr-review skill to review PR #$PR. The working directory is a checkout of the PR head; do not run git checkout. $TEST_PROMPT
 
 Finish with the complete review as your final message. $MODE"
-MAX_ATTEMPTS=3
+MAX_ATTEMPTS=4
 ATTEMPT=1
 CURRENT_MODEL="$MODEL"
 
@@ -256,15 +256,23 @@ while [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; do
   fi
 
   if [[ $ATTEMPT -lt $MAX_ATTEMPTS ]]; then
-    if grep -qiE "(503|UNAVAILABLE|high demand|overloaded|\"retryable\":\s*true)" "$OUT"; then
+    if grep -qiE "(RESOURCE_EXHAUSTED|Quota exceeded)" "$OUT"; then
+      NEXT_MODEL=""
+      case "$CURRENT_MODEL" in
+        gemini-3.8-flash*) NEXT_MODEL="gemini-3.7-flash-high" ;;
+        gemini-3.7-flash*) NEXT_MODEL="gemini-3.6-flash-high" ;;
+        gemini-3.6-flash*) NEXT_MODEL="gemini-3.1-pro-high" ;;
+      esac
+      if [[ -n "$NEXT_MODEL" ]]; then
+        echo "warning: $CURRENT_MODEL quota exhausted; falling back to $NEXT_MODEL..." >&2
+        CURRENT_MODEL="$NEXT_MODEL"
+        ATTEMPT=$((ATTEMPT + 1))
+        continue
+      fi
+    elif grep -qiE "(503|UNAVAILABLE|high demand|overloaded)" "$OUT"; then
       WAIT_SEC=$((ATTEMPT * 15))
       echo "warning: agy encountered transient model error on attempt $ATTEMPT/$MAX_ATTEMPTS; retrying in ${WAIT_SEC}s..." >&2
       sleep "$WAIT_SEC"
-      ATTEMPT=$((ATTEMPT + 1))
-      continue
-    elif grep -qiE "(RESOURCE_EXHAUSTED|Quota exceeded)" "$OUT" && [[ "$CURRENT_MODEL" != "gemini-3.7-flash-high" ]]; then
-      echo "warning: $CURRENT_MODEL quota exhausted; falling back to gemini-3.7-flash-high..." >&2
-      CURRENT_MODEL="gemini-3.7-flash-high"
       ATTEMPT=$((ATTEMPT + 1))
       continue
     fi
